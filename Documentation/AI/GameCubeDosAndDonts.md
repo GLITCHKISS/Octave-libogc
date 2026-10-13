@@ -269,6 +269,18 @@ effects. That frees main memory, and it already handles libasnd's traps:
 **Do** read streamed music's data off the main thread, or keep the reads small.
 Main-thread refills queued behind a loader's big reads caused 100 ms stutters.
 
+**Don't** mount a memory card while libasnd is running. A locked card is
+unlocked as it mounts, by a DSP task, and libasnd's mixer holds the DSP for
+good: the mount waits forever and the game goes black. A real card unlocked
+earlier (by Swiss or the IPL) hides this; a memory card emulator (GCMCE,
+FlipperMCE) locks itself again at every ID query, so every mount hits it.
+Octave mounts slot A at boot, before `ASND_Init`, and a later mount stops the
+sound around it (`AUD_SuspendForCard`): a game's own streaming voice must set
+itself again when `ASND_StatusVoice` says it's unused.
+
+**Don't** send ID queries (`EXI_GetID`) to slot A after its card is mounted:
+an emulator relocks and its reads then fail.
+
 ---
 
 ## A debug layout

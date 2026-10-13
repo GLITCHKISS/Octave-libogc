@@ -108,6 +108,10 @@ static volatile uint32_t sRetraceCount = 0;
 static void OnRetrace(u32 retraceCount) { sRetraceCount = retraceCount; }
 uint32_t OctRetraceCount() { return sRetraceCount; }
 
+#if PLATFORM_GAMECUBE
+static void MountMemoryCard();  // (the memory card, below)
+#endif
+
 void SYS_Initialize()
 {
     EngineState& engine = *GetEngineState();
@@ -154,6 +158,11 @@ void SYS_Initialize()
 #endif
 
     InitFAT();
+
+#if PLATFORM_GAMECUBE
+    // Slot A's card mounted now, while the DSP is free for its unlock (MountMemoryCard).
+    MountMemoryCard();
+#endif
 }
 
 void SYS_Shutdown()
@@ -1234,19 +1243,25 @@ struct CardQuiet
     GeckoQuiet gecko;
 };
 
-// Finds the USB Gecko (slot A, else slot B) and starts sending the log to it. False if there's none.
+// Finds the USB Gecko (slot B, else slot A) and starts sending the log to it. False if there's none.
+// Slot B first: slot A is where saves go, and a memory card emulator there (GCMCE / FlipperMCE)
+// answers no ID while it switches to the game's own card at boot -- it looked like an empty slot and
+// took the Gecko probe's command.
 bool OctGeckoLogEnable()
 {
     if (sGeckoOn)
     {
         return true;
     }
+    u32 idA = 0, idB = 0;
+    EXI_GetID(EXI_CHANNEL_0, EXI_DEVICE_0, &idA);
+    EXI_GetID(EXI_CHANNEL_1, EXI_DEVICE_0, &idB);
     if (sGeckoChannel < 0)
     {
-        if (!SlotHasMemoryCard(EXI_CHANNEL_0) && usb_isgeckoalive(EXI_CHANNEL_0))
-            sGeckoChannel = EXI_CHANNEL_0;
-        else if (!SlotHasMemoryCard(EXI_CHANNEL_1) && usb_isgeckoalive(EXI_CHANNEL_1))
+        if (!SlotHasMemoryCard(EXI_CHANNEL_1) && usb_isgeckoalive(EXI_CHANNEL_1))
             sGeckoChannel = EXI_CHANNEL_1;
+        else if (!SlotHasMemoryCard(EXI_CHANNEL_0) && usb_isgeckoalive(EXI_CHANNEL_0))
+            sGeckoChannel = EXI_CHANNEL_0;
         else
             return false;
     }
@@ -1274,6 +1289,9 @@ bool OctGeckoLogEnable()
     sGeckoOn = true;
     OctGeckoLog(sGeckoChannel == EXI_CHANNEL_0 ? "Octave: the log, live over the USB Gecko in slot A"
                                                : "Octave: the log, live over the USB Gecko in slot B");
+    char ids[96];
+    snprintf(ids, sizeof(ids), "Octave: EXI IDs at boot: slot A %08x, slot B %08x", (unsigned)idA, (unsigned)idB);
+    OctGeckoLog(ids);
     return true;
 }
 
@@ -1710,6 +1728,15 @@ static void UnmountMemoryCard(int32_t channel, int32_t result)
 // The last CARD_Mount's result: why slot A is not mounted, when it is not.
 static int32_t sCardMountResult = CARD_ERROR_NOCARD;
 
+// A card that is locked is unlocked as it mounts, by a DSP task, and ASND never lets go of the DSP:
+// mounted while ASND ran, such a card hung the game. A memory card emulator (GCMCE / FlipperMCE)
+// locks itself again at every ID query (libogc's CARD_Mount makes one), so every mount of one is
+// such a mount -- the game went black at its first look at the card. So the card is mounted at boot
+// before the sound starts (SYS_Initialize), and a later mount stops the sound for it
+// (Audio_Dolphin.cpp).
+bool AUD_SuspendForCard();
+void AUD_ResumeAfterCard();
+
 static void MountMemoryCard()
 {
     if (!IsMemoryCardMounted())
@@ -1722,9 +1749,14 @@ static void MountMemoryCard()
             GetEngineState()->mSystem.mMemoryCardMountArea = SYS_AlignedMalloc(CARD_WORKAREA_SIZE, 32);
             CARD_Init("OCTA","00");
         }
+        const bool suspended = AUD_SuspendForCard();
         int errorSlotA = CARD_Mount(CARD_SLOTA, GetEngineState()->mSystem.mMemoryCardMountArea, UnmountMemoryCard);
+        if (suspended)
+        {
+            AUD_ResumeAfterCard();
+        }
         sCardMountResult = errorSlotA;
-        LogDebug("Memory card code: %d", errorSlotA);
+        LogDebug("Memory card code: %d%s", errorSlotA, suspended ? " (the sound stopped for it)" : "");
 
         if (errorSlotA >= 0)
         {

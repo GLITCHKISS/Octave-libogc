@@ -1551,6 +1551,11 @@ int OctSd_MountAll(void)
 	int i;
 
 	for(i=0;i<3;i++) {
+		/* With the SD card found in serial port 2, the slots aren't probed at all: a
+		   memory card emulator in slot A (GCMCE / FlipperMCE) answers no ID while it
+		   switches to the game's own card at boot, so it looked like an empty slot,
+		   took the SD probe's commands, and the game went black after the splash. */
+		if(devices[i].chan<2 && defaultChan==2) break;
 		if(devices[i].chan<2 && SlotHasMemoryCard(devices[i].chan)) continue;
 		if(!fatMount(devices[i].name,devices[i].disc,0,4,64)) continue;
 		__sd_event("mounted %s: EXI ch%d mode=%s",devices[i].name,devices[i].chan,OctSd_GetModeName(devices[i].chan));

@@ -713,11 +713,37 @@ static void AramStoreWave(SoundWave* soundWave)
 
 #endif // PLATFORM_GAMECUBE
 
+#if PLATFORM_GAMECUBE
+// ASND keeps its mixer on the DSP for good and never yields it, and a memory card is unlocked by a
+// DSP task (libogc's card.c): a card mounted while ASND runs that has to be unlocked waited forever
+// (the game hung). The card is mounted at boot before ASND starts (SYS_Initialize); a mount after
+// that stops ASND for it and starts it again (System_Dolphin.cpp MountMemoryCard). Voices playing
+// then end; a game's own streaming voice has to notice it's unused and set it again.
+static bool sAsndRunning = false;
+
+bool AUD_SuspendForCard()
+{
+    if (!sAsndRunning)
+        return false;
+    ASND_End();
+    sAsndRunning = false;
+    return true;
+}
+
+void AUD_ResumeAfterCard()
+{
+    ASND_Init();
+    ASND_Pause(0);
+    sAsndRunning = true;
+}
+#endif
+
 void AUD_Initialize()
 {
     ASND_Init();
     ASND_Pause(0);
 #if PLATFORM_GAMECUBE
+    sAsndRunning = true;
     AramInit();
 #endif
 
@@ -756,6 +782,9 @@ void AUD_Shutdown()
     }
 
     ASND_End();
+#if PLATFORM_GAMECUBE
+    sAsndRunning = false;
+#endif
 }
 
 void AUD_Update()
