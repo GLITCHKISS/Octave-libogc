@@ -41,6 +41,7 @@ VkFormat ConvertPixelFormat(PixelFormat pixelFormat, bool srgb)
     switch (pixelFormat)
     {
     case PixelFormat::LA4: format = VK_FORMAT_R8G8_UNORM; break;
+    case PixelFormat::IA8: format = VK_FORMAT_R8G8_UNORM; break;
     case PixelFormat::RGB565: format = VK_FORMAT_R5G6B5_UNORM_PACK16; break;
     case PixelFormat::RGBA5551: format = VK_FORMAT_R5G5B5A1_UNORM_PACK16; break;
     case PixelFormat::RGBA8: format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM; break;

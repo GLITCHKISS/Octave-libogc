@@ -33,14 +33,16 @@ static const char* sPixelFormatEnumStrings[] =
     "RGB565",
     "RGBA8",
     "CMPR",
-    "RGBA5551"
+    "RGBA5551",
+    "IA8"
 };
 static_assert(
     uint32_t(PixelFormat::LA4) == 0 &&
     uint32_t(PixelFormat::RGB565) == 1 &&
     uint32_t(PixelFormat::RGBA8) == 2 &&
     uint32_t(PixelFormat::CMPR) == 3 &&
-    uint32_t(PixelFormat::RGBA5551) == 4,
+    uint32_t(PixelFormat::RGBA5551) == 4 &&
+    uint32_t(PixelFormat::IA8) == 5,
     "Need to update texture asset format string table");
 
 const char* gFilterEnumStrings[] =
@@ -355,6 +357,7 @@ void CookTexture(
         case PixelFormat::RGB565: cookCmd += "4"; break;
         case PixelFormat::RGBA5551: cookCmd += "5"; break;
         case PixelFormat::CMPR: cookCmd += "14"; break;   // DXT1; carries 1-bit alpha
+        case PixelFormat::IA8: cookCmd += "3"; break;     // the texels' grey and their full 8-bit alpha
         case PixelFormat::RGBA8: // Fallthrough to default
         default: cookCmd += "6"; break;
         }
@@ -394,6 +397,7 @@ void CookTexture(
         case PixelFormat::RGB565: cookCmd += "rgb565"; break;
         case PixelFormat::RGBA5551: cookCmd += "rgba5551"; break;
         case PixelFormat::CMPR: opaque ? (cookCmd += "etc1") : (cookCmd += "etc1a4"); break;
+        case PixelFormat::IA8: cookCmd += "la8"; break;
         case PixelFormat::RGBA8: // Fallthrough to default
         default: cookCmd += "rgba8"; break;
         }
@@ -985,7 +989,7 @@ void Texture::GatherProperties(std::vector<Property>& outProps)
 
     outProps.push_back(Property(DatumType::Bool, "Mipmapped", this, &mMipmapped, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Bool, "sRGB", this, &mSrgb, 1, HandlePropChange));
-    outProps.push_back(Property(DatumType::Integer, "Format", this, &mFormat, 1, Texture::HandlePropChange, NULL_DATUM, 5, sPixelFormatEnumStrings));
+    outProps.push_back(Property(DatumType::Integer, "Format", this, &mFormat, 1, Texture::HandlePropChange, NULL_DATUM, 6, sPixelFormatEnumStrings));
     outProps.push_back(Property(DatumType::Integer, "Filter Type", this, &mFilterType, 1, Texture::HandlePropChange, NULL_DATUM, int32_t(FilterType::Count), gFilterEnumStrings));
     outProps.push_back(Property(DatumType::Integer, "Wrap Mode", this, &mWrapMode, 1, Texture::HandlePropChange, NULL_DATUM, int32_t(WrapMode::Count), gWrapEnumStrings));
     outProps.push_back(Property(DatumType::Bool, "Force High Quality", this, &mForceHighQuality, 1, HandlePropChange));

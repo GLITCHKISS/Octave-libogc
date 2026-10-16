@@ -48,6 +48,7 @@ enum class PixelFormat
     RGBA8,
     CMPR,
     RGBA5551,
+    IA8,        // GameCube / Wii: 8 bits of intensity and 8 of alpha (a white texture with soft alpha, at half RGBA8's size)
 
     R8,
     R32U,
