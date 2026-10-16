@@ -512,6 +512,10 @@ void GFX_SetFog(const FogSettings& fogSettings)
     gGxContext.mFogNearZ = cameraNear;
     gGxContext.mFogFarZ = cameraFar;
     gGxContext.mFogColor = fogColor;
+    // The fog is on for whatever draws next, so say so: the material switch (GxUtils.cpp) only turns it off when this
+    // says it's on. Left as the last material of the frame before had it (off), the first unfogged thing drawn -- the
+    // sky -- took the fog meant for the fogged ones.
+    gGxContext.mApplyFog = true;
 
     GX_SetFog(
         gGxContext.mFogType,
