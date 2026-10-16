@@ -1434,13 +1434,17 @@ void GFX_DrawShadowMeshComp(ShadowMesh3D* shadowMeshComp)
         GX_SetCullMode(GX_CULL_BACK); // Reverse triangle winding
         CallMeshDisplayList(mesh->GetResource()->mDisplayList, mesh->GetResource()->mDisplayListSize);
 
-        // (2) Front faces
+        // (2) Front faces. Each pixel's mark is cleared as it is darkened (a constant destination alpha of
+        // 0 written with the colour), so a pixel seen through several overlapping volumes -- the planks of a
+        // pier, each its own -- is darkened once, to the shadow colour, not once per volume to near black.
         GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_FALSE);
         GX_SetBlendMode(GX_BM_BLEND, GX_BL_DSTALPHA, GX_BL_INVDSTALPHA, GX_LO_CLEAR);
         GX_SetColorUpdate(GX_TRUE);
-        GX_SetAlphaUpdate(GX_FALSE);
+        GX_SetAlphaUpdate(GX_TRUE);
+        GX_SetDstAlpha(GX_ENABLE, 0);
         GX_SetCullMode(GX_CULL_FRONT); // Reverse triangle winding
         CallMeshDisplayList(mesh->GetResource()->mDisplayList, mesh->GetResource()->mDisplayListSize);
+        GX_SetDstAlpha(GX_DISABLE, 0);
 
         // (3) Clear alpha channel
         GX_SetZMode(GX_FALSE, GX_LEQUAL, GX_FALSE);
