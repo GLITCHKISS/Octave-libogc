@@ -53,6 +53,7 @@
 #include <ogc/machine/processor.h>
 #include <ogc/lwp_watchdog.h>
 #include <ogc/exi.h>
+#include <ogc/usbgecko.h>
 #include <ogc/lwp.h>
 #include <ogc/cache.h>
 #include <ogc/disc_io.h>
@@ -1540,6 +1541,18 @@ static bool SlotHasMemoryCard(int chan)
 	return id!=0 && id!=0xffffffff && (id&0xffff0000)==0 && (id&3)==0;
 }
 
+/* A USB Gecko in this slot (it answers its own probe): not probed for an SD adapter, and not
+   mounted as a memory card (System_Dolphin.cpp). Both sent their commands to the Gecko, and a game
+   built with libogc's GDB stub on it (DEBUG_Init) went quiet to GDB from then on -- no pause, no
+   crash reported. Asked once a slot, at the first look, before anything else talks to it. */
+static int sSlotGecko[2] = { -1, -1 };
+bool OctSlotHasUsbGecko(int chan)
+{
+	if(chan<0 || chan>1) return false;
+	if(sSlotGecko[chan]<0) sSlotGecko[chan] = (!SlotHasMemoryCard(chan) && usb_isgeckoalive(chan)) ? 1 : 0;
+	return sSlotGecko[chan]==1;
+}
+
 int OctSd_MountAll(void)
 {
 	static const struct { const char *name; const DISC_INTERFACE *disc; int chan; } devices[] = {
@@ -1557,6 +1570,7 @@ int OctSd_MountAll(void)
 		   took the SD probe's commands, and the game went black after the splash. */
 		if(devices[i].chan<2 && defaultChan==2) break;
 		if(devices[i].chan<2 && SlotHasMemoryCard(devices[i].chan)) continue;
+		if(devices[i].chan<2 && OctSlotHasUsbGecko(devices[i].chan)) continue;
 		if(!fatMount(devices[i].name,devices[i].disc,0,4,64)) continue;
 		__sd_event("mounted %s: EXI ch%d mode=%s",devices[i].name,devices[i].chan,OctSd_GetModeName(devices[i].chan));
 		if(defaultChan<0) {

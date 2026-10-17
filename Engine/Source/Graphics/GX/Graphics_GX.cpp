@@ -37,7 +37,11 @@
 
 #include <gccore.h>
 #include <ogc/machine/processor.h>      // _CPU_ISR_Disable / Restore
-#define DEFAULT_FIFO_SIZE    (256*1024)
+// The GP FIFO. 256 KB froze a real GameCube (not Dolphin) once a frame sent more than it took:
+// CPU-skinned meshes go through it a vertex at a time (GX_Position1x16 and the rest: 24 bytes a
+// triangle), and Castopia's full fisherman (seven of them, ~9,600 triangles, ~230 KB) hung the GPU
+// as he came into view, every time; 6,900 triangles never did. 1 MB holds that with room over.
+#define DEFAULT_FIFO_SIZE    (1024*1024)
 
 GxContext gGxContext;
 

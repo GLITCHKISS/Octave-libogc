@@ -22,6 +22,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <malloc.h>
@@ -48,6 +50,7 @@ extern "C" int OctSd_MountAll(void);
 extern "C" void OctSd_NoteThreadPriority(u32 prio);  // (SdGeckoDma.c: its card reads above the main thread)
 #endif
 extern "C" const char* OctSd_GetModeName(int chan);
+extern "C" bool OctSlotHasUsbGecko(int chan);   // (SdGeckoDma.c: a USB Gecko there -- left alone)
 static int sSdChannel = -1;
 #endif
 
@@ -86,7 +89,9 @@ static void InitFAT()
 #endif
 #if PLATFORM_GAMECUBE
         // (libogc's own mount tries both card slots too: not with a memory card in one.)
-        const bool mayProbe = !SlotHasMemoryCard(EXI_CHANNEL_0) && !SlotHasMemoryCard(EXI_CHANNEL_1);
+        // (Nor with a USB Gecko in one: its probes reached the Gecko, and GDB's stub on it went deaf.)
+        const bool mayProbe = !SlotHasMemoryCard(EXI_CHANNEL_0) && !SlotHasMemoryCard(EXI_CHANNEL_1) &&
+                              !OctSlotHasUsbGecko(EXI_CHANNEL_0) && !OctSlotHasUsbGecko(EXI_CHANNEL_1);
 #else
         const bool mayProbe = true;  // (the Wii's SD slot)
 #endif
@@ -536,6 +541,93 @@ static bool IsoOpenDVD()
     return false;
 }
 
+// How much of an image's boot DOL is the code running now: its first text section, sampled at
+// kBootSpots places of kBootSpotSize bytes, each compared with the same addresses in memory. -1:
+// not an image it could read. The image booted scores kBootSpots (a spot Swiss patched in memory
+// scores a little lower); another build of the game, next to nothing. A few KB of reads an image,
+// no file table parsed: quick over a card full of games.
+static const int kBootSpots = 8;
+static const uint32_t kBootSpotSize = 512;
+static int IsoBootDolScore(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (f == nullptr) return -1;
+    int score = -1;
+    uint8_t h[0x100];
+    if (fseek(f, 0x420, SEEK_SET) == 0 && fread(h, 1, 4, f) == 4)
+    {
+        const uint32_t dol = IsoRead32(h);
+        if (dol != 0 && fseek(f, (long)dol, SEEK_SET) == 0 && fread(h, 1, sizeof(h), f) == sizeof(h))
+        {
+            const uint32_t off = IsoRead32(h + 0x00), addr = IsoRead32(h + 0x48), size = IsoRead32(h + 0x90);
+            if (size >= (uint32_t)kBootSpots * kBootSpotSize && addr >= 0x80000000u && addr + size <= 0x81800000u)
+            {
+                static uint8_t spot[kBootSpotSize];
+                score = 0;
+                for (int i = 0; i < kBootSpots; ++i)
+                {
+                    const uint32_t at = (uint32_t)((uint64_t)(size - kBootSpotSize) * i / (kBootSpots - 1)) & ~3u;
+                    if (fseek(f, (long)(dol + off + at), SEEK_SET) != 0 || fread(spot, 1, kBootSpotSize, f) != kBootSpotSize)
+                    {
+                        score = -1;
+                        break;
+                    }
+                    if (memcmp(spot, (const void*)(uintptr_t)(addr + at), kBootSpotSize) == 0) ++score;
+                }
+            }
+        }
+    }
+    fclose(f);
+    return score;
+}
+
+// The image booted, opened if it can be told: every .iso / .gcm in the usual places scored
+// (IsoBootDolScore); the best, if it is nearly all the running code and holds this project (its
+// .octp at the root of its file table). Builds alike in their code (only their assets differ):
+// the newest file. None good enough: false, and the name and the scan below decide as before.
+static bool IsoOpenBooted(const std::string& pn, const std::string& pd)
+{
+    std::string octp;
+    for (char ch : pn + ".octp") octp += (char)tolower((unsigned char)ch);
+    std::string best;
+    int bestScore = kBootSpots - 2;        // (the least that counts)
+    time_t bestTime = 0;
+    std::string dirs[] = { pd, pd + "../", "/", "./", "/games/", "sd:/", "sd:/games/" };
+    for (const std::string& dir : dirs)
+    {
+        DIR* d = opendir(dir.empty() ? "." : dir.c_str());
+        if (d == nullptr) continue;
+        struct dirent* ent;
+        while ((ent = readdir(d)) != nullptr)
+        {
+            std::string name = ent->d_name;
+            if (name.size() < 5) continue;
+            std::string ext;
+            for (size_t k = name.size() - 4; k < name.size(); ++k) ext += (char)tolower((unsigned char)name[k]);
+            if (ext != ".iso" && ext != ".gcm") continue;
+            const std::string path = dir + name;
+            const int score = IsoBootDolScore(path.c_str());
+            struct stat st;
+            const time_t t = (stat(path.c_str(), &st) == 0) ? st.st_mtime : 0;
+            IsoLog("ISO booted? %s: %d of %d", path.c_str(), score, kBootSpots);
+            if (score > bestScore || (score == bestScore && !best.empty() && t > bestTime))
+            {
+                best = path; bestScore = score; bestTime = t;
+            }
+        }
+        closedir(d);
+    }
+    if (best.empty() || !IsoOpenSD(best.c_str())) return false;
+    if (sIsoFiles.count(octp) != 0)
+    {
+        LogDebug("ISO booted: %s (its code matches the running code, %d of %d)", best.c_str(), bestScore, kBootSpots);
+        return true;
+    }
+    fclose(sIso); sIso = nullptr; sIsoMode = ISO_NONE; sIsoFiles.clear();     // (not this game after all)
+    IsoCloseExtraHandles(); sIsoPath[0] = 0;
+    return false;
+}
+
 // Locate the disc image: SD first (an ISO on the card => SD delivery), else the
 // physical disc (=> DVD delivery). The presence of an SD ISO IS the delivery signal.
 static void IsoLocate()
@@ -563,6 +655,12 @@ static void IsoLocate()
     const std::string& pn = es->mProjectName;
     const std::string& pd = es->mProjectDirectory;
     if (pn.empty()) return;   // too early (project name not set) -- retry on a later call
+
+    // 0) The image this program was BOOTED from, when it can be told: the one whose boot DOL is the
+    //    code running now (IsoOpenBooted). Found by name or by scan below, a card holding several
+    //    builds of one game gave the game the first of them -- new code reading another build's
+    //    scripts and assets (Castopia's hardware tests, 2026-10-17).
+    if (IsoOpenBooted(pn, pd)) return;
 
     std::string cands[] = {
         pd + pn + ".iso",
@@ -1739,6 +1837,15 @@ void AUD_ResumeAfterCard();
 
 static void MountMemoryCard()
 {
+#if PLATFORM_GAMECUBE
+    // A USB Gecko in slot A: no card can be there, and the mount's commands reached the Gecko -- a
+    // game built with libogc's GDB stub on it went quiet to GDB from then on.
+    if (OctSlotHasUsbGecko(EXI_CHANNEL_0))
+    {
+        sCardMountResult = CARD_ERROR_NOCARD;
+        return;
+    }
+#endif
     if (!IsMemoryCardMounted())
     {
         // The work area is made once and kept. Mounting is tried again every time a save is
