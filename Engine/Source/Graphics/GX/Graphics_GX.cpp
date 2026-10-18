@@ -31,6 +31,7 @@
 #include "Assertion.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <malloc.h>
 #include <math.h>
 #include <vector>
@@ -612,30 +613,54 @@ void GFX_EndGpuTimestamp(const char* name)
 
 // QUANTIZED MESHES (GxUtils.cpp, GFX_SetQuantizedMeshes): the mesh's float vertices into the GPU's
 // 16-bit / 8-bit forms. False, and nothing changed, where they would not keep their precision, its
-// second UV set is in use, or there is no room (then it draws from its floats as ever).
+// second UV set is in use or it has vertex colours (unless extended: GFX_SetQuantizedMeshesExtended
+// keeps them too), or there is no room (then it draws from its floats as ever).
 static bool QuantizeStaticMesh(StaticMesh* staticMesh, StaticMeshResource* resource)
 {
-    const Vertex* v = staticMesh->GetVertices();
     const uint32_t n = staticMesh->GetNumVertices();
-    if (v == nullptr || n == 0)
+    const bool extended = GFX_GetQuantizedMeshesExtended();
+    const bool hasColor = staticMesh->HasVertexColor();
+    if (n == 0 || (hasColor && !extended))
     {
         return false;
     }
+    // the float vertices, as either form holds them (colours already in GX's order: they were turned
+    // when the mesh was made)
+    const uint8_t* base = hasColor ? (const uint8_t*)staticMesh->GetColorVertices() : (const uint8_t*)staticMesh->GetVertices();
+    const uint32_t srcStride = hasColor ? sizeof(VertexColor) : sizeof(Vertex);
+    const uint32_t offPos = hasColor ? offsetof(VertexColor, mPosition) : offsetof(Vertex, mPosition);
+    const uint32_t offNrm = hasColor ? offsetof(VertexColor, mNormal) : offsetof(Vertex, mNormal);
+    const uint32_t offUv0 = hasColor ? offsetof(VertexColor, mTexcoord0) : offsetof(Vertex, mTexcoord0);
+    const uint32_t offUv1 = hasColor ? offsetof(VertexColor, mTexcoord1) : offsetof(Vertex, mTexcoord1);
+    const uint32_t offClr = offsetof(VertexColor, mColor);
+    if (base == nullptr)
+    {
+        return false;
+    }
+    auto at = [&](uint32_t i, uint32_t off) -> const float* { return (const float*)(base + i * srcStride + off); };
 
-    float posMax = 0.0f, uvMax = 0.0f;
+    float posMax = 0.0f, uvMax = 0.0f, uv1Max = 0.0f;
+    bool uv1Own = false;
     for (uint32_t i = 0; i < n; ++i)
     {
-        const Vertex& x = v[i];
+        const float* p = at(i, offPos);
+        const float* t0 = at(i, offUv0);
+        const float* t1 = at(i, offUv1);
         for (uint32_t k = 0; k < 3; ++k)
         {
-            posMax = fmaxf(posMax, fabsf(x.mPosition[k]));
+            posMax = fmaxf(posMax, fabsf(p[k]));
         }
-        uvMax = fmaxf(uvMax, fmaxf(fabsf(x.mTexcoord0.x), fabsf(x.mTexcoord0.y)));
-        const bool uv1Zero = (x.mTexcoord1.x == 0.0f && x.mTexcoord1.y == 0.0f);
-        const bool uv1Same = (x.mTexcoord1.x == x.mTexcoord0.x && x.mTexcoord1.y == x.mTexcoord0.y);
+        uvMax = fmaxf(uvMax, fmaxf(fabsf(t0[0]), fabsf(t0[1])));
+        uv1Max = fmaxf(uv1Max, fmaxf(fabsf(t1[0]), fabsf(t1[1])));
+        const bool uv1Zero = (t1[0] == 0.0f && t1[1] == 0.0f);
+        const bool uv1Same = (t1[0] == t0[0] && t1[1] == t0[1]);
         if (!uv1Zero && !uv1Same)
         {
-            return false;                       // a second UV set of its own: kept as floats
+            if (!extended)
+            {
+                return false;                   // a second UV set of its own: kept as floats
+            }
+            uv1Own = true;                      // (extended: kept as a second set)
         }
     }
 
@@ -646,18 +671,24 @@ static bool QuantizeStaticMesh(StaticMesh* staticMesh, StaticMeshResource* resou
     while (posFrac > 0 && posMax * float(1 << posFrac) > kFit) --posFrac;
     int uvFrac = 15;
     while (uvFrac > 0 && uvMax * float(1 << uvFrac) > kFit) --uvFrac;
-    if (posFrac < 8 || uvFrac < 8)
+    int uv1Frac = 15;
+    while (uv1Frac > 0 && uv1Max * float(1 << uv1Frac) > kFit) --uv1Frac;
+    if (posFrac < 8 || uvFrac < 8 || (uv1Own && uv1Frac < 8))
     {
         return false;
     }
 
-    uint8_t* q = (uint8_t*)memalign(32, n * kQuantStride);
+    // the layout: the 14 bytes, then the second set and the colour where it has them
+    const uint32_t uv1At = uv1Own ? kQuantStride : 0;
+    const uint32_t clrAt = hasColor ? kQuantStride + (uv1Own ? 4 : 0) : 0;
+    const uint32_t stride = kQuantStride + (uv1Own ? 4 : 0) + (hasColor ? 4 : 0);
+    uint8_t* q = (uint8_t*)memalign(32, n * stride);
     if (q == nullptr)
     {
         return false;
     }
 
-    const float posScale = float(1 << posFrac), uvScale = float(1 << uvFrac);
+    const float posScale = float(1 << posFrac), uvScale = float(1 << uvFrac), uv1Scale = float(1 << uv1Frac);
     auto s16 = [](float f) -> int16_t
     {
         f = roundf(f);
@@ -670,24 +701,41 @@ static bool QuantizeStaticMesh(StaticMesh* staticMesh, StaticMeshResource* resou
     };
     for (uint32_t i = 0; i < n; ++i)
     {
-        const Vertex& x = v[i];
-        uint8_t* o = q + i * kQuantStride;
-        int16_t pos[3] = { s16(x.mPosition.x * posScale), s16(x.mPosition.y * posScale), s16(x.mPosition.z * posScale) };
-        int8_t nrm[3] = { s8(x.mNormal.x * 64.0f), s8(x.mNormal.y * 64.0f), s8(x.mNormal.z * 64.0f) };
-        int16_t uv[2] = { s16(x.mTexcoord0.x * uvScale), s16(x.mTexcoord0.y * uvScale) };
+        const float* p = at(i, offPos);
+        const float* nm = at(i, offNrm);
+        const float* t0 = at(i, offUv0);
+        uint8_t* o = q + i * stride;
+        int16_t pos[3] = { s16(p[0] * posScale), s16(p[1] * posScale), s16(p[2] * posScale) };
+        int8_t nrm[3] = { s8(nm[0] * 64.0f), s8(nm[1] * 64.0f), s8(nm[2] * 64.0f) };
+        int16_t uv[2] = { s16(t0[0] * uvScale), s16(t0[1] * uvScale) };
         memcpy(o, pos, 6);              // (the GameCube is big-endian, as GX reads them)
         memcpy(o + 6, nrm, 3);
         o[9] = 0;
         memcpy(o + 10, uv, 4);
+        if (uv1Own)
+        {
+            const float* t1 = at(i, offUv1);
+            int16_t uv1[2] = { s16(t1[0] * uv1Scale), s16(t1[1] * uv1Scale) };
+            memcpy(o + uv1At, uv1, 4);
+        }
+        if (hasColor)
+        {
+            memcpy(o + clrAt, base + i * srcStride + offClr, 4);    // (its bytes as GX reads them)
+        }
     }
-    DCFlushRange(q, n * kQuantStride);
+    DCFlushRange(q, n * stride);
     GX_InvVtxCache();                   // (a block another mesh was drawn from: see the compact path)
 
     resource->mQuantVertices = q;
     resource->mPosFrac = uint8_t(posFrac);
     resource->mUvFrac = uint8_t(uvFrac);
+    resource->mUv1Frac = uint8_t(uv1Own ? uv1Frac : 0);
+    resource->mQuantStride = uint8_t(stride);
+    resource->mQuantUv1 = uint8_t(uv1At);
+    resource->mQuantClr = uint8_t(clrAt);
     resource->mQuantized = true;
-    LogDebug("Mesh %s: quantized (%u vertices, %d/%d fraction bits)", staticMesh->GetName().c_str(), n, posFrac, uvFrac);
+    LogDebug("Mesh %s: quantized (%u vertices, %u bytes each, %d/%d/%d fraction bits)", staticMesh->GetName().c_str(),
+             n, stride, posFrac, uvFrac, uv1Own ? uv1Frac : 0);
     return true;
 }
 
@@ -1016,6 +1064,13 @@ void GFX_CreateStaticMeshResource(StaticMesh* staticMesh, bool hasColor, uint32_
     if (hasColor)
     {
         resource->mColorDisplayList = CreateMeshDisplayList(staticMesh, true, resource->mColorDisplayListSize);
+        // extended (GFX_SetQuantizedMeshesExtended): its colours kept in the quantized array, the
+        // colour display list indexing it the same way
+        if (GFX_GetQuantizedMeshes() && GFX_GetQuantizedMeshesExtended() && resource->mColorDisplayList != nullptr &&
+            !staticMesh->IsTriangleCollisionMeshEnabled() && GFX_QuantizeAllowed(staticMesh))
+        {
+            QuantizeStaticMesh(staticMesh, resource);
+        }
     }
     else
     {
@@ -1034,7 +1089,8 @@ void GFX_CreateStaticMeshResource(StaticMesh* staticMesh, bool hasColor, uint32_
                 resource->mQuantized = true;
             }
         }
-        else if (GFX_GetQuantizedMeshes() && resource->mDisplayList != nullptr && !staticMesh->IsTriangleCollisionMeshEnabled())
+        else if (GFX_GetQuantizedMeshes() && resource->mDisplayList != nullptr && !staticMesh->IsTriangleCollisionMeshEnabled() &&
+                 GFX_QuantizeAllowed(staticMesh))
         {
             QuantizeStaticMesh(staticMesh, resource);
         }
@@ -1076,6 +1132,10 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
         resource->mQuantVertices = nullptr;
     }
     resource->mQuantized = false;
+    resource->mQuantStride = uint8_t(kQuantStride);
+    resource->mQuantUv1 = 0;
+    resource->mQuantClr = 0;
+    resource->mUv1Frac = 0;
 }
 
 // SkeletalMesh

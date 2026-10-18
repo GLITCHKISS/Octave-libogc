@@ -113,6 +113,17 @@ have held another one. BigBlockCache hands big blocks on, and the GPU's vertex
 cache is keyed by address. Dolphin doesn't emulate that cache; the console
 does.
 
+**Do** keep static meshes in the GPU's 16-bit vertex forms (`GxUtils.h`):
+`GFX_SetQuantizedMeshes(true)` before the scene loads, and
+`GFX_SetQuantizedMeshesExtended(true)` for meshes with vertex colours or a
+second UV set of their own. A mesh with both goes from 44 bytes a vertex to 22.
+Castopia's pier and outpost gained about 510 KB of RAM this way, and looked the
+same. Meshes larger than about 125 units, or with UVs past about 125, stay as
+floats on their own.
+- A quantized mesh has no float vertices left: `GetVertices()` returns null.
+  Any mesh the game's code reads or rewrites a vertex at a time has to answer
+  false in `GFX_SetQuantizeFilter`. See Castopia's `Main.cpp`.
+
 ---
 
 ## Memory (24 MB)

@@ -177,6 +177,13 @@ struct StaticMeshResource
     uint8_t mPosFrac = 0;
     uint8_t mUvFrac = 0;
     bool mQuantized = false;
+    // EXTENDED (GFX_SetQuantizedMeshesExtended): after those 14 bytes the mesh's own second texture
+    // coordinate (16-bit, mUv1Frac) and its colour (RGBA8), where it has them -- 14, 18 or 22 bytes a
+    // vertex. The byte each starts at (0: none -- the second set reads the first, no colour).
+    uint8_t mUv1Frac = 0;
+    uint8_t mQuantStride = 14;
+    uint8_t mQuantUv1 = 0;
+    uint8_t mQuantClr = 0;
 #elif API_C3D
     void* mVertexData = nullptr;
     void* mIndexData = nullptr;

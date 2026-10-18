@@ -60,6 +60,15 @@ void GFX_SetCompactUnlitMeshes(bool compact);
 bool GFX_GetCompactUnlitMeshes();
 void GFX_SetQuantizedMeshes(bool quantized);
 bool GFX_GetQuantizedMeshes();
+// On top of GFX_SetQuantizedMeshes: meshes with vertex colours, and with a second UV set of their
+// own, quantized too (GxUtils.cpp). Off unless a game turns it on.
+void GFX_SetQuantizedMeshesExtended(bool extended);
+bool GFX_GetQuantizedMeshesExtended();
+// Which meshes may be quantized as they load (nullptr: any that fit): a game whose code reads or
+// rewrites some meshes' float vertices (GetVertices) answers false for those -- quantized, they have none.
+typedef bool (*GxQuantizeFilter)(class StaticMesh* mesh);
+void GFX_SetQuantizeFilter(GxQuantizeFilter filter);
+bool GFX_QuantizeAllowed(class StaticMesh* mesh);
 // A quantized vertex: int16 x, y, z; int8 normal x, y, z; a pad byte; int16 s, t (GxUtils.cpp)
 static const uint32_t kQuantStride = 14;
 bool GFX_MaterialAllowsCompact(class Material* material);

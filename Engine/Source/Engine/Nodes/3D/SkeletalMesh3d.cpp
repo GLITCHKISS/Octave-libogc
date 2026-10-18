@@ -30,7 +30,8 @@ static_assert(int32_t(AnimationUpdateMode::Count) == 3, "Need to update string c
 FORCE_LINK_DEF(SkeletalMesh3D);
 DEFINE_NODE(SkeletalMesh3D, Mesh3D);
 
-#define NUM_ANIMATION_SLOTS 8
+// (16: a game can layer more than 8 -- Castopia's fisherman, his rod's 8 with his walk's 5 over them)
+#define NUM_ANIMATION_SLOTS 16
 
 struct DecompTransform
 {

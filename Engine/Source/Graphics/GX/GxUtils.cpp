@@ -667,6 +667,33 @@ bool GFX_GetQuantizedMeshes()
     return sQuantizedMeshes;
 }
 
+// EXTENDED: the meshes the above leaves as floats -- vertex colours (lit or not: the colours kept as
+// they are, 4 bytes), a second UV set of its own (kept as a second 16-bit set, its own fraction bits)
+// -- quantized too: a mesh with both, 44 bytes a vertex as floats, is 22. Its own switch so a game
+// that turned on GFX_SetQuantizedMeshes before this existed draws as it did.
+static bool sQuantizedMeshesExtended = false;
+static GxQuantizeFilter sQuantizeFilter = nullptr;
+
+void GFX_SetQuantizedMeshesExtended(bool extended)
+{
+    sQuantizedMeshesExtended = extended;
+}
+
+bool GFX_GetQuantizedMeshesExtended()
+{
+    return sQuantizedMeshesExtended;
+}
+
+void GFX_SetQuantizeFilter(GxQuantizeFilter filter)
+{
+    sQuantizeFilter = filter;
+}
+
+bool GFX_QuantizeAllowed(StaticMesh* mesh)
+{
+    return sQuantizeFilter == nullptr || sQuantizeFilter(mesh);
+}
+
 // Unlit, untextured, and its vertex colours not blending textures: drawn by colour alone.
 bool GFX_MaterialAllowsCompact(Material* material)
 {
@@ -712,14 +739,18 @@ void BindStaticMesh(StaticMesh* staticMesh, uint32_t* instanceColors)
 
     if (resource->mQuantized)
     {
-        // 16-bit position, 8-bit normal, a pad byte, 16-bit texture coordinate (14 bytes); both
-        // texture coordinate inputs read the one set. Flushed and the vertex cache cleared when it
-        // was made (GFX_CreateStaticMeshResource): nothing writes it after.
+        // 16-bit position, 8-bit normal, a pad byte, 16-bit texture coordinate (14 bytes); then,
+        // extended, the mesh's own second texture coordinate and its colour where it has them
+        // (mQuantStride, mQuantUv1, mQuantClr) -- else both texture coordinate inputs read the one
+        // set. Flushed and the vertex cache cleared when it was made (GFX_CreateStaticMeshResource):
+        // nothing writes it after.
         uint8_t* q = (uint8_t*)resource->mQuantVertices;
+        const uint32_t stride = resource->mQuantStride;
+        const bool color = (instanceColors != nullptr || resource->mQuantClr != 0);
         GX_ClearVtxDesc();
         GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
         GX_SetVtxDesc(GX_VA_NRM, GX_INDEX16);
-        if (instanceColors != nullptr)
+        if (color)
         {
             GX_SetVtxDesc(GX_VA_CLR0, GX_INDEX16);
         }
@@ -727,22 +758,27 @@ void BindStaticMesh(StaticMesh* staticMesh, uint32_t* instanceColors)
         GX_SetVtxDesc(GX_VA_TEX1, GX_INDEX16);
         GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S16, resource->mPosFrac);
         GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_S8, 6);
-        if (instanceColors != nullptr)
+        if (color)
         {
             GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
         }
         GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_S16, resource->mUvFrac);
-        GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_S16, resource->mUvFrac);
-        GX_SetArray(GX_VA_POS, q, kQuantStride);
-        GX_SetArray(GX_VA_NRM, q + 6, kQuantStride);
+        GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_S16,
+                         resource->mQuantUv1 != 0 ? resource->mUv1Frac : resource->mUvFrac);
+        GX_SetArray(GX_VA_POS, q, stride);
+        GX_SetArray(GX_VA_NRM, q + 6, stride);
         if (instanceColors != nullptr)
         {
             GX_SetArray(GX_VA_CLR0, instanceColors, sizeof(uint32_t));
             DCFlushRange(instanceColors, staticMesh->GetNumVertices() * sizeof(uint32_t));
             GX_InvVtxCache();
         }
-        GX_SetArray(GX_VA_TEX0, q + 10, kQuantStride);
-        GX_SetArray(GX_VA_TEX1, q + 10, kQuantStride);
+        else if (resource->mQuantClr != 0)
+        {
+            GX_SetArray(GX_VA_CLR0, q + resource->mQuantClr, stride);
+        }
+        GX_SetArray(GX_VA_TEX0, q + 10, stride);
+        GX_SetArray(GX_VA_TEX1, q + (resource->mQuantUv1 != 0 ? resource->mQuantUv1 : 10), stride);
         return;
     }
 
