@@ -69,6 +69,11 @@ bool GFX_GetQuantizedMeshesExtended();
 typedef bool (*GxQuantizeFilter)(class StaticMesh* mesh);
 void GFX_SetQuantizeFilter(GxQuantizeFilter filter);
 bool GFX_QuantizeAllowed(class StaticMesh* mesh);
+// Anisotropic filtering, texture by texture (GxUtils.cpp): a game answers 2 or 4 for the textures seen at a slant (a sea,
+// a floor), 1 for the rest. Set it before the textures load. (nullptr, as ever: none.)
+typedef uint8_t (*GxAnisotropyFilter)(class Texture* texture);
+void GFX_SetTextureAnisotropy(GxAnisotropyFilter filter);
+uint8_t GFX_TextureAnisotropy(class Texture* texture);
 // A quantized vertex: int16 x, y, z; int8 normal x, y, z; a pad byte; int16 s, t (GxUtils.cpp)
 static const uint32_t kQuantStride = 14;
 bool GFX_MaterialAllowsCompact(class Material* material);

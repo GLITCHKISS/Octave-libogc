@@ -694,6 +694,23 @@ bool GFX_QuantizeAllowed(StaticMesh* mesh)
     return sQuantizeFilter == nullptr || sQuantizeFilter(mesh);
 }
 
+// ANISOTROPIC FILTERING: a mipmapped texture seen at a slant is blurred to the mip its most squeezed direction asks for;
+// on a mesh of flat triangles each tilted its own way (a swell grid) that mip jumps at their edges -- a darker, blurrier
+// band with a straight edge. Anisotropy takes the mip from the less squeezed direction and filters along the other
+// (extra filter cycles where it's needed, none where it isn't), so the slant stays sharp and the jumps go. Opt in,
+// texture by texture: the games before it draw as they did.
+static GxAnisotropyFilter sAnisotropyFilter = nullptr;
+
+void GFX_SetTextureAnisotropy(GxAnisotropyFilter filter)
+{
+    sAnisotropyFilter = filter;
+}
+
+uint8_t GFX_TextureAnisotropy(Texture* texture)
+{
+    return sAnisotropyFilter != nullptr ? sAnisotropyFilter(texture) : 1;
+}
+
 // Unlit, untextured, and its vertex colours not blending textures: drawn by colour alone.
 bool GFX_MaterialAllowsCompact(Material* material)
 {

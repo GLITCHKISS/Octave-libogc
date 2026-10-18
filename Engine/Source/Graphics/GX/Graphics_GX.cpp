@@ -851,6 +851,15 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& data)
 
     GX_InitTexObjWrapMode(&resource->mGxTexObj, wrap, wrap);
     GX_InitTexObjFilterMode(&resource->mGxTexObj, minFilter, magFilter);
+
+    // anisotropic, if the game asks for it on this one (GFX_SetTextureAnisotropy): it needs the trilinear filter and
+    // the LOD worked out along the texture's edges (libogc's GX_InitTexObjMaxAniso)
+    const uint8_t aniso = GFX_TextureAnisotropy(texture);
+    if (mipmapped && minFilter == GX_LIN_MIP_LIN && aniso >= 2)
+    {
+        GX_InitTexObjEdgeLOD(&resource->mGxTexObj, GX_ENABLE);
+        GX_InitTexObjMaxAniso(&resource->mGxTexObj, aniso >= 4 ? GX_ANISO_4 : GX_ANISO_2);
+    }
 }
 
 void GFX_DestroyTextureResource(Texture* texture)
