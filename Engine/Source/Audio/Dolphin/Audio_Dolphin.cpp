@@ -75,6 +75,13 @@ struct DiscSource
 
 static const uint32_t kDiscWindowBytes = 16 * 1024;
 
+// A disc stream's start, done by the audio I/O thread too. On the main thread, opening a track froze
+// the game for about a second on hardware each time a new one started: vorbisfile reads the headers
+// (a disc seek), seeks to the END of the file to find its length (another, across the disc), back to
+// the start, and the first buffer is decoded -- with the loader's reads ahead of it on the disc lock.
+// Now AUD_Play only asks; AUD_Update starts the voice once the thread has it open and a buffer full.
+enum { OPEN_NONE = 0, OPEN_REQUESTED, OPEN_DONE, OPEN_FAILED };
+
 static sem_t sAudioIoSem = LWP_SEM_NULL;
 static lwp_t sAudioIoThread = LWP_THREAD_NULL;
 static void RequestReadAhead(DiscSource* d);
@@ -101,9 +108,24 @@ struct StreamVoice
     int            bytesPerSample = 1;   // 1 = 8-bit unsigned, 2 = 16-bit LE
     bool           loop = false;
     bool           eof = false;
+    // Opened by the I/O thread (OPEN_*): while REQUESTED only it touches vf, the disc source and
+    // buf[0]; DONE hands them back with the first buffer decoded (openFilled bytes), and the voice
+    // is set as AUD_Play asked (the open* fields).
+    volatile int32_t openState = OPEN_NONE;
+    bool           vfOpen = false;
+    uint32_t       openFilled = 0;
+    int32_t        openFormat = 0;
+    int32_t        openPitchHz = 0;
+    int32_t        openVolL = 0;
+    int32_t        openVolR = 0;
 };
 
 static StreamVoice sStreams[AUDIO_MAX_VOICES];
+static size_t DiscRead(void* ptr, size_t size, size_t nmemb, void* ds);
+static int DiscSeek(void* ds, ogg_int64_t off, int whence);
+static long DiscTell(void* ds);
+static int MemClose(void* ds);
+static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want);
 
 // Serves read-ahead requests. Below the main thread's priority (see AUD_Initialize), so it runs
 // while the main thread waits on the GPU and vsync, not in the middle of its work.
@@ -119,6 +141,24 @@ static void* AudioIoThread(void*)
     while (true)
     {
         LWP_SemWait(sAudioIoSem);
+
+        for (int32_t v = 0; v < AUDIO_MAX_VOICES; ++v)
+        {
+            StreamVoice* sv = &sStreams[v];
+            if (sv->openState != OPEN_REQUESTED)
+                continue;
+
+            ov_callbacks dcb = { DiscRead, DiscSeek, MemClose, DiscTell };
+            bool ok = (ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) >= 0);
+            sv->vfOpen = ok;
+            if (ok)
+            {
+                sv->openFilled = StreamFill(sv, sv->buf[0], sv->bufSize);   // the first buffer whole
+                DCFlushRange(sv->buf[0], sv->bufSize);
+            }
+            __asm__ volatile("" ::: "memory");   // (all of it written before the main thread is told)
+            sv->openState = ok ? OPEN_DONE : OPEN_FAILED;
+        }
 
         for (int32_t v = 0; v < AUDIO_MAX_VOICES; ++v)
         {
@@ -187,11 +227,14 @@ static size_t DiscRead(void* ptr, size_t size, size_t nmemb, void* ds)
 
         if (d->pos < d->windowAt || d->pos >= d->windowAt + d->windowSize)
         {
-            // Not read ahead (the stream's start, a seek, a loop): read it here.
-            SCOPED_FRAME_STAT("AudRead");
+            // Not read ahead (the stream's start, a seek, a loop): read it here. (Timed only on the main
+            // thread: the profiler's stats aren't the I/O thread's to touch, and it opens streams.)
+            const bool onMain = (LWP_GetSelf() != sAudioIoThread);
+            if (onMain) BEGIN_FRAME_STAT("AudRead");
             uint32_t fill = d->size - d->pos;
             if (fill > kDiscWindowBytes) fill = kDiscWindowBytes;
             const bool readOk = SYS_ReadFileRange(d->path.c_str(), true, d->base + d->pos, fill, (char*)d->window);
+            if (onMain) END_FRAME_STAT("AudRead");
             if (!readOk)
             {
                 LogError("Audio stream: disc read failed (%s, offset %u, %u bytes)",
@@ -298,9 +341,13 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
 static void StreamStop(StreamVoice* sv)
 {
     if (!sv->active) return;
+    while (sv->openState == OPEN_REQUESTED)   // (stopped while the I/O thread opens it: let it finish)
+        usleep(500);
+    sv->openState = OPEN_NONE;
     WaitReadAhead(&sv->disc);
     sv->disc.aheadState = AHEAD_EMPTY;
-    ov_clear(&sv->vf);
+    if (sv->vfOpen) ov_clear(&sv->vf);
+    sv->vfOpen = false;
     for (int b = 0; b < 3; ++b)
     {
         if (sv->buf[b]) { free(sv->buf[b]); sv->buf[b] = nullptr; }
@@ -747,7 +794,7 @@ void AUD_Initialize()
     AramInit();
 #endif
 
-    // At boot, so its stack sits low in a heap not yet cut up. 64 KB: an SD read goes through
+    // At boot, so its stack sits low in a heap not yet cut up. 64 KB was the least: an SD read goes through
     // libfat and the SD driver, and 16 KB overflowed on hardware (see SYS_CreateThread).
     // Priority 50: below the main thread (64), because SD reads busy-wait and a reader at or above
     // the main thread holds the CPU when it wakes from vsync; above the asset loader (40), so the
@@ -756,7 +803,8 @@ void AUD_Initialize()
     {
         sAudioIoSem = LWP_SEM_NULL;
     }
-    else if (LWP_CreateThread(&sAudioIoThread, AudioIoThread, nullptr, nullptr, 64 * 1024, 50) != 0)
+    else if (LWP_CreateThread(&sAudioIoThread, AudioIoThread, nullptr, nullptr, 128 * 1024, 50) != 0)   // (128 KB: it opens
+                                                                                                          //  and decodes streams too)
     {
         LWP_SemDestroy(sAudioIoSem);
         sAudioIoSem = LWP_SEM_NULL;   // no thread: streams read on the main thread, as before
@@ -803,6 +851,25 @@ void AUD_Update()
     {
         StreamVoice* sv = &sStreams[v];
         if (!sv->active) continue;
+
+        // Opened by the I/O thread: still going, nothing to do; failed, gone; done, the voice set going
+        // on its first buffer (the next one decoded from the next frame on, as ever).
+        const int32_t open = sv->openState;
+        if (open == OPEN_REQUESTED)
+            continue;
+        if (open == OPEN_FAILED)
+        {
+            LogError("Audio stream: failed to open Vorbis stream on disc (%s).", sv->disc.path.c_str());
+            StreamStop(sv);
+            continue;
+        }
+        if (open == OPEN_DONE)
+        {
+            sv->openState = OPEN_NONE;
+            ASND_SetVoice(v, sv->openFormat, sv->openPitchHz, 0, sv->buf[0], sv->openFilled,
+                          sv->openVolL, sv->openVolR, StreamCallback);
+            continue;
+        }
 
         if (ASND_StatusVoice(v) == SND_UNUSED)
         {
@@ -909,9 +976,11 @@ void AUD_Play(
             sv->disc.ahead = (uint8_t*)malloc(kDiscWindowBytes);
             sv->disc.aheadState = AHEAD_EMPTY;
 
+            // Opened by the I/O thread when there is one (asked below, once the buffers are made);
+            // here only without one.
             ov_callbacks dcb = { DiscRead, DiscSeek, MemClose, DiscTell };
             if (sv->disc.window == nullptr ||
-                ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) < 0)
+                (sAudioIoSem == LWP_SEM_NULL && ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) < 0))
             {
                 LogError("SoundWave '%s': failed to open Vorbis stream on disc.", soundWave->GetName().c_str());
                 WaitReadAhead(&sv->disc);
@@ -920,6 +989,7 @@ void AUD_Play(
                 sv->active = false;
                 return;
             }
+            sv->vfOpen = (sAudioIoSem == LWP_SEM_NULL);
         }
         else
         {
@@ -954,6 +1024,7 @@ void AUD_Play(
             sv->active = false;
             return;
         }
+        sv->vfOpen = true;
         }
 
         sv->active = true;
@@ -984,6 +1055,19 @@ void AUD_Play(
         {
             LogError("SoundWave '%s': failed to allocate stream buffers.", soundWave->GetName().c_str());
             StreamStop(sv);
+            return;
+        }
+
+        if (fromDisc && !sv->vfOpen)
+        {
+            // The I/O thread opens it and decodes the first buffer; AUD_Update sets the voice then.
+            sv->openFormat = voiceFormat;
+            sv->openPitchHz = pitchHz;
+            sv->openVolL = sv->openVolR = spatial ? 0 : volumeInt;
+            sv->openFilled = 0;
+            __asm__ volatile("" ::: "memory");
+            sv->openState = OPEN_REQUESTED;
+            LWP_SemPost(sAudioIoSem);
             return;
         }
 
@@ -1077,6 +1161,8 @@ bool AUD_IsPlaying(uint32_t voiceIndex)
         }
 #endif
         StreamVoice* sv = &sStreams[voiceIndex];
+        if (sv->active && (sv->openState == OPEN_REQUESTED || sv->openState == OPEN_DONE))
+            return true;   // (still being opened by the I/O thread: playing, as far as anyone asks)
         if (sv->active && sv->eof && sv->filled == 0 && VoiceDrained(voiceIndex, sv->buf, 3))
         {
             AUD_Stop(voiceIndex);
@@ -1093,6 +1179,11 @@ void AUD_SetVolume(uint32_t voiceIndex, float leftVolume, float rightVolume)
     int32_t leftVolInt = int32_t(MID_VOLUME * leftVolume);
     int32_t rightVolInt = int32_t(MID_VOLUME * rightVolume);
     ASND_ChangeVolumeVoice(voiceIndex, leftVolInt, rightVolInt);
+    if (voiceIndex < AUDIO_MAX_VOICES && sStreams[voiceIndex].openState != OPEN_NONE)
+    {
+        sStreams[voiceIndex].openVolL = leftVolInt;   // (not set going yet: it starts at this)
+        sStreams[voiceIndex].openVolR = rightVolInt;
+    }
 }
 
 void AUD_SetPitch(uint32_t voiceIndex, float pitch)
