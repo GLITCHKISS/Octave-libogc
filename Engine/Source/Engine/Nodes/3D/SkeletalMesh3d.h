@@ -166,6 +166,7 @@ protected:
     SkeletalMeshRef mSkeletalMesh;
     std::vector<glm::mat4> mBoneMatrices;
     std::vector<Vertex> mSkinnedVertices; // Used by CPU skinning only.
+    std::vector<Vertex> mSkinnedVerticesBack; // (GX: the other of the two, in turn -- CpuSkinVertices)
 
     ScriptableFP<AnimEventHandlerFP> mAnimEventHandler;
     std::string mDefaultAnimation;

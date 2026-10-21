@@ -647,49 +647,47 @@ void SkeletalMesh3D::DetectTriggeredAnimEvents(
     }
 }
 
+// The key before `time` (the one it interpolates from): the first i with time < keys[i + 1], or the second-last key
+// past them all -- found by halving, not walked from the start. Animations baked a key a frame (Castopia's rod: hundreds
+// of keys) walked every key up to the time, for every channel of every bone of every playing animation, each frame.
+template<typename KeyT>
+static uint32_t FindKeyIndex(const std::vector<KeyT>& keys, float time)
+{
+    const uint32_t n = uint32_t(keys.size());
+    if (n < 2)
+    {
+        return 0;
+    }
+    uint32_t lo = 1, hi = n - 1;                // (the first key after `time` is in [lo, hi]; none: n - 1, the last)
+    if (!(time < keys[hi].mTime))
+    {
+        return n - 2;
+    }
+    while (lo < hi)
+    {
+        const uint32_t mid = (lo + hi) / 2;
+        if (time < keys[mid].mTime) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo - 1;
+}
+
 uint32_t SkeletalMesh3D::FindScaleIndex(float time, const Channel& channel)
 {
     OCT_ASSERT(channel.mScaleKeys.size() > 0);
-
-    for (uint32_t i = 0; i < channel.mScaleKeys.size() - 1; ++i)
-    {
-        if (time < channel.mScaleKeys[i + 1].mTime)
-        {
-            return i;
-        }
-    }
-
-    return uint32_t(channel.mScaleKeys.size() - 2);
+    return FindKeyIndex(channel.mScaleKeys, time);
 }
 
 uint32_t SkeletalMesh3D::FindRotationIndex(float time, const Channel& channel)
 {
     OCT_ASSERT(channel.mRotationKeys.size() > 0);
-
-    for (uint32_t i = 0; i < channel.mRotationKeys.size() - 1; ++i)
-    {
-        if (time < channel.mRotationKeys[i + 1].mTime)
-        {
-            return i;
-        }
-    }
-
-    return uint32_t(channel.mRotationKeys.size() - 2);
+    return FindKeyIndex(channel.mRotationKeys, time);
 }
 
 uint32_t SkeletalMesh3D::FindPositionIndex(float time, const Channel& channel)
 {
     OCT_ASSERT(channel.mPositionKeys.size() > 0);
-
-    for (uint32_t i = 0; i < channel.mPositionKeys.size() - 1; ++i)
-    {
-        if (time < channel.mPositionKeys[i + 1].mTime)
-        {
-            return i;
-        }
-    }
-
-    return uint32_t(channel.mPositionKeys.size() - 2);
+    return FindKeyIndex(channel.mPositionKeys, time);
 }
 
 glm::mat4 SkeletalMesh3D::GetBoneTransform(const std::string& name) const
@@ -1195,9 +1193,12 @@ void SkeletalMesh3D::CpuSkinVertices()
     if (mesh != nullptr)
     {
 #if API_GX && !EDITOR
-        // The GX renderer draws these vertices straight from this array, and the GPU may still be
-        // drawing the last frame with them: let it finish before they are rewritten.
-        GxWaitGpu();
+        // The GX renderer draws these vertices straight from the array, and the GPU may still be drawing the last
+        // frame with it. Two arrays, used in turn: the GPU only ever has the frame before in flight (GFX_BeginFrame
+        // waits for the one before that), so the array it was given two frames ago is free to rewrite now. (One array
+        // and a GxWaitGpu here stalled the CPU on the GPU's whole last frame, every frame, at the first skinned mesh:
+        // 3-6 ms on Castopia's pier, and the frame's CPU and GPU no longer overlapped.)
+        mSkinnedVertices.swap(mSkinnedVerticesBack);
 #endif
         mSkinnedVertices.resize(mesh->GetNumVertices());
         const std::vector<VertexSkinned>& verts = mesh->GetVertices();
@@ -1225,10 +1226,11 @@ void SkeletalMesh3D::CpuSkinVertices()
                 Vertex& dstVert = mSkinnedVertices[i];
 
                 static_assert(MAX_BONE_INFLUENCES == 4, "Need to adjust this code or convert to loop.");
+                // (most vertices have one or two bones: the rest, weighted 0, left out)
                 glm::mat4 transform = mBoneMatrices[srcVert.mBoneIndices[0]] * srcVert.mBoneWeights[0];
-                transform += mBoneMatrices[srcVert.mBoneIndices[1]] * srcVert.mBoneWeights[1];
-                transform += mBoneMatrices[srcVert.mBoneIndices[2]] * srcVert.mBoneWeights[2];
-                transform += mBoneMatrices[srcVert.mBoneIndices[3]] * srcVert.mBoneWeights[3];
+                if (srcVert.mBoneWeights[1] != 0.0f) transform += mBoneMatrices[srcVert.mBoneIndices[1]] * srcVert.mBoneWeights[1];
+                if (srcVert.mBoneWeights[2] != 0.0f) transform += mBoneMatrices[srcVert.mBoneIndices[2]] * srcVert.mBoneWeights[2];
+                if (srcVert.mBoneWeights[3] != 0.0f) transform += mBoneMatrices[srcVert.mBoneIndices[3]] * srcVert.mBoneWeights[3];
 
                 dstVert.mPosition = transform * glm::vec4(srcVert.mPosition, 1.0f);
                 dstVert.mNormal = transform * glm::vec4(srcVert.mNormal, 0.0f);
