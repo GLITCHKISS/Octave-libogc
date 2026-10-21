@@ -711,6 +711,21 @@ uint8_t GFX_TextureAnisotropy(Texture* texture)
     return sAnisotropyFilter != nullptr ? sAnisotropyFilter(texture) : 1;
 }
 
+// TRILINEAR, or not: blending two mips costs the texture unit two cycles a pixel, one mip one. Castopia's shop, wood on
+// most of the screen several layers deep, was fill-bound on its grain's trilinear read (2026-10-21: the wood's grain
+// alone cost as much as its grain and AO map read bilinearly). Opt out, texture by texture.
+static GxTrilinearFilter sTrilinearFilter = nullptr;
+
+void GFX_SetTextureTrilinear(GxTrilinearFilter filter)
+{
+    sTrilinearFilter = filter;
+}
+
+bool GFX_TextureTrilinear(Texture* texture)
+{
+    return sTrilinearFilter != nullptr ? sTrilinearFilter(texture) : true;
+}
+
 // Unlit, untextured, and its vertex colours not blending textures: drawn by colour alone.
 bool GFX_MaterialAllowsCompact(Material* material)
 {

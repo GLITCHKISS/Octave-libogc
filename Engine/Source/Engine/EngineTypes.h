@@ -285,6 +285,11 @@ struct EngineConfig
     // widescreen TV). The engine's aspect scale is set from the start (cameras see 16:9), and the boot
     // splash is drawn narrowed so it keeps its shape once stretched. Config.ini: Anamorphic=1.
     bool mAnamorphic = false;
+    // Opaque draws sorted by their material's sort priority, then nearest first, then by material -- so the GPU's early
+    // depth test skips what's already covered, whatever its material (a sky dome given a high priority drawn last).
+    // Off: by material first, as ever. On GameCube a fill-bound view (Castopia's shop) textured each hidden layer.
+    // Config.ini: OpaqueFrontToBack=1.
+    bool mOpaqueFrontToBack = false;
     // Packaging for GameCube/Wii: lit, textured static meshes written in the GPU's compressed
     // vertex formats (StaticMesh::SaveStream) -- under half the bytes to read, and read straight
     // into the form they are drawn from. Opt in per project (Config.ini CookQuantizedMeshes=1).

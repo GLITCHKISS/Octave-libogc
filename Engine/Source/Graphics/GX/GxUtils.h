@@ -74,6 +74,12 @@ bool GFX_QuantizeAllowed(class StaticMesh* mesh);
 typedef uint8_t (*GxAnisotropyFilter)(class Texture* texture);
 void GFX_SetTextureAnisotropy(GxAnisotropyFilter filter);
 uint8_t GFX_TextureAnisotropy(class Texture* texture);
+// Trilinear filtering, texture by texture (GxUtils.cpp): a mipmapped linear texture blends its two nearest mips
+// (GX_LIN_MIP_LIN), which takes the GPU's texture unit twice the cycles of one (GX_LIN_MIP_NEAR). A game answers false
+// for the textures that don't need it. Set it before the textures load. (nullptr, as ever: all trilinear.)
+typedef bool (*GxTrilinearFilter)(class Texture* texture);
+void GFX_SetTextureTrilinear(GxTrilinearFilter filter);
+bool GFX_TextureTrilinear(class Texture* texture);
 // A quantized vertex: int16 x, y, z; int8 normal x, y, z; a pad byte; int16 s, t (GxUtils.cpp)
 static const uint32_t kQuantStride = 14;
 bool GFX_MaterialAllowsCompact(class Material* material);

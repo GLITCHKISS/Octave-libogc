@@ -1025,6 +1025,20 @@ void Renderer::GatherDrawData(World* world)
                 return l.mBlendMode > r.mBlendMode;
             }
 
+            // Config.ini's OpaqueFrontToBack: priority (a sky last), then nearest first, whatever the material
+            if (GetEngineConfig()->mOpaqueFrontToBack)
+            {
+                if (l.mSortPriority != r.mSortPriority)
+                {
+                    return l.mSortPriority < r.mSortPriority;
+                }
+                if (l.mDistance2 != r.mDistance2)
+                {
+                    return l.mDistance2 < r.mDistance2;
+                }
+                return l.mMaterial < r.mMaterial;
+            }
+
             // Sort by material first (just use address)
             if (l.mMaterial != r.mMaterial)
             {

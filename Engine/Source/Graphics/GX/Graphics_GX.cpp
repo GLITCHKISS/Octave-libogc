@@ -853,7 +853,10 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& data)
     switch (texture->GetFilterType())
     {
     case FilterType::Nearest: minFilter = mipmapped ? GX_NEAR_MIP_LIN : GX_NEAR; magFilter = GX_NEAR; break;
-    case FilterType::Linear: minFilter = mipmapped ? GX_LIN_MIP_LIN : GX_LINEAR; magFilter = GX_LINEAR; break;
+    case FilterType::Linear:
+        minFilter = mipmapped ? (GFX_TextureTrilinear(texture) ? GX_LIN_MIP_LIN : GX_LIN_MIP_NEAR) : GX_LINEAR;
+        magFilter = GX_LINEAR;
+        break;
     default: break;
     }
 
