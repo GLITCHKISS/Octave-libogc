@@ -341,10 +341,18 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
 static void StreamStop(StreamVoice* sv)
 {
     if (!sv->active) return;
+    const uint64_t waitFromUs = SYS_GetTimeMicroseconds();
+    const bool wasOpening = (sv->openState == OPEN_REQUESTED), wasReading = (sv->disc.aheadState == AHEAD_REQUESTED);
     while (sv->openState == OPEN_REQUESTED)   // (stopped while the I/O thread opens it: let it finish)
         usleep(500);
     sv->openState = OPEN_NONE;
     WaitReadAhead(&sv->disc);
+    const uint64_t waitedUs = SYS_GetTimeMicroseconds() - waitFromUs;
+    if (waitedUs > 1000)    // (the main thread held up by the I/O thread's disc work: a hitch, logged)
+    {
+        LogWarning("AUDIO stop waited %.1f ms (%s)", waitedUs / 1000.0f,
+                   wasOpening ? "the stream still opening" : (wasReading ? "a read-ahead on the disc" : "?"));
+    }
     sv->disc.aheadState = AHEAD_EMPTY;
     if (sv->vfOpen) ov_clear(&sv->vf);
     sv->vfOpen = false;
@@ -963,6 +971,7 @@ void AUD_Play(
 
         if (fromDisc)
         {
+            LogWarning("AUDIO start %s (streamed from the disc)", soundWave->GetName().c_str());
             // The audio never came off the disc: open it where it lies. Costs one small
             // window of memory however long the track is.
             sv->disc.path = soundWave->GetDiscPath();
