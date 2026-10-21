@@ -281,6 +281,10 @@ struct EngineConfig
     bool mLogToFile = false;
     bool mScriptHotReload = false;
     bool mShowSplash = true;   // "Powered by Octave" boot splash (packaged games)
+    // The picture is anamorphic 16:9: a 4:3 frame the TV stretches wide (a GameCube game made for a
+    // widescreen TV). The engine's aspect scale is set from the start (cameras see 16:9), and the boot
+    // splash is drawn narrowed so it keeps its shape once stretched. Config.ini: Anamorphic=1.
+    bool mAnamorphic = false;
     // Packaging for GameCube/Wii: lit, textured static meshes written in the GPU's compressed
     // vertex formats (StaticMesh::SaveStream) -- under half the bytes to read, and read straight
     // into the form they are drawn from. Opt in per project (Config.ini CookQuantizedMeshes=1).

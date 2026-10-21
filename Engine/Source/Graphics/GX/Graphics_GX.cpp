@@ -123,6 +123,22 @@ namespace
         }
         sGpArmed = false;
 
+        static uint32_t sEpoch = 0;
+        if (sEpoch != OctPerfEpoch())           // (a new window asked for: start the sums over)
+        {
+            sEpoch = OctPerfEpoch();
+            for (uint32_t m = 0; m < kNumGpMetrics; ++m)
+            {
+                sGpSum[m] = 0.0;
+                sGpFrames[m] = 0;
+            }
+            sDlVerts = sDlTris = 0;
+            sDlBatches = sDlFrames = 0;
+            sGpMetric = (sGpMetric + 1) % kNumGpMetrics;
+            sGpPeriodStartUs = SYS_GetTimeMicroseconds();
+            return;
+        }
+
         u32 c0 = 0, c1 = 0;
         GX_ReadGPMetric(&c0, &c1);
         sGpSum[sGpMetric] += c0;

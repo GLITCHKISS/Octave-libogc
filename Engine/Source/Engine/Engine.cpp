@@ -1306,6 +1306,7 @@ void WriteEngineConfig(std::string path)
         fprintf(configIni, "ScriptHotReload=%d\n", sEngineConfig.mScriptHotReload);
         fprintf(configIni, "ColorScale=%d\n", sEngineConfig.mColorScale);
         fprintf(configIni, "ShowSplash=%d\n", sEngineConfig.mShowSplash);
+        fprintf(configIni, "Anamorphic=%d\n", sEngineConfig.mAnamorphic);
         fprintf(configIni, "CookQuantizedMeshes=%d\n", sEngineConfig.mCookQuantizedMeshes);
 
         fclose(configIni);
@@ -1431,6 +1432,8 @@ void ReadEngineConfig(std::string path)
                 sEngineConfig.mColorScale = atoi(value);
             else if (keyStr == "ShowSplash")
                 sEngineConfig.mShowSplash = strToBool(value);
+            else if (keyStr == "Anamorphic")
+                sEngineConfig.mAnamorphic = strToBool(value);
             else if (keyStr == "CookQuantizedMeshes")
                 sEngineConfig.mCookQuantizedMeshes = strToBool(value);
 

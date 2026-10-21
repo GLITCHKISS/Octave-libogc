@@ -152,6 +152,12 @@ void SYS_Initialize()
     VIDEO_WaitVSync();
     VIDEO_WaitVSync();
     engine.mAspectRatioScale = 1.0f;
+    if (GetEngineConfig()->mAnamorphic)
+    {
+        // Config.ini's Anamorphic=1: the 640x480 picture goes to a widescreen TV that stretches it to
+        // 16:9, so cameras see 16:9 squeezed into it -- from the start, before the boot splash
+        engine.mAspectRatioScale = (16.0f / 9.0f) / (4.0f / 3.0f);
+    }
 
 #if ENABLE_LIBOGC_CONSOLE
     // Initialize the console, required for printf
@@ -1391,6 +1397,17 @@ bool OctGeckoLogEnable()
     snprintf(ids, sizeof(ids), "Octave: EXI IDs at boot: slot A %08x, slot B %08x", (unsigned)idA, (unsigned)idB);
     OctGeckoLog(ids);
     return true;
+}
+
+// The Gecko log's sender raised above every other thread, for good: for a game that has found its main thread
+// stuck in a loop (a hang watchdog). The sender is otherwise the lowest of all, and a main thread that never waits
+// starves it -- the lines saying where it hung would sit in the queue unsent.
+void OctGeckoLogUrgent()
+{
+    if (sGeckoThread != LWP_THREAD_NULL)
+        LWP_SetThreadPriority(sGeckoThread, 126);
+    if (sGeckoSem != LWP_SEM_NULL)
+        LWP_SemPost(sGeckoSem);
 }
 
 // Queues a line for the Gecko (no-op until OctGeckoLogEnable). Never waits.

@@ -18,6 +18,103 @@
 #endif
 #if OCT_SKELETAL
 #include "Nodes/3D/SkeletalMesh3d.h"
+
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+#include "Nodes/3D/StaticMesh3d.h"
+#include <ogc/lwp_watchdog.h>       // (gettime: the CPU's timebase, 40.5 MHz)
+void OctLog(const char* format, ...);
+// The console perf log's CULL line, every 5 s: what the "Culling" stat spends its time on, a frame -- each kind of node
+// gathered (its draw data; a widget's PreRender with it), the rest of the gather (sorting the draws), the lights, and
+// the frustum cull -- which also runs each skeletal mesh's animation (anim: its bones, for the CPU skinning) and each
+// particle system's simulation (psim) for those in view, timed apart from the cull itself. ms a frame, and how many.
+// And the ANIM line: each skeletal mesh's animation, by name, the costliest first.
+namespace
+{
+    enum { kCullStatic, kCullSkeletal, kCullParticle, kCull3dOther, kCullWidget, kCullSort, kCullLights, kCullAnim,
+           kCullParticleSim, kCullFrustum, kCullParts };
+    const char* const kCullNames[kCullParts] = { "static", "skeletal", "particle", "other3d", "widgets", "sort", "lights",
+                                                 "anim", "psim", "frustum" };
+    uint64_t sCullUpdateTicks = 0;          // (this frame's animation and particle updates: the cull's own is the rest)
+    struct AnimCost { const void* mNode; char mName[24]; uint64_t mTicks; uint32_t mCount; };
+    AnimCost sAnimCosts[32];
+    uint32_t sNumAnimCosts = 0;
+
+    void NoteAnim(const Node* node, uint64_t ticks)
+    {
+        AnimCost* c = nullptr;
+        for (uint32_t i = 0; i < sNumAnimCosts; ++i) if (sAnimCosts[i].mNode == node) { c = &sAnimCosts[i]; break; }
+        if (c == nullptr && sNumAnimCosts < 32)
+        {
+            c = &sAnimCosts[sNumAnimCosts++];
+            c->mNode = node;
+            snprintf(c->mName, sizeof(c->mName), "%s", node->GetName().c_str());
+            c->mTicks = 0;
+            c->mCount = 0;
+        }
+        if (c != nullptr) { c->mTicks += ticks; c->mCount++; }
+    }
+    uint64_t sCullTicks[kCullParts] = {};
+    uint64_t sCullCount[kCullParts] = {};
+    uint64_t sCullNodeTicks = 0;            // (this frame's gathered nodes: the gather's rest is the sort)
+    uint32_t sCullFrames = 0;
+    uint64_t sCullStartUs = 0;
+    uint32_t sCullEpoch = 0;
+
+    void CullFrameDone(uint64_t gather, uint64_t lights, uint64_t frustum)
+    {
+        if (sCullEpoch != OctPerfEpoch() || sCullStartUs == 0)
+        {
+            sCullEpoch = OctPerfEpoch();
+            for (uint32_t i = 0; i < kCullParts; ++i) { sCullTicks[i] = 0; sCullCount[i] = 0; }
+            sNumAnimCosts = 0;
+            sCullUpdateTicks = 0;
+            sCullFrames = 0;
+            sCullStartUs = SYS_GetTimeMicroseconds();
+            sCullNodeTicks = 0;
+            return;
+        }
+        sCullTicks[kCullSort] += (gather > sCullNodeTicks) ? gather - sCullNodeTicks : 0;
+        sCullTicks[kCullLights] += lights;
+        sCullTicks[kCullFrustum] += (frustum > sCullUpdateTicks) ? frustum - sCullUpdateTicks : 0;
+        sCullNodeTicks = 0;
+        sCullUpdateTicks = 0;
+        sCullFrames++;
+        const uint64_t nowUs = SYS_GetTimeMicroseconds();
+        if (nowUs - sCullStartUs < 5000000 || sCullFrames == 0)
+        {
+            return;
+        }
+        char line[400];
+        int at = snprintf(line, sizeof(line), "CULL");
+        const double perMs = (double)TB_TIMER_CLOCK;   // (timebase ticks a millisecond)
+        for (uint32_t i = 0; i < kCullParts && at < int(sizeof(line)) - 40; ++i)
+        {
+            at += snprintf(line + at, sizeof(line) - at, " %s=%.2fms", kCullNames[i], sCullTicks[i] / perMs / sCullFrames);
+            if (i <= kCullWidget || i == kCullAnim || i == kCullParticleSim)
+            {
+                at += snprintf(line + at, sizeof(line) - at, "(%.0f)", (double)sCullCount[i] / sCullFrames);
+            }
+            sCullTicks[i] = 0;
+            sCullCount[i] = 0;
+        }
+        OctLog("%s", line);
+
+        at = snprintf(line, sizeof(line), "ANIM");          // (the costliest first)
+        for (uint32_t n = 0; n < sNumAnimCosts && at < int(sizeof(line)) - 48; ++n)
+        {
+            uint32_t best = n;
+            for (uint32_t i = n + 1; i < sNumAnimCosts; ++i) if (sAnimCosts[i].mTicks > sAnimCosts[best].mTicks) best = i;
+            const AnimCost t = sAnimCosts[n]; sAnimCosts[n] = sAnimCosts[best]; sAnimCosts[best] = t;
+            at += snprintf(line + at, sizeof(line) - at, " %s=%.2fms", sAnimCosts[n].mName, sAnimCosts[n].mTicks / perMs / sCullFrames);
+        }
+        OctLog("%s", line);
+        sNumAnimCosts = 0;
+
+        sCullFrames = 0;
+        sCullStartUs = nowUs;
+    }
+}
+#endif
 #endif
 #include "Nodes/3D/ShadowMesh3d.h"
 #if OCT_SPLINES
@@ -203,8 +300,12 @@ void Renderer::UpdateSplash()
     glm::uvec4 vp = GetViewport();
     float sw = (vp.z > 0) ? (float)vp.z : (float)GetEngineState()->mWindowWidth;
     float sh = (vp.w > 0) ? (float)vp.w : (float)GetEngineState()->mWindowHeight;
-    mSplashWidget->SetPosition(0.0f, 0.0f);
-    mSplashWidget->SetDimensions(sw, sh);
+    // An anamorphic picture (Config.ini's Anamorphic=1) is stretched wide by the TV: the splash drawn that
+    // much narrower, in the middle, so it keeps its shape -- black either side
+    const float scale = glm::max(1.0f, GetEngineState()->mAspectRatioScale);
+    const float w = sw / scale;
+    mSplashWidget->SetPosition(0.5f * (sw - w), 0.0f);
+    mSplashWidget->SetDimensions(w, sh);
 
     const float t = mSplashTimer;
     float alpha;
@@ -726,6 +827,9 @@ void Renderer::GatherDrawData(World* world)
                 // on Node if we want to tread child visibility independent of the parent.
                 return false;
             }
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+            const uint64_t cullT0 = gettime();
+#endif
 
 #if EDITOR
             if (onlySelected &&
@@ -842,6 +946,29 @@ void Renderer::GatherDrawData(World* world)
             }
 #endif
 
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+            {
+                int32_t kind = -1;
+                if (node->IsPrimitive3D())
+                {
+                    const TypeId t = node->GetType();
+                    kind = (t == StaticMesh3D::GetStaticType()) ? kCullStatic :
+                           (t == SkeletalMesh3D::GetStaticType()) ? kCullSkeletal :
+                           (t == Particle3D::GetStaticType()) ? kCullParticle : kCull3dOther;
+                }
+                else if (node->IsWidget())
+                {
+                    kind = kCullWidget;
+                }
+                if (kind >= 0)
+                {
+                    const uint64_t dt = gettime() - cullT0;
+                    sCullTicks[kind] += dt;
+                    sCullCount[kind]++;
+                    sCullNodeTicks += dt;
+                }
+            }
+#endif
             return true;
         };
 
@@ -1239,7 +1366,34 @@ void Renderer::FrustumCull(Camera3D* camera)
 #endif
 }
 
+static inline void HandleCullResultImpl(DrawData& drawData, bool inFrustum);
+
 static inline void HandleCullResult(DrawData& drawData, bool inFrustum)
+{
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+    const uint64_t t0 = gettime();
+    HandleCullResultImpl(drawData, inFrustum);
+    const uint64_t dt = gettime() - t0;
+#if OCT_SKELETAL
+    if (drawData.mNodeType == SkeletalMesh3D::GetStaticType())
+    {
+        sCullTicks[kCullAnim] += dt; sCullCount[kCullAnim]++; sCullUpdateTicks += dt;
+        NoteAnim(drawData.mNode, dt);
+        return;
+    }
+#endif
+#if OCT_PARTICLES
+    if (drawData.mNodeType == Particle3D::GetStaticType())
+    {
+        sCullTicks[kCullParticleSim] += dt; sCullCount[kCullParticleSim]++; sCullUpdateTicks += dt;
+    }
+#endif
+#else
+    HandleCullResultImpl(drawData, inFrustum);
+#endif
+}
+
+static inline void HandleCullResultImpl(DrawData& drawData, bool inFrustum)
 {
 #if OCT_SKELETAL
     if (drawData.mNodeType == SkeletalMesh3D::GetStaticType())
@@ -1471,9 +1625,17 @@ void Renderer::Render(World* world, int32_t screenIndex)
     // otherwise it increases GPU idle time.
     {
         SCOPED_FRAME_STAT("Culling");
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+        const uint64_t cullA = gettime();
+        uint64_t cullB = 0, cullC = 0;
+#endif
 
         GatherDrawData(world);
 
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+        cullB = gettime();
+        cullC = cullB;
+#endif
         if (enable3D)
         {
             if (activeCamera != nullptr)
@@ -1482,12 +1644,19 @@ void Renderer::Render(World* world, int32_t screenIndex)
             }
 
             GatherLightData(world);
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+            cullC = gettime();
+#endif
 
             if (mFrustumCulling)
             {
                 FrustumCull(activeCamera);
             }
         }
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+        const uint64_t cullD = gettime();
+        CullFrameDone(cullB - cullA, cullC - cullB, cullD - cullC);
+#endif
     }
 
     // Still update UI and cull when minimized (to update animation and particle simulation)

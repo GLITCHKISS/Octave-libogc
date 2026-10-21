@@ -166,6 +166,21 @@ static void LogFrameStats(const std::vector<CpuStat>& stats, float deltaTime)
     static float sWorstFrame = 0.0f;
     static float sTime = 0.0f;
     static uint32_t sFrames = 0;
+    static uint32_t sEpoch = 0;
+
+    if (sEpoch != OctPerfEpoch())           // (a new window asked for: what's gathered so far dropped)
+    {
+        sEpoch = OctPerfEpoch();
+        for (uint32_t i = 0; i < kPerfMaxStats; ++i)
+        {
+            sSum[i] = 0.0f;
+            sWorst[i] = 0.0f;
+        }
+        sWorstFrame = 0.0f;
+        sTime = 0.0f;
+        sFrames = 0;
+        return;
+    }
 
     uint32_t count = glm::min<uint32_t>(uint32_t(stats.size()), kPerfMaxStats);
     float frameMs = deltaTime * 1000.0f;
@@ -232,6 +247,18 @@ static void LogFrameStats(const std::vector<CpuStat>& stats, float deltaTime)
     }
 }
 #endif
+
+static volatile uint32_t sPerfEpoch = 0;
+
+void OctPerfRestart()
+{
+    sPerfEpoch = sPerfEpoch + 1;
+}
+
+uint32_t OctPerfEpoch()
+{
+    return sPerfEpoch;
+}
 
 void Profiler::BeginFrame()
 {

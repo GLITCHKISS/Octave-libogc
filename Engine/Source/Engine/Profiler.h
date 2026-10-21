@@ -16,6 +16,11 @@ void OctLuaPerfBegin(const char* name);
 void OctLuaPerfEnd();
 #endif
 
+// The console perf log's windows (PERF, GPU, CULL: an average every 5 s) started over from now -- for a game comparing
+// one setting with another, each window then all one setting. OctPerfEpoch counts the restarts, for the loggers.
+void OctPerfRestart();
+uint32_t OctPerfEpoch();
+
 struct CpuStat
 {
     char mName[STAT_NAME_BUFFER_LENGTH] = {};
