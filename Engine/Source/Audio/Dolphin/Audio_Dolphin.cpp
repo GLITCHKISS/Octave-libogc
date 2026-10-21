@@ -155,6 +155,14 @@ static void* AudioIoThread(void*)
             {
                 sv->openFilled = StreamFill(sv, sv->buf[0], sv->bufSize);   // the first buffer whole
                 DCFlushRange(sv->buf[0], sv->bufSize);
+                // and the second, queued as soon as the voice starts. Left to AUD_Update, the voice had nothing
+                // queued, so ASND_TestVoiceBufferReady said "about to run dry" and the main thread decoded the whole
+                // buffer in one frame: ~25 ms, a dropped frame at every track's start (seen on hardware, a jolt).
+                if (!sv->eof)
+                {
+                    sv->filled = StreamFill(sv, sv->buf[1], sv->bufSize);
+                    if (sv->filled < sv->bufSize) sv->eof = true;
+                }
             }
             __asm__ volatile("" ::: "memory");   // (all of it written before the main thread is told)
             sv->openState = ok ? OPEN_DONE : OPEN_FAILED;
