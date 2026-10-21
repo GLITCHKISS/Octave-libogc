@@ -1187,11 +1187,26 @@ void SkeletalMesh3D::UpdateAttachedChildren(float deltaTime)
     }
 }
 
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+#include <ogc/lwp_watchdog.h>
+// CPU skinning's share of the animation, for the console perf log's CULL line (Renderer.cpp reads and clears them each
+// frame): the rest of "anim" is the pose -- the keys, the bone matrices, the hierarchy
+uint64_t gOctSkinTicks = 0;
+uint32_t gOctSkinVerts = 0;
+#endif
+
 void SkeletalMesh3D::CpuSkinVertices()
 {
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+    const uint64_t skinT0 = gettime();
+    struct SkinTimer { uint64_t t0; ~SkinTimer() { gOctSkinTicks += gettime() - t0; } } skinTimer{ skinT0 };
+#endif
     SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();
     if (mesh != nullptr)
     {
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+        gOctSkinVerts += mesh->GetNumVertices();
+#endif
 #if API_GX && !EDITOR
         // The GX renderer draws these vertices straight from the array, and the GPU may still be drawing the last
         // frame with it. Two arrays, used in turn: the GPU only ever has the frame before in flight (GFX_BeginFrame

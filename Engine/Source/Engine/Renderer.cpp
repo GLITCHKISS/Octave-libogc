@@ -23,6 +23,8 @@
 #include "Nodes/3D/StaticMesh3d.h"
 #include <ogc/lwp_watchdog.h>       // (gettime: the CPU's timebase, 40.5 MHz)
 void OctLog(const char* format, ...);
+extern uint64_t gOctSkinTicks;      // (SkeletalMesh3d.cpp: CPU skinning's time and vertices since the last frame)
+extern uint32_t gOctSkinVerts;
 // The console perf log's CULL line, every 5 s: what the "Culling" stat spends its time on, a frame -- each kind of node
 // gathered (its draw data; a widget's PreRender with it), the rest of the gather (sorting the draws), the lights, and
 // the frustum cull -- which also runs each skeletal mesh's animation (anim: its bones, for the CPU skinning) and each
@@ -35,6 +37,7 @@ namespace
     const char* const kCullNames[kCullParts] = { "static", "skeletal", "particle", "other3d", "widgets", "sort", "lights",
                                                  "anim", "psim", "frustum" };
     uint64_t sCullUpdateTicks = 0;          // (this frame's animation and particle updates: the cull's own is the rest)
+    uint64_t sSkinTicks = 0, sSkinVerts = 0;    // (of "anim", the CPU skinning: SkeletalMesh3d.cpp's counts)
     struct AnimCost { const void* mNode; char mName[24]; uint64_t mTicks; uint32_t mCount; };
     AnimCost sAnimCosts[32];
     uint32_t sNumAnimCosts = 0;
@@ -68,6 +71,8 @@ namespace
             for (uint32_t i = 0; i < kCullParts; ++i) { sCullTicks[i] = 0; sCullCount[i] = 0; }
             sNumAnimCosts = 0;
             sCullUpdateTicks = 0;
+            sSkinTicks = 0; sSkinVerts = 0;
+            gOctSkinTicks = 0; gOctSkinVerts = 0;
             sCullFrames = 0;
             sCullStartUs = SYS_GetTimeMicroseconds();
             sCullNodeTicks = 0;
@@ -78,12 +83,15 @@ namespace
         sCullTicks[kCullFrustum] += (frustum > sCullUpdateTicks) ? frustum - sCullUpdateTicks : 0;
         sCullNodeTicks = 0;
         sCullUpdateTicks = 0;
+        sSkinTicks += gOctSkinTicks; sSkinVerts += gOctSkinVerts;
+        gOctSkinTicks = 0; gOctSkinVerts = 0;
         sCullFrames++;
         const uint64_t nowUs = SYS_GetTimeMicroseconds();
         if (nowUs - sCullStartUs < 5000000 || sCullFrames == 0)
         {
             return;
         }
+        const uint64_t animTicks = sCullTicks[kCullAnim];   // (for the SKIN line: the loop below clears it)
         char line[400];
         int at = snprintf(line, sizeof(line), "CULL");
         const double perMs = (double)TB_TIMER_CLOCK;   // (timebase ticks a millisecond)
@@ -98,6 +106,13 @@ namespace
             sCullCount[i] = 0;
         }
         OctLog("%s", line);
+
+        {   // (anim split: the pose -- keys, matrices, hierarchy -- and the CPU skinning, and how many vertices skinned)
+            const double animMs = animTicks / perMs / sCullFrames, skinMs = sSkinTicks / perMs / sCullFrames;
+            OctLog("SKIN anim=%.2fms: pose=%.2fms skin=%.2fms (%.0f vertices a frame)", animMs, animMs - skinMs, skinMs,
+                   (double)sSkinVerts / sCullFrames);
+            sSkinTicks = 0; sSkinVerts = 0;
+        }
 
         at = snprintf(line, sizeof(line), "ANIM");          // (the costliest first)
         for (uint32_t n = 0; n < sNumAnimCosts && at < int(sizeof(line)) - 48; ++n)
