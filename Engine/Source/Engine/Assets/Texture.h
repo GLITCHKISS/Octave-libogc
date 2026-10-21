@@ -34,7 +34,7 @@ public:
     // GameCube only: another texture's texels read in the background into ARAM, this texture's own
     // stash (the texture itself untouched, so it can be on the screen meanwhile); then, when wanted,
     // copied in from there in a few milliseconds. For a picture needed at a moment's notice that
-    // the SD card takes seconds to give: a marathon's next sky. StashFrom is false when it cannot
+    // the SD card takes seconds to give: a level's next sky. StashFrom is false when it cannot
     // (another size or format, no ARAM, a stash already being read); IsStashed(name) is true once
     // that asset's texels are all in; ReloadFromStash puts them up (false if there is no stash).
     bool StashFrom(const std::string& assetName);

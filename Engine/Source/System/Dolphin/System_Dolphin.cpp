@@ -665,7 +665,7 @@ static void IsoLocate()
     // 0) The image this program was BOOTED from, when it can be told: the one whose boot DOL is the
     //    code running now (IsoOpenBooted). Found by name or by scan below, a card holding several
     //    builds of one game gave the game the first of them -- new code reading another build's
-    //    scripts and assets (Castopia's hardware tests, 2026-10-17).
+    //    scripts and assets (hardware tests, 2026-10-17).
     if (IsoOpenBooted(pn, pd)) return;
 
     std::string cands[] = {
@@ -1005,7 +1005,7 @@ bool SYS_ReadFileRange(const char* path, bool isAsset, uint32_t offset, uint32_t
 }
 
 // READS IN THE BACKGROUND: SYS_ReadFileRange by a thread of its own, for data the main thread
-// wants soon but must not wait for -- a marathon's change of sky, 4 MB of star frames. The
+// wants soon but must not wait for -- a change of sky, 4 MB of star frames. The
 // console's SD card gives well under a megabyte a second, so read on the main thread that was
 // half a minute at 7 frames a second (Texture::ReloadFromAsync). A piece at a time, 32 KB, so
 // the disc lock is let go between pieces and the music's reads get in. `state` goes 1 while the

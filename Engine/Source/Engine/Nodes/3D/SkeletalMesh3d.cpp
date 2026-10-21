@@ -30,7 +30,7 @@ static_assert(int32_t(AnimationUpdateMode::Count) == 3, "Need to update string c
 FORCE_LINK_DEF(SkeletalMesh3D);
 DEFINE_NODE(SkeletalMesh3D, Mesh3D);
 
-// (16: a game can layer more than 8 -- Castopia's fisherman, his rod's 8 with his walk's 5 over them)
+// (16: a game can layer more than 8 -- a character's 8 arm layers with its walk's 5 over them)
 #define NUM_ANIMATION_SLOTS 16
 
 struct DecompTransform
@@ -648,7 +648,7 @@ void SkeletalMesh3D::DetectTriggeredAnimEvents(
 }
 
 // The key before `time` (the one it interpolates from): the first i with time < keys[i + 1], or the second-last key
-// past them all -- found by halving, not walked from the start. Animations baked a key a frame (Castopia's rod: hundreds
+// past them all -- found by halving, not walked from the start. Animations baked a key a frame (hundreds
 // of keys) walked every key up to the time, for every channel of every bone of every playing animation, each frame.
 template<typename KeyT>
 static uint32_t FindKeyIndex(const std::vector<KeyT>& keys, float time)
@@ -1212,7 +1212,7 @@ void SkeletalMesh3D::CpuSkinVertices()
         // frame with it. Two arrays, used in turn: the GPU only ever has the frame before in flight (GFX_BeginFrame
         // waits for the one before that), so the array it was given two frames ago is free to rewrite now. (One array
         // and a GxWaitGpu here stalled the CPU on the GPU's whole last frame, every frame, at the first skinned mesh:
-        // 3-6 ms on Castopia's pier, and the frame's CPU and GPU no longer overlapped.)
+        // 3-6 ms in a test level, and the frame's CPU and GPU no longer overlapped.)
         mSkinnedVertices.swap(mSkinnedVerticesBack);
 #endif
         mSkinnedVertices.resize(mesh->GetNumVertices());

@@ -37,7 +37,7 @@
 // linked: Octave pulls a whole class in (its registration with it) for any
 // reference, so every use is behind its switch.
 //
-// A 2D game drawing everything itself (Castle Crashers on the GameCube) uses
+// A 2D game drawing everything itself uses
 // none of them: about 830 KB of code and Bullet's 240 KB of pools at start for
 // the first three, about 440 KB more for the rest.
 

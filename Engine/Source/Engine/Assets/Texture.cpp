@@ -712,7 +712,7 @@ bool Texture::ReloadFrom(const std::string& assetName)
 }
 
 // ReloadFrom a piece at a time: `maxBytes` of the texels from byte `at`, so that refilling a big
-// texture is spread over many frames (a marathon's change of sky, while it is being played). The
+// texture is spread over many frames (a change of sky, while the game is being played). The
 // texture shows a mix of the two pictures until the last piece is in: refill one that is not on
 // the screen. Returns where the next piece starts (outTotal when done), or -1.
 int32_t Texture::ReloadPart(const std::string& assetName, uint32_t at, uint32_t maxBytes, uint32_t& outTotal)

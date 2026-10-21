@@ -136,7 +136,7 @@ static u32 _ioFailBlock[MAX_DRIVE];
 // card's (0xffffffff) at a restart is the card itself, left mid-transfer by a read
 // that failed partway (still driving the data line), not some other device: it is
 // reset rather than given up on. Giving up there made one failed read the end of
-// every read that came after (CCGC, level 30's boss: "549 KB in 2 ms (FAILED)").
+// every read that came after (a boss stage: "549 KB in 2 ms (FAILED)").
 static bool _ioCardSeen[MAX_DRIVE];
 static u32 _ioRestartFails;
 

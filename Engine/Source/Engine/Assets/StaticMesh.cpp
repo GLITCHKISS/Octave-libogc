@@ -691,7 +691,7 @@ void StaticMesh::Create()
         // the floats are in the quantized array now; the indices stay (a colour display list may
         // still be made from them at draw time, GFX_DrawStaticMeshComp). Freed AT ONCE, not deferred
         // as ResizeVertexArray does: the GPU never drew from them (the mesh is only now made), and
-        // deferred, a run of meshes loaded in one go (Super Sonic's 43 frames) held every one's
+        // deferred, a run of meshes loaded in one go (a character's 43 frames) held every one's
         // floats until the frame ended -- 1.5 MB -- and the last of them found no room.
         free(mVertices);
         mVertices = nullptr;
@@ -710,7 +710,7 @@ glm::vec3 StaticMesh::GetVertexPosition(uint32_t index)
     return mHasVertexColor ? GetColorVertices()[index].mPosition : GetVertices()[index].mPosition;
 }
 
-// WHY. A marathon changes colours every zone, and on the GameCube the pipe's palettes are the same
+// WHY. A long run that changes colours every zone, on the GameCube: the level's palettes are the same
 // meshes painted differently. Loading another palette's meshes to swap them in held two sets at
 // once (2.8 MB more) and cut the heap up; here the new colours are read off the disc, 4 bytes a
 // vertex, and written into the compact vertex array the display lists already point at.
@@ -860,8 +860,8 @@ bool StaticMesh::ApplyStagedColors()
 
 // WHY. The colours read off the disc (StageColorsFrom) were 44 bytes of vertex for every 4 of
 // colour: some 2 MB for a change of palette, which the console's SD card reads at well under a
-// megabyte a second -- a marathon's change of zone crawled at 7 frames a second for half a
-// minute. Across a pipe's meshes a vertex's colours in all seven palettes come in only ~1,500
+// megabyte a second -- a change of zone crawled at 7 frames a second for half a
+// minute. Across a level's meshes a vertex's colours in all seven palettes come in only ~1,500
 // combinations, so every palette fits in ~135 KB, kept in memory and applied in a few ms.
 bool StaticMesh::SetPaletteColors(const uint8_t* indices, uint32_t indexBytes, const uint8_t* table, uint32_t tableBytes,
                                   uint32_t palettes, uint32_t palette)

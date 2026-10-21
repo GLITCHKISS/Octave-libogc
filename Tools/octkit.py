@@ -5,7 +5,7 @@ and Blender's .blend through Blender itself; videos and fonts go through Octave'
 turns each into
 the .oct asset the editor would have made of it, in Assets/ (the same sub-folders), and Octave's packager then
 cooks them for the console as it does any asset (a texture's GameCube format is chosen there, from its alpha).
-Sonic Pipe Dream's way (its native/*.py wrote its stages, sounds and sky this way), made general.
+A game's own build scripts' way (writing its stages, sounds and sky), made general.
 
     python Tools/octkit.py convert <project folder>     the new and changed files; events as JSON lines
     python Tools/octkit.py status  <project folder>     every file, its asset and whether it's up to date: JSON
@@ -29,7 +29,7 @@ A model becomes a mesh for each of its materials (SM_<Name>, or SM_<Name>_<Mater
 65535 vertices), a material each (M_...), and a texture for each picture in it (T_...): its scene baked flat.
 and its uuid, made once and kept, so what refers to the asset keeps finding it. Missing settings are the
 defaults: what Octave's editor gives a new asset, and for sounds, mono 22 kHz effects and stereo 32 kHz music
-streamed from the disc (as Sonic Pipe Dream's).
+streamed from the disc.
 
 Only Python's standard library; images and audio are read with Octave's own ffmpeg (External/ffmpeg/bin).
 """
@@ -112,7 +112,7 @@ def write_sound(path, name, pcm, rate, channels=1, uuid=None, volume=1.0, pitch=
 def write_music(path, name, source, uuid=None, rate=32000, channels=2, quality=4, volume=1.0):
     """A music asset from any audio file: Vorbis, made here at a proper quality (the engine's own cook
     encodes at a much lower one), stored compressed and STREAMED from the disc as it plays, so a track costs
-    next to no memory. Sonic Pipe Dream's music, made this way."""
+    next to no memory."""
     ogg = _ffmpeg(['-i', str(source), '-vn', '-ac', str(channels), '-ar', str(rate), '-c:a', 'libvorbis',
                    '-q:a', str(quality), '-f', 'ogg', '-'])
     frames = int(round(_duration(source) * rate))

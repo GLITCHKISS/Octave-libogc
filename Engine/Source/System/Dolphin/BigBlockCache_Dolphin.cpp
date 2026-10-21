@@ -4,7 +4,7 @@
 // star frames, the menus) frees and allocates blocks of hundreds of kilobytes all session long.
 // With newlib's malloc that cuts the heap to pieces: small allocations made in between (Lua
 // tables, nodes, strings) land in the holes the big blocks leave, and a few stages later a
-// 512 KB star frame has nowhere to go with 9.7 MB free -- measured in Sonic2Special3D-GC: the
+// 512 KB star frame has nowhere to go with 9.7 MB free -- measured in one game: the
 // largest block fell from 6.5 MB at boot to 544 KB by the third stage, and loads failed.
 //
 // WHAT. Freed blocks of BIG_BLOCK bytes or more are kept here instead of going back to the heap,
@@ -34,7 +34,7 @@
 
 // The heap itself: newlib's reentrant allocators, which malloc() and the rest are thin calls to. Not
 // __real_malloc and the like: those exist only through the link's --wrap, and declared weak (so a game
-// linked without the wrap, like CCGC, still links when it pulls this file in through
+// linked without the wrap still links when it pulls this file in through
 // BigBlockCacheReserve) they pulled nothing in -- in a game WITH the wrap no one else names malloc,
 // so newlib's malloc was never linked, __real_malloc was null, and the first allocation jumped to 0
 // (Octave v2.2-v2.3: every Lua-only game, packaged with Standalone). These are always there.

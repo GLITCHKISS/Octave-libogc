@@ -61,7 +61,7 @@ BULLET_DIR	:=	$(CURDIR)/../External/Bullet
 #---------------------------------------------------------------------------------
 
 # Each function and variable in a section of its own, so a game linking with
-# --gc-sections leaves out what it never uses (PPGC).
+# --gc-sections leaves out what it never uses.
 CFLAGS	= -g -O2 -Wall -ffunction-sections -fdata-sections $(MACHDEP) $(INCLUDE) -DPLATFORM_GAMECUBE=1 -DPLATFORM_DOLPHIN=1 -DAPI_GX=1 \
 			$(OCT_DEFINES)
 CXXFLAGS	=	$(CFLAGS)

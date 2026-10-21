@@ -499,7 +499,7 @@ static void PcmFeed(PcmStream& s)
 //
 // The GameCube has 16 MB of ARAM beside its 24 MB of main memory, reachable only by DMA. A sound
 // effect's PCM moves there when it loads (AUD_ProcessWaveBuffer) and its main-memory copy is
-// freed: in Sonic Pipe Dream that is ~780 KB of main memory back, for 128 KB of voice buffers.
+// freed: in one game that was ~780 KB of main memory back, for 128 KB of voice buffers.
 //
 // libasnd plays from main memory, so a voice playing an ARAM sound has two 8 KB buffers: the
 // first is read from ARAM when it starts, and each time libasnd takes the queued buffer it calls

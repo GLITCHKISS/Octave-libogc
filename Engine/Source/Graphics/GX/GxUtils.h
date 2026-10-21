@@ -19,8 +19,8 @@ class Widget;
 // all 16, the top ones land in the instruction's W and I fields, and it loads ONE float (the 1
 // comes free) from 608 bytes past r13 -- whatever variable the link happens to put there. Every
 // matrix it makes then has that float times the first matrix's translation in its third column.
-// In Sonic Pipe Dream the address was inside StaticMesh::StageColorsFrom's read buffer: once a
-// marathon's hold read colours into it, every 3D object was drawn with a garbage matrix --
+// In one game the address was inside StaticMesh::StageColorsFrom's read buffer: once a
+// stage read colours into it, every 3D object was drawn with a garbage matrix --
 // "stripes to a single point", the frame rate gone -- for as long as the game ran. It was zero
 // until then, so all was well; another build's layout puts another variable there. The C concat
 // is correct, and the engine calls it by name: c_guMtxConcat. The name guMtxConcat is pointed at
@@ -91,8 +91,8 @@ void DestroyMeshDisplayList(void* displayList);
 // To use it: call GxSetCullFrustum in GFX_BeginFrame with the camera's projection (tangents
 // 1 / P[0][0] and 1 / P[1][1], near and far), and CallMeshDisplayListCulled in place of
 // CallMeshDisplayList in GFX_DrawStaticMeshComp with the model-view matrix (before it is turned
-// into the normal matrix). Sonic Pipe Dream left out only ~8% of its batches: its camera looks
-// down the pipe, so nearly all of it is in view.
+// into the normal matrix). One game left out only ~8% of its batches: its camera looks
+// along its course, so nearly all of it is in view.
 void CallMeshDisplayListCulled(void* displayList, uint32_t size, const Mtx modelView);
 void GxSetCullFrustum(bool enabled, float tanHalfX, float tanHalfY, float nearZ, float farZ);
 // For a mesh whose vertices move after its lists are built: its batches are never left out.

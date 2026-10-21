@@ -1,6 +1,6 @@
 """OctTemplate's own build step: DolphinWorks runs this on every Build, after it has converted Raw/ into assets and
 before Octave packages the game -- for what the game makes for itself (data as Lua tables, pictures cut or
-recoloured, levels from a file...). Sonic Pipe Dream's native/*.py scripts did this kind of work.
+recoloured, levels from a file...).
 
     PROJECT   this project's folder (also the working folder)
     OCTAVE    Octave-libogc's folder: octkit (Tools/octkit.py) imports from it

@@ -99,7 +99,7 @@ in the instruction's W and I fields. So it loads one float (the 1 comes free)
 from 608 bytes past r13, from whatever variable the link happens to put there.
 Every matrix it makes then gets that float times the first matrix's
 translation in its third column. That float is usually zero, so all looks well
-until the variable changes. In Sonic Pipe Dream it sat inside a disc read
+until the variable changes. In one game it sat inside a disc read
 buffer: after the first read into it, every 3D object collapsed into "stripes
 to a single point" for the rest of the run, while the 2D HUD was fine.
 - Octave calls `c_guMtxConcat`, and its `GxUtils.h` points the name
@@ -117,12 +117,12 @@ does.
 `GFX_SetQuantizedMeshes(true)` before the scene loads, and
 `GFX_SetQuantizedMeshesExtended(true)` for meshes with vertex colours or a
 second UV set of their own. A mesh with both goes from 44 bytes a vertex to 22.
-Castopia's pier and outpost gained about 510 KB of RAM this way, and looked the
+A test level of docks and buildings gained about 510 KB of RAM this way, and looked the
 same. Meshes larger than about 125 units, or with UVs past about 125, stay as
 floats on their own.
 - A quantized mesh has no float vertices left: `GetVertices()` returns null.
   Any mesh the game's code reads or rewrites a vertex at a time has to answer
-  false in `GFX_SetQuantizeFilter`. See Castopia's `Main.cpp`.
+  false in `GFX_SetQuantizeFilter`.
 
 ---
 
@@ -152,7 +152,7 @@ vector's final size at boot.
 
 **Don't** let a Lua table grow for the whole of a session either. Lua keeps a
 table's slots in one block and doubles it when it fills: past 8192 slots that
-is 128 KB in one piece, plus the old 64 KB during the copy. A marathon kept its
+is 128 KB in one piece, plus the old 64 KB during the copy. A long run kept its
 track, a table per frame, in one table for the whole run. At the fourth zone
 the heap had 2.5 MB free and no 128 KB piece, so the zone could not be joined.
 It was built again and failed again every 1.7 s until the run ran off the end
@@ -252,7 +252,7 @@ gives each reading thread its own handle (`IsoFileForThread` in
 **Do** stash data that's needed at a moment's notice in ARAM when the card is
 too slow to read it then: `Texture:StashFrom` reads a texture's texels into
 ARAM in the background, and `ReloadFromStash` DMAs them in within a few
-milliseconds. That's how a marathon's next sky is ready on the emerald.
+milliseconds. That's how a long run's next sky can be ready the moment it's needed.
 
 **Don't** allocate a bounce buffer for each read. Under memory pressure the
 `memalign` fails, and the read fails part way. The disc reader now uses one
@@ -319,7 +319,7 @@ Each step is cheap. Jumping straight to custom checks is what cost hours before.
   `Dolphin.exe -u <dir> -C Dolphin.Core.FastDiscSpeed=True -C Dolphin.Core.EmulationSpeed=0 -b -e <game>.iso`.
   For gdb, add `-C Dolphin.General.GDBPort=2345 -C Dolphin.Interface.DebugModeEnabled=True`.
 - **Screenshots on a timer**, not by hand, and a game-side test switch that
-  plays the game by itself up to the bug (Sonic Pipe Dream's `GcTest.lua`).
+  plays the game by itself up to the bug.
 
 **Hardware-true Dolphin.** The launch line above is tuned for fast repeats.
 To chase a "console only" bug, or to confirm a fix before a hardware test, set

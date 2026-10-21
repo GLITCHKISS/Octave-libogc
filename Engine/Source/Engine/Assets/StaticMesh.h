@@ -93,8 +93,8 @@ public:
     // each of several palettes, at once and without reading anything. `indices` is 2 bytes a
     // vertex -- which combination of colours the vertex has, high byte first and plus 32 --
     // and `table` every combination's colour in each of `palettes` palettes, 4 bytes each,
-    // little-endian (as a mesh file holds its colours), palette 0 first. See Sonic Pipe Dream's
-    // native/make_pipe_palettes.py. False (and nothing changed) if the data does not fit the mesh.
+    // little-endian (as a mesh file holds its colours), palette 0 first. A build script
+    // can write it. False (and nothing changed) if the data does not fit the mesh.
     bool SetPaletteColors(const uint8_t* indices, uint32_t indexBytes, const uint8_t* table, uint32_t tableBytes,
                           uint32_t palettes, uint32_t palette);
 

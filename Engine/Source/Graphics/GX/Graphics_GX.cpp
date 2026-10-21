@@ -40,8 +40,8 @@
 #include <ogc/machine/processor.h>      // _CPU_ISR_Disable / Restore
 // The GP FIFO. 256 KB froze a real GameCube (not Dolphin) once a frame sent more than it took:
 // CPU-skinned meshes go through it a vertex at a time (GX_Position1x16 and the rest: 24 bytes a
-// triangle), and Castopia's full fisherman (seven of them, ~9,600 triangles, ~230 KB) hung the GPU
-// as he came into view, every time; 6,900 triangles never did. 1 MB holds that with room over.
+// triangle), and a full character (seven meshes, ~9,600 triangles, ~230 KB) hung the GPU
+// as it came into view, every time; 6,900 triangles never did. 1 MB holds that with room over.
 #define DEFAULT_FIFO_SIZE    (1024*1024)
 
 GxContext gGxContext;
@@ -226,7 +226,7 @@ void GxWaitGpu()
     // Everything queued so far, this frame's commands included. A frame in flight STAYS in flight:
     // GFX_BeginFrame still has to show it (its wait then returns at once). Marked done here, it was
     // never handed to the video interface -- a dropped frame -- and the next one was copied into
-    // the framebuffer on screen, torn, on every frame that waited here: all through a marathon's
+    // the framebuffer on screen, torn, on every frame that waited here: all through a long run's
     // hold (ApplyStagedColors) and a sky's change of stars (Texture::ReloadPart).
     GX_DrawDone();
 #if PROFILING_ENABLED

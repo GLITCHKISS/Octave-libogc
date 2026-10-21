@@ -117,7 +117,7 @@ bool OctDvdReadAligned(uint32_t alignedOff, void* dst, uint32_t alignedLen)
 // own 499 KB already taken), and the game retried it forever.
 // The scratch buffer is a fixed one, not taken from the heap each read: a 64 KB block
 // wanted for every read failed now and then with the heap full, and the read failed
-// with it (a marathon's change of sky left frames half one sky). Every caller holds the
+// with it (a change of sky left frames half one sky). Every caller holds the
 // disc lock (IsoReadRaw), so one buffer serves them all.
 // Made at the first read from a disc (at boot, while memory is in one piece) and kept: a game that
 // reads its image from the SD card never reads the disc, and doesn't keep these 64 KB.

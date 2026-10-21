@@ -711,7 +711,7 @@ uint8_t GFX_TextureAnisotropy(Texture* texture)
     return sAnisotropyFilter != nullptr ? sAnisotropyFilter(texture) : 1;
 }
 
-// TRILINEAR, or not: blending two mips costs the texture unit two cycles a pixel, one mip one. Castopia's shop, wood on
+// TRILINEAR, or not: blending two mips costs the texture unit two cycles a pixel, one mip one. A shop interior, wood on
 // most of the screen several layers deep, was fill-bound on its grain's trilinear read (2026-10-21: the wood's grain
 // alone cost as much as its grain and AO map read bilinearly). Opt out, texture by texture.
 static GxTrilinearFilter sTrilinearFilter = nullptr;
@@ -1075,7 +1075,7 @@ void ApplyWidgetRotation(Mtx& mtx, Widget* widget)
 //
 // Strips: a list of separate triangles makes the GPU transform three vertices for every triangle,
 // shared or not -- it keeps no transformed vertices to reuse. In a strip each triangle after the
-// first adds ONE vertex. Measured on hardware (Sonic Pipe Dream, 2026-09-24), the frame's GPU time
+// first adds ONE vertex. Measured on hardware (2026-09-24), the frame's GPU time
 // went with the triangles sent, about 0.25 ms a thousand, with the transform unit waiting on
 // triangle setup nearly all the time it was busy. The triangles and their winding are exactly the
 // mesh's: only the order they are sent in changes.
