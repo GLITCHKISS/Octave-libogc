@@ -617,6 +617,41 @@ void SkeletalMesh3D::ClearBoneDynamics()
     mBoneColliders.clear();
 }
 
+// the nearest points of segments p1-q1 and p2-q2: s along the first, t along the second (0..1)
+static void ClosestOnSegments(const glm::vec3& p1, const glm::vec3& q1, const glm::vec3& p2, const glm::vec3& q2, float& s, float& t)
+{
+    const glm::vec3 d1 = q1 - p1, d2 = q2 - p2, r = p1 - p2;
+    const float a = glm::dot(d1, d1), e = glm::dot(d2, d2), f = glm::dot(d2, r);
+    const float eps = 0.00000001f;
+    s = t = 0.0f;
+    if (a <= eps && e <= eps)
+        return;
+    if (a <= eps)
+    {
+        t = glm::clamp(f / e, 0.0f, 1.0f);
+        return;
+    }
+    const float c = glm::dot(d1, r);
+    if (e <= eps)
+    {
+        s = glm::clamp(-c / a, 0.0f, 1.0f);
+        return;
+    }
+    const float b = glm::dot(d1, d2), denom = a * e - b * b;
+    s = (denom > eps) ? glm::clamp((b * f - c * e) / denom, 0.0f, 1.0f) : 0.0f;
+    t = (b * s + f) / e;
+    if (t < 0.0f)
+    {
+        t = 0.0f;
+        s = glm::clamp(-c / a, 0.0f, 1.0f);
+    }
+    else if (t > 1.0f)
+    {
+        t = 1.0f;
+        s = glm::clamp((b - c) / a, 0.0f, 1.0f);
+    }
+}
+
 void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
 {
     SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();
@@ -700,20 +735,33 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                         chain.mPos[i] = chain.mPos[i - 1] + d * (sLength[i] / len);
                 }
 
-                // out of the colliders
+                // out of the colliders: the whole of each segment, not only its joints (a collider can come up
+                // between two), its two ends moved by how near the contact is to each -- the root's end stays
                 for (uint32_t i = 1; i < numPoints; ++i)
                 {
                     for (uint32_t c = 0; c < mBoneColliders.size(); ++c)
                     {
-                        glm::vec3 ab = sColB[c] - sColA[c];
-                        float ab2 = glm::dot(ab, ab);
-                        float u = (ab2 > 0.000001f) ? glm::clamp(glm::dot(chain.mPos[i] - sColA[c], ab) / ab2, 0.0f, 1.0f) : 0.0f;
-                        glm::vec3 closest = sColA[c] + ab * u;
-                        glm::vec3 away = chain.mPos[i] - closest;
+                        float s, u;
+                        ClosestOnSegments(chain.mPos[i - 1], chain.mPos[i], sColA[c], sColB[c], s, u);
+                        glm::vec3 away = glm::mix(chain.mPos[i - 1], chain.mPos[i], s) - glm::mix(sColA[c], sColB[c], u);
                         float dist = glm::length(away);
                         float reach = (mBoneColliders[c].mRadius + chain.mRadius) * scale;
-                        if (dist < reach && dist > 0.00001f)
-                            chain.mPos[i] = closest + away * (reach / dist);
+                        if (dist >= reach || dist < 0.00001f)
+                            continue;
+
+                        glm::vec3 push = away * ((reach - dist) / dist);
+                        if (i == 1)
+                        {
+                            if (s < 0.2f)                   // (at the pinned root itself: nothing to move)
+                                continue;
+                            chain.mPos[i] += push / s;
+                        }
+                        else
+                        {
+                            float w = 1.0f / ((1.0f - s) * (1.0f - s) + s * s);
+                            chain.mPos[i - 1] += push * ((1.0f - s) * w);
+                            chain.mPos[i] += push * (s * w);
+                        }
                     }
                 }
             }
