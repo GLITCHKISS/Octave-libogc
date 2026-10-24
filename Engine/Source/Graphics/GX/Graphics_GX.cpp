@@ -1552,6 +1552,294 @@ void GFX_DrawShadowMeshComp(ShadowMesh3D* shadowMeshComp)
     }
 }
 
+// Projected shadows (a silhouette rendered into a texture and projected). Each frame the casters are drawn from an orthographic
+// camera straight above them -- one flat grey over white -- into a corner of the EFB, copied into an I8 texture
+// (which clears that corner again), and that texture is then laid straight down onto the receivers: each is drawn
+// again with its texture coordinates generated from its position through the same camera, multiplying what is
+// already there (white leaves it, grey darkens it), only where it is the nearest surface (equal depth). The camera
+// is fitted to the casters each frame, so the texture is spent on them alone and stays crisp at a small size.
+static const uint32_t kProjShadowRes = 128;
+static void* sProjShadowTex = nullptr;
+static GXTexObj sProjShadowTexObj;
+static Mtx sProjShadowView;
+static float sProjShadowHalf = 1.0f;
+static glm::vec3 sProjShadowCenter = { 0.0f, 0.0f, 0.0f };
+static float sProjShadowTop = 0.0f;
+static bool sProjShadowValid = false;
+
+static void ProjShadowLoadMtx(const glm::mat4& m, Mtx out)
+{
+    glm::mat4 t = glm::transpose(m);
+    memcpy(out, &t, sizeof(float) * 4 * 3);
+}
+
+static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx view)
+{
+    SkeletalMesh* mesh = skeletalMeshComp->GetSkeletalMesh();
+    if (mesh == nullptr)
+        return;
+
+    bool cpuSkinned = IsCpuSkinningRequired(skeletalMeshComp);
+    if (cpuSkinned)
+    {
+        Vertex* vertices = skeletalMeshComp->GetSkinnedVertices();
+        uint32_t numVertices = skeletalMeshComp->GetNumSkinnedVertices();
+
+        GX_ClearVtxDesc();
+        GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
+        GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+        GX_SetArray(GX_VA_POS, &vertices[0].mPosition, sizeof(Vertex));
+        DCFlushRange(vertices, numVertices * sizeof(Vertex));
+        GX_InvVtxCache();
+    }
+    else
+    {
+        BindSkeletalMesh(mesh);
+    }
+
+    Mtx model, modelView;
+    ProjShadowLoadMtx(skeletalMeshComp->GetRenderTransform(), model);
+    c_guMtxConcat(view, model, modelView);
+
+    if (cpuSkinned)
+    {
+        GX_LoadPosMtxImm(modelView, GX_PNMTX0);
+    }
+    else
+    {
+        uint32_t numBones = skeletalMeshComp->GetNumBones();
+        for (uint32_t i = 0; i < numBones; ++i)
+        {
+            Mtx bone, fullTransform;
+            ProjShadowLoadMtx(skeletalMeshComp->GetBoneTransform(i), bone);
+            c_guMtxConcat(modelView, bone, fullTransform);
+            GX_LoadPosMtxImm(fullTransform, GX_PNMTX0 + i * 3);
+        }
+    }
+
+    const uint32_t numFaces = mesh->GetNumFaces();
+    const uint32_t kMaxFacesPerBatch = 21845;
+    const uint16_t* indices = mesh->GetIndices();
+    const VertexSkinned* verts = mesh->GetVertices().data();
+
+    for (uint32_t firstFace = 0; firstFace < numFaces; firstFace += kMaxFacesPerBatch)
+    {
+        const uint32_t batchFaces = (numFaces - firstFace < kMaxFacesPerBatch) ? (numFaces - firstFace) : kMaxFacesPerBatch;
+        GX_Begin(GX_TRIANGLES, GX_VTXFMT0, uint16_t(batchFaces * 3));
+        for (uint32_t i = firstFace; i < firstFace + batchFaces; ++i)
+        {
+            for (uint32_t c = 0; c < 3; ++c)
+            {
+                uint16_t idx = indices[i * 3 + c];
+                if (cpuSkinned)
+                {
+                    GX_Position1x16(idx);
+                }
+                else
+                {
+                    // BindSkeletalMesh's format: the matrix index, then position, normal and both texcoords.
+                    GX_MatrixIndex1x8(uint8_t(3 * verts[idx].mBoneIndices[0]));
+                    GX_Position1x16(idx);
+                    GX_Normal1x16(idx);
+                    GX_TexCoord1x16(idx);
+                    GX_TexCoord1x16(idx);
+                }
+            }
+        }
+        GX_End();
+    }
+}
+
+void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
+{
+    sProjShadowValid = false;
+    Camera3D* camera = gGxContext.mWorld ? gGxContext.mWorld->GetActiveCamera() : nullptr;
+    if (casters.empty() || camera == nullptr)
+        return;
+
+    if (sProjShadowTex == nullptr)
+    {
+        uint32_t size = GX_GetTexBufferSize(kProjShadowRes, kProjShadowRes, GX_TF_I8, GX_FALSE, 0);
+        sProjShadowTex = memalign(32, size);
+        if (sProjShadowTex == nullptr)
+            return;
+        GX_InitTexObj(&sProjShadowTexObj, sProjShadowTex, kProjShadowRes, kProjShadowRes, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+        GX_InitTexObjLOD(&sProjShadowTexObj, GX_LINEAR, GX_LINEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
+    }
+
+    // The camera: over the first caster (the others -- what it wears, what it holds -- ride with it), looking
+    // straight down, its view half the size of the caster's bounds each way (the bounds hold it in every pose).
+    SkeletalMesh3D* lead = casters[0];
+    Bounds b = lead->GetBounds();
+    float radius = (lead->GetBoundsRadiusOverride() > 0.0f) ? lead->GetBoundsRadiusOverride() : b.mRadius;
+    sProjShadowHalf = glm::max(0.25f, radius * 0.5f);
+    sProjShadowCenter = lead->GetWorldPosition();
+    sProjShadowTop = sProjShadowCenter.y + radius;
+
+    guVector eye = { sProjShadowCenter.x, sProjShadowCenter.y + 20.0f, sProjShadowCenter.z };
+    guVector up = { 0.0f, 0.0f, -1.0f };
+    guVector look = { sProjShadowCenter.x, sProjShadowCenter.y, sProjShadowCenter.z };
+    guLookAt(sProjShadowView, &eye, &up, &look);
+
+    // The corner of the EFB, white first (no shadow), its border kept white (clamped, nothing smears off its edge).
+    GX_SetViewport(0, 0, kProjShadowRes, kProjShadowRes, 0, 1);
+    GX_SetScissor(0, 0, kProjShadowRes, kProjShadowRes);
+
+    GxResetIndirect();
+    GX_SetNumTexGens(0);
+    GX_SetNumTevStages(1);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+    GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+    gGxContext.mLighting.mEnabled = false;
+    gGxContext.mLighting.mColorChannel = false;
+    gGxContext.mLighting.mMaterialSrc = GX_SRC_REG;
+    SetupLightingChannels();
+    GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetAlphaUpdate(GX_FALSE);
+    GX_SetCullMode(GX_CULL_NONE);
+    GX_SetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, { 0, 0, 0, 0 });
+    gGxContext.mApplyFog = false;
+
+    Mtx44 proj;
+    guOrtho(proj, 1.0f, -1.0f, -1.0f, 1.0f, 0.0f, 2.0f);
+    GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
+    Mtx ident;
+    guMtxIdentity(ident);
+    GX_LoadPosMtxImm(ident, GX_PNMTX0);
+    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    GX_SetChanMatColor(GX_COLOR0A0, { 255, 255, 255, 255 });
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+    GX_Position3f32(-1.0f, -1.0f, -1.0f);
+    GX_Position3f32(1.0f, -1.0f, -1.0f);
+    GX_Position3f32(1.0f, 1.0f, -1.0f);
+    GX_Position3f32(-1.0f, 1.0f, -1.0f);
+    GX_End();
+
+    // The casters in one grey: as dark as the world's shadow colour says (its colour, by its alpha).
+    glm::vec4 sc = gGxContext.mWorld->GetShadowColor();
+    glm::vec3 g = glm::mix(glm::vec3(1.0f), glm::vec3(sc), glm::clamp(sc.a, 0.0f, 1.0f));
+    GX_SetChanMatColor(GX_COLOR0A0, { uint8_t(g.r * 255.0f), uint8_t(g.g * 255.0f), uint8_t(g.b * 255.0f), 255 });
+    GX_SetScissor(2, 2, kProjShadowRes - 4, kProjShadowRes - 4);
+    guOrtho(proj, sProjShadowHalf, -sProjShadowHalf, -sProjShadowHalf, sProjShadowHalf, 0.1f, 200.0f);
+    GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
+    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+    for (SkeletalMesh3D* caster : casters)
+    {
+        ProjShadowDrawCaster(caster, sProjShadowView);
+    }
+
+    // Into the texture, the corner cleared again for the frame (the copy's clear: the frame's own clear colour and
+    // depth). No copy filter on it (the display copy's vertical filter would soften it).
+    GXRModeObj* rmode = &GetEngineState()->mSystem.mGxRmode;
+    GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+    GX_SetTexCopySrc(0, 0, kProjShadowRes, kProjShadowRes);
+    // R8: the red channel copied as it is. An I8 copy goes through the video luma conversion (white comes out
+    // 235, black 16), and every receiver under the box was darkened by 235/255 where there was no shadow.
+    GX_SetTexCopyDst(kProjShadowRes, kProjShadowRes, GX_CTF_R8, GX_FALSE);
+    GX_CopyTex(sProjShadowTex, GX_TRUE);
+    GX_PixModeSync();
+    GX_InvalidateTexAll();
+    GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE, rmode->vfilter);
+
+    // Back to the frame's own camera.
+    GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
+    GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
+    Mtx44 projection;
+    glm::mat4 camProjection = camera->GetProjectionMatrix();
+    memcpy(&projection, &camProjection, sizeof(Mtx44));
+    GX_LoadProjectionMtx(projection, camera->GetProjectionMode() == ProjectionMode::ORTHOGRAPHIC ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
+    GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+
+    sProjShadowValid = true;
+}
+
+void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receivers)
+{
+    Camera3D* camera = gGxContext.mWorld ? gGxContext.mWorld->GetActiveCamera() : nullptr;
+    if (!sProjShadowValid || camera == nullptr)
+        return;
+
+    // texture coordinates from the shadow camera's view: s across, t down the texture
+    Mtx texFromView = { { 0.5f / sProjShadowHalf, 0.0f, 0.0f, 0.5f },
+                        { 0.0f, -0.5f / sProjShadowHalf, 0.0f, 0.5f },
+                        { 0.0f, 0.0f, 0.0f, 1.0f } };
+    Mtx texFromWorld;
+    c_guMtxConcat(texFromView, sProjShadowView, texFromWorld);
+
+    Mtx view;
+    ProjShadowLoadMtx(camera->GetViewMatrix(), view);
+
+    GxResetIndirect();
+    GX_SetNumTexGens(1);
+    GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_POS, GX_TEXMTX9);
+    GX_LoadTexObj(&sProjShadowTexObj, GX_TEXMAP0);
+    GX_SetNumTevStages(1);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+    GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+    gGxContext.mLighting.mEnabled = false;
+    gGxContext.mLighting.mColorChannel = false;
+    gGxContext.mLighting.mMaterialSrc = GX_SRC_REG;
+    SetupLightingChannels();
+    GX_SetChanMatColor(GX_COLOR0A0, { 255, 255, 255, 255 });
+    GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
+    GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_FALSE);                 // only where the receiver is what's seen
+    GX_SetZCompLoc(GX_TRUE);
+    GX_SetBlendMode(GX_BM_BLEND, GX_BL_DSTCLR, GX_BL_ZERO, GX_LO_CLEAR);   // what's there, times the shadow texture
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetAlphaUpdate(GX_FALSE);
+    GX_SetCullMode(GX_CULL_FRONT);
+    GX_SetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, { 0, 0, 0, 0 });
+    gGxContext.mApplyFog = false;
+
+    const float reach = sProjShadowHalf * 1.42f;               // (the box's corner)
+    for (StaticMesh3D* comp : receivers)
+    {
+        StaticMesh* mesh = comp->GetStaticMesh();
+        if (mesh == nullptr)
+            continue;
+        StaticMeshResource* res = mesh->GetResource();
+
+        // only what lies under the box, and not above the caster's top
+        Bounds b = comp->GetBounds();
+        float dx = b.mCenter.x - sProjShadowCenter.x, dz = b.mCenter.z - sProjShadowCenter.z;
+        float r = b.mRadius + reach;
+        if (dx * dx + dz * dz > r * r || b.mCenter.y - b.mRadius > sProjShadowTop)
+            continue;
+
+        bool hasInstanceColors = comp->HasInstanceColors();
+        bool hasColor = mesh->HasVertexColor() || hasInstanceColors;
+        BindStaticMesh(mesh, hasInstanceColors ? comp->GetInstanceColors().data() : nullptr);
+
+        Mtx model, modelView, texMtx;
+        ProjShadowLoadMtx(comp->GetRenderTransform(), model);
+        c_guMtxConcat(view, model, modelView);
+        GX_LoadPosMtxImm(modelView, GX_PNMTX0);
+        c_guMtxConcat(texFromWorld, model, texMtx);
+        GX_LoadTexMtxImm(texMtx, GX_TEXMTX9, GX_TG_MTX2x4);
+
+        if (hasColor)
+        {
+            if (res->mColorDisplayList == nullptr)
+                res->mColorDisplayList = CreateMeshDisplayList(mesh, true, res->mColorDisplayListSize);
+            CallMeshDisplayList(res->mColorDisplayList, res->mColorDisplayListSize);
+        }
+        else
+        {
+            CallMeshDisplayList(res->mDisplayList, res->mDisplayListSize);
+        }
+    }
+
+    // The draws after this bind their materials again (blend, depth, texgens, TEV); fog comes back with the first
+    // material that wants it (BindMaterial, mApplyFog).
+    GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+}
+
 // InstancedMeshComp
 #if OCT_INSTANCING
 void GFX_DrawInstancedMeshComp(InstancedMesh3D* instancedMeshComp)

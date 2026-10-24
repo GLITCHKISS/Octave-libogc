@@ -1003,6 +1003,16 @@ bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* skeletalMeshComp)
 }
 
 // ShadowMeshComp
+void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
+{
+    // Not implemented on this backend yet (GX only).
+}
+
+void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receivers)
+{
+    // Not implemented on this backend yet (GX only).
+}
+
 void GFX_DrawShadowMeshComp(ShadowMesh3D* shadowMeshComp)
 {
     StaticMesh* mesh = shadowMeshComp->GetStaticMesh();

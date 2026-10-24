@@ -82,6 +82,8 @@ enum class PipelineConfig
     Wireframe,
     Collision,
     Line,
+    ProjShadowCaster,
+    ProjShadowReceiver,
 
     Count
 };

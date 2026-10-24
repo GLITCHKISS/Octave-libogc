@@ -199,6 +199,41 @@ void InitPipelineConfigs()
     }
 
     {
+        // Projected shadow, the casters' silhouette into the shadow texture (no depth: a colour target alone;
+        // both sides; one flat grey). The vertex shader (Shadow.vert / ShadowSkinned.vert) is set per caster.
+        PipelineState& state = sPipelineConfigs[(uint32_t)PipelineConfig::ProjShadowCaster];
+        state = sPipelineConfigs[(uint32_t)PipelineConfig::Forward];
+        state.mVertexShader = gVulkanContext->GetGlobalShader("Shadow.vert");
+        state.mFragmentShader = gVulkanContext->GetGlobalShader("ProjShadowCaster.frag");
+        state.mVertexType = VertexType::Vertex;
+        state.mCullMode = VK_CULL_MODE_NONE;
+        state.mDepthTestEnabled = false;
+        state.mDepthWriteEnabled = false;
+        state.mBlendStates[0] = GetBasicBlendState(BasicBlendState::Opaque);
+    }
+
+    {
+        // Projected shadow, laid onto a receiver: drawn again over it (equal depth, no depth write), multiplying
+        // what is there by the shadow texture (dst * src).
+        PipelineState& state = sPipelineConfigs[(uint32_t)PipelineConfig::ProjShadowReceiver];
+        state = sPipelineConfigs[(uint32_t)PipelineConfig::Forward];
+        state.mFragmentShader = gVulkanContext->GetGlobalShader("ProjShadowReceiver.frag");
+        state.mDepthTestEnabled = true;
+        state.mDepthWriteEnabled = false;
+        state.mDepthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        state.mCullMode = VK_CULL_MODE_BACK_BIT;
+        state.mBlendStates[0] = GetBasicBlendState(BasicBlendState::Opaque);
+        state.mBlendStates[0].blendEnable = VK_TRUE;
+        state.mBlendStates[0].srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
+        state.mBlendStates[0].dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        state.mBlendStates[0].colorBlendOp = VK_BLEND_OP_ADD;
+        state.mBlendStates[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        state.mBlendStates[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        state.mBlendStates[0].alphaBlendOp = VK_BLEND_OP_ADD;
+        state.mBlendStates[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+    }
+
+    {
         // Line
         PipelineState& state = sPipelineConfigs[(uint32_t)PipelineConfig::Line];
         state.mVertexShader = gVulkanContext->GetGlobalShader("Line.vert");

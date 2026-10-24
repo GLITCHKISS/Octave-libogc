@@ -110,6 +110,12 @@ bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* skeletalMeshComp);
 // ShadowMesh3D uses StaticMeshCompResource for now.
 void GFX_DrawShadowMeshComp(ShadowMesh3D* shadowMeshComp);
 
+// Projected shadows: the casters (skeletal meshes with Cast Shadows) drawn as a silhouette from an orthographic
+// camera straight above them into a texture, before the forward pass; then that texture laid straight down onto the
+// receivers (opaque static meshes with Receive Projected Shadows) under them, after the opaque draws.
+void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters);
+void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receivers);
+
 // InstancedMeshComp
 void GFX_DrawInstancedMeshComp(InstancedMesh3D* instancedMeshComp);
 

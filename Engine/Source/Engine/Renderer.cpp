@@ -1764,6 +1764,33 @@ void Renderer::Render(World* world, int32_t screenIndex)
                     GFX_EndRenderPass();
 #endif
 
+                    // ********************
+                    //  Projected Shadows
+                    // ********************
+                    // The casters' silhouette, from straight above them, into the shadow texture.
+                    std::vector<SkeletalMesh3D*> shadowCasters;
+                    std::vector<StaticMesh3D*> shadowReceivers;
+                    for (const std::vector<DrawData>* list : { &mOpaqueDraws, &mPostShadowOpaqueDraws })
+                    {
+                        for (const DrawData& d : *list)
+                        {
+                            if (d.mNodeType == SkeletalMesh3D::GetStaticType())
+                            {
+                                SkeletalMesh3D* sk = static_cast<SkeletalMesh3D*>(d.mNode);
+                                if (sk->ShouldCastShadows()) shadowCasters.push_back(sk);
+                            }
+                            else if (d.mNodeType == StaticMesh3D::GetStaticType())
+                            {
+                                StaticMesh3D* sm = static_cast<StaticMesh3D*>(d.mNode);
+                                if (sm->ShouldReceiveShadows()) shadowReceivers.push_back(sm);
+                            }
+                        }
+                    }
+                    if (!shadowCasters.empty())
+                    {
+                        GFX_RenderProjectedShadowMap(shadowCasters);
+                    }
+
                     GFX_SetViewport(sceneViewportX, sceneViewportY, sceneViewportWidth, sceneViewportHeight);
                     GFX_SetScissor(sceneViewportX, sceneViewportY, sceneViewportWidth, sceneViewportHeight);
 
@@ -1782,6 +1809,12 @@ void Renderer::Render(World* world, int32_t screenIndex)
                         // Reset state that was altered by shadow mesh draws.
                         GFX_SetPipelineState(PipelineConfig::Forward);
                         RenderDraws(mPostShadowOpaqueDraws);
+
+                        // The casters' shadow texture laid straight down onto the receivers under them.
+                        if (!shadowCasters.empty() && !shadowReceivers.empty())
+                        {
+                            GFX_DrawProjectedShadowReceivers(shadowReceivers);
+                        }
 
                         RenderDraws(mTranslucentDraws);
 
