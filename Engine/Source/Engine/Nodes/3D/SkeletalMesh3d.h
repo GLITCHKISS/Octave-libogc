@@ -49,20 +49,29 @@ struct QueuedAnimation
 typedef void(*AnimEventHandlerFP)(const AnimEvent& animEvent);
 
 // Dynamic bones: chains of bones simulated after the animation each frame (cloth, tails, hair). Each joint of a chain
-// is a particle in world space that keeps its momentum (verlet), is damped, falls under gravity and is pulled back
-// toward where the animation puts it (the stiffness); the chain keeps its lengths, its first joint stays where the
-// animation has it, and each bone is then turned to point at the next particle. Colliders -- capsules fixed to bones,
-// given in the skeleton's rest pose -- push the particles out of them.
+// is a particle kept as an offset from where the animation puts it: the offset keeps its momentum (verlet), is damped,
+// falls under gravity, is pulled back toward nothing (the stiffness) and is thrown by the mesh's acceleration --
+// starting, stopping, turning -- as much as the inertia says (1: all of it). Moving steadily throws nothing: the damping
+// is against the mesh, not the world. The chain keeps its lengths, each joint stays within the limit of the animation
+// (the tip the whole limit, less up the line), its first joint stays where the animation has it, and each bone is then
+// turned to point at the next particle. Colliders -- capsules fixed to bones, given in the skeleton's rest pose --
+// push the particles out of them.
 struct BoneChain
 {
     std::vector<int32_t> mBones;            // root first, each the next's parent
     std::vector<glm::vec3> mPos;            // the particles, world space: each bone's head, then the last's tip
-    std::vector<glm::vec3> mPrev;
+    std::vector<glm::vec3> mOffset;         // each one's offset from where the animation has it, and last frame's
+    std::vector<glm::vec3> mPrevOffset;
+    std::vector<glm::vec3> mLastTarget;     // where the animation had them last frame, and how far it had moved them
+    std::vector<glm::vec3> mLastMove;
+    bool mHasMove = false;
     glm::vec3 mTipLocal = {};               // the last bone's tip, in its own space (rest)
     float mStiffness = 0.2f;                // per 60th of a second: how much of the way back to the animation
     float mDamping = 0.1f;
     glm::vec3 mGravity = { 0.0f, -9.8f, 0.0f };
     float mRadius = 0.01f;                  // the particles' own thickness, kept off colliders
+    float mInertia = 1.0f;                  // how much of the mesh's acceleration throws the chain
+    float mLimit = 0.0f;                    // m the tip may stray from the animation (0: no limit)
     bool mReset = true;
 };
 
@@ -165,7 +174,8 @@ public:
     // Dynamic bones (see BoneChain). AddBoneChain: the bone and its descendants down a single line; returns the chain's
     // index, or -1. AddBoneCollider: a capsule fixed to a bone, its ends given in the rest pose's model space (a sphere
     // when they're the same point). ResetBoneDynamics: the particles back on the animation (after a teleport).
-    int32_t AddBoneChain(const std::string& rootBone, float stiffness, float damping, glm::vec3 gravity, float radius);
+    int32_t AddBoneChain(const std::string& rootBone, float stiffness, float damping, glm::vec3 gravity, float radius,
+        float inertia = 1.0f, float limit = 0.0f);
     void AddBoneCollider(const std::string& bone, glm::vec3 restA, glm::vec3 restB, float radius);
     void ResetBoneDynamics();
     void ClearBoneDynamics();

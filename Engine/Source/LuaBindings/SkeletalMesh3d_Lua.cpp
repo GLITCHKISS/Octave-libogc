@@ -281,7 +281,8 @@ int SkeletalMesh3D_Lua::SetBoneRotation(lua_State* L)
     return 0;
 }
 
-// AddBoneChain(rootBone, [stiffness 0.2], [damping 0.1], [gravity Vec(0,-9.8,0)], [radius 0.01]) -> chain index or -1
+// AddBoneChain(rootBone, [stiffness 0.2], [damping 0.1], [gravity Vec(0,-9.8,0)], [radius 0.01], [inertia 1],
+// [limit 0]) -> chain index or -1
 int SkeletalMesh3D_Lua::AddBoneChain(lua_State* L)
 {
     SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
@@ -294,8 +295,12 @@ int SkeletalMesh3D_Lua::AddBoneChain(lua_State* L)
     if (!lua_isnone(L, 4)) { damping = CHECK_NUMBER(L, 4); }
     if (!lua_isnone(L, 5)) { gravity = CHECK_VECTOR(L, 5); }
     if (!lua_isnone(L, 6)) { radius = CHECK_NUMBER(L, 6); }
+    float inertia = 1.0f;
+    float limit = 0.0f;
+    if (!lua_isnone(L, 7)) { inertia = CHECK_NUMBER(L, 7); }
+    if (!lua_isnone(L, 8)) { limit = CHECK_NUMBER(L, 8); }
 
-    int32_t index = comp->AddBoneChain(boneName, stiffness, damping, gravity, radius);
+    int32_t index = comp->AddBoneChain(boneName, stiffness, damping, gravity, radius, inertia, limit);
 
     lua_pushinteger(L, (int)index);
     return 1;
