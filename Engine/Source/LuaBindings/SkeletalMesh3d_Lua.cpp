@@ -281,6 +281,61 @@ int SkeletalMesh3D_Lua::SetBoneRotation(lua_State* L)
     return 0;
 }
 
+// AddBoneChain(rootBone, [stiffness 0.2], [damping 0.1], [gravity Vec(0,-9.8,0)], [radius 0.01]) -> chain index or -1
+int SkeletalMesh3D_Lua::AddBoneChain(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    const char* boneName = CHECK_STRING(L, 2);
+    float stiffness = 0.2f;
+    float damping = 0.1f;
+    glm::vec3 gravity = { 0.0f, -9.8f, 0.0f };
+    float radius = 0.01f;
+    if (!lua_isnone(L, 3)) { stiffness = CHECK_NUMBER(L, 3); }
+    if (!lua_isnone(L, 4)) { damping = CHECK_NUMBER(L, 4); }
+    if (!lua_isnone(L, 5)) { gravity = CHECK_VECTOR(L, 5); }
+    if (!lua_isnone(L, 6)) { radius = CHECK_NUMBER(L, 6); }
+
+    int32_t index = comp->AddBoneChain(boneName, stiffness, damping, gravity, radius);
+
+    lua_pushinteger(L, (int)index);
+    return 1;
+}
+
+// AddBoneCollider(bone, a, b, radius): a capsule fixed to the bone; its ends each a Vec (rest pose, model space) or a
+// bone's name (that bone's head in the rest pose)
+int SkeletalMesh3D_Lua::AddBoneCollider(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    const char* boneName = CHECK_STRING(L, 2);
+    glm::vec3 ends[2];
+    for (int i = 0; i < 2; ++i)
+    {
+        if (lua_type(L, 3 + i) == LUA_TSTRING)
+            ends[i] = comp->GetBoneRestPosition(comp->FindBoneIndex(lua_tostring(L, 3 + i)));
+        else
+            ends[i] = CHECK_VECTOR(L, 3 + i);
+    }
+    float radius = CHECK_NUMBER(L, 5);
+
+    comp->AddBoneCollider(boneName, ends[0], ends[1], radius);
+
+    return 0;
+}
+
+int SkeletalMesh3D_Lua::ResetBoneDynamics(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    comp->ResetBoneDynamics();
+    return 0;
+}
+
+int SkeletalMesh3D_Lua::ClearBoneDynamics(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    comp->ClearBoneDynamics();
+    return 0;
+}
+
 int SkeletalMesh3D_Lua::SetBoneScale(lua_State* L)
 {
     SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
@@ -385,6 +440,10 @@ void SkeletalMesh3D_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, SetBonePosition);
 
     REGISTER_TABLE_FUNC(L, mtIndex, SetBoneRotation);
+    REGISTER_TABLE_FUNC(L, mtIndex, AddBoneChain);
+    REGISTER_TABLE_FUNC(L, mtIndex, AddBoneCollider);
+    REGISTER_TABLE_FUNC(L, mtIndex, ResetBoneDynamics);
+    REGISTER_TABLE_FUNC(L, mtIndex, ClearBoneDynamics);
 
     REGISTER_TABLE_FUNC(L, mtIndex, SetBoneScale);
 

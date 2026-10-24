@@ -38,6 +38,10 @@ struct SkeletalMesh3D_Lua
     static int GetBoneScale(lua_State* L);
     static int SetBonePosition(lua_State* L);
     static int SetBoneRotation(lua_State* L);
+    static int AddBoneChain(lua_State* L);
+    static int AddBoneCollider(lua_State* L);
+    static int ResetBoneDynamics(lua_State* L);
+    static int ClearBoneDynamics(lua_State* L);
     static int SetBoneScale(lua_State* L);
     static int GetNumBones(lua_State* L);
     static int SetAnimEventHandler(lua_State* L);

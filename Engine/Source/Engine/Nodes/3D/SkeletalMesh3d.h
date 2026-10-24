@@ -48,6 +48,32 @@ struct QueuedAnimation
 
 typedef void(*AnimEventHandlerFP)(const AnimEvent& animEvent);
 
+// Dynamic bones: chains of bones simulated after the animation each frame (cloth, tails, hair). Each joint of a chain
+// is a particle in world space that keeps its momentum (verlet), is damped, falls under gravity and is pulled back
+// toward where the animation puts it (the stiffness); the chain keeps its lengths, its first joint stays where the
+// animation has it, and each bone is then turned to point at the next particle. Colliders -- capsules fixed to bones,
+// given in the skeleton's rest pose -- push the particles out of them.
+struct BoneChain
+{
+    std::vector<int32_t> mBones;            // root first, each the next's parent
+    std::vector<glm::vec3> mPos;            // the particles, world space: each bone's head, then the last's tip
+    std::vector<glm::vec3> mPrev;
+    glm::vec3 mTipLocal = {};               // the last bone's tip, in its own space (rest)
+    float mStiffness = 0.2f;                // per 60th of a second: how much of the way back to the animation
+    float mDamping = 0.1f;
+    glm::vec3 mGravity = { 0.0f, -9.8f, 0.0f };
+    float mRadius = 0.01f;                  // the particles' own thickness, kept off colliders
+    bool mReset = true;
+};
+
+struct BoneCollider
+{
+    int32_t mBone = -1;
+    glm::vec3 mA = {};                      // in the bone's own space (from the rest pose)
+    glm::vec3 mB = {};
+    float mRadius = 0.05f;
+};
+
 class SkeletalMesh3D : public Mesh3D
 {
 public:
@@ -136,6 +162,15 @@ public:
 
     int32_t FindBoneIndex(const std::string& name) const;
 
+    // Dynamic bones (see BoneChain). AddBoneChain: the bone and its descendants down a single line; returns the chain's
+    // index, or -1. AddBoneCollider: a capsule fixed to a bone, its ends given in the rest pose's model space (a sphere
+    // when they're the same point). ResetBoneDynamics: the particles back on the animation (after a teleport).
+    int32_t AddBoneChain(const std::string& rootBone, float stiffness, float damping, glm::vec3 gravity, float radius);
+    void AddBoneCollider(const std::string& bone, glm::vec3 restA, glm::vec3 restB, float radius);
+    void ResetBoneDynamics();
+    void ClearBoneDynamics();
+    glm::vec3 GetBoneRestPosition(int32_t boneIndex) const;     // its head in the rest pose, model space
+
     void SetAnimEventHandler(AnimEventHandlerFP handler);
     AnimEventHandlerFP GetAnimEventHandler();
     void SetScriptAnimEventHandler(const ScriptFunc& func);
@@ -162,6 +197,7 @@ protected:
 
     void UpdateAttachedChildren(float deltaTime);
     void CpuSkinVertices();
+    void SimulateBoneDynamics(float deltaTime);
 
     SkeletalMeshRef mSkeletalMesh;
     std::vector<glm::mat4> mBoneMatrices;
@@ -174,6 +210,8 @@ protected:
     std::vector<ActiveAnimation> mActiveAnimations;
     std::vector<QueuedAnimation> mQueuedAnimations;
     float mBoundsRadiusOverride = 0.0f;
+    std::vector<BoneChain> mBoneChains;
+    std::vector<BoneCollider> mBoneColliders;
     bool mAnimationPaused;
     bool mRevertToBindPose;
     bool mInheritPose;
