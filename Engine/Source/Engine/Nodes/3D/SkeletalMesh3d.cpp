@@ -783,6 +783,16 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                         {
                             if (s < 0.2f)                   // (at the pinned root itself: nothing to move)
                                 continue;
+
+                            // the pinned root already inside this collider (a shoulder's, at the root of an arm):
+                            // its first segment can't come out of it, and pushing the next joint for it -- the push
+                            // scaled up by 1/s -- shoved the chain into whatever lay beyond (the body)
+                            glm::vec3 ab = sColB[c] - sColA[c];
+                            float ab2 = glm::dot(ab, ab);
+                            float t = (ab2 > 0.000001f) ? glm::clamp(glm::dot(chain.mPos[0] - sColA[c], ab) / ab2, 0.0f, 1.0f) : 0.0f;
+                            if (glm::distance(chain.mPos[0], sColA[c] + ab * t) < reach)
+                                continue;
+
                             chain.mPos[i] += push / s;
                         }
                         else
