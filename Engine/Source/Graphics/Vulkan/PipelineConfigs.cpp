@@ -200,10 +200,11 @@ void InitPipelineConfigs()
 
     {
         // Projected shadow, the casters' silhouette into the shadow texture (no depth: a colour target alone;
-        // both sides; one flat grey). The vertex shader (Shadow.vert / ShadowSkinned.vert) is set per caster.
+        // both sides; one flat grey). The vertex shader (ProjShadowCaster.vert / ProjShadowCasterSkinned.vert: its
+        // group's camera, projShadow.mViewProj) is set per caster.
         PipelineState& state = sPipelineConfigs[(uint32_t)PipelineConfig::ProjShadowCaster];
         state = sPipelineConfigs[(uint32_t)PipelineConfig::Forward];
-        state.mVertexShader = gVulkanContext->GetGlobalShader("Shadow.vert");
+        state.mVertexShader = gVulkanContext->GetGlobalShader("ProjShadowCaster.vert");
         state.mFragmentShader = gVulkanContext->GetGlobalShader("ProjShadowCaster.frag");
         state.mVertexType = VertexType::Vertex;
         state.mCullMode = VK_CULL_MODE_NONE;

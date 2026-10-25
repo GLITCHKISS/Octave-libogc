@@ -30,14 +30,11 @@ void GFX_Initialize()
     }
 }
 
-static Image* sProjShadowImageForShutdown();
+static void DestroyProjShadowImages();
 
 void GFX_Shutdown()
 {
-    if (Image* img = sProjShadowImageForShutdown())
-    {
-        GetDestroyQueue()->Destroy(img);
-    }
+    DestroyProjShadowImages();
     gVulkanContext->Destroy();
     DestroyVulkanContext();
 }
@@ -405,135 +402,197 @@ void GFX_DrawShadowMeshComp(ShadowMesh3D* shadowMeshComp)
 }
 
 // Projected shadows, as the GX renderer's (its GFX_RenderProjectedShadowMap / GFX_DrawProjectedShadowReceivers are the
-// reference): the casters' silhouette, one flat grey over white, from an orthographic camera straight above the first
-// of them -- half the size of its bounds each way -- into a small texture before the forward pass; then each receiver
-// under that box drawn again inside the forward pass with the texture laid straight down onto it (texture coordinates
-// from its world position through the same camera, global.mShadowViewProj), multiplying what is there.
+// reference), for every caster wherever it is: the casters in groups -- each with those near enough to it to share
+// its box (a character and what's worn on it: a cape; a small one beside a big one) -- and each group its own silhouette, one flat grey over white,
+// from an orthographic camera straight above its first -- half the size of its bounds each way -- in a small texture of
+// its own before the forward pass; then each receiver under a group's box drawn again inside the forward pass with that
+// texture laid straight down onto it (texture coordinates from its world position through the group's camera,
+// projShadow.mViewProj), multiplying what is there: where two groups' shadows meet, both darken it. (One box for all,
+// over the first caster, left any other far from it without a shadow.) GX still draws the first group's alone.
 static const uint32_t kProjShadowRes = 128;
-static Image* sProjShadowImage = nullptr;
-static bool sProjShadowValid = false;
-static float sProjShadowHalf = 1.0f;
-static glm::vec3 sProjShadowCenter = { 0.0f, 0.0f, 0.0f };
-static float sProjShadowTop = 0.0f;
+static const uint32_t kMaxProjShadows = 6;
 
-static Image* sProjShadowImageForShutdown()
+struct ProjShadow
 {
-    Image* img = sProjShadowImage;
-    sProjShadowImage = nullptr;
-    sProjShadowValid = false;
-    return img;
+    Image* mImage = nullptr;
+    bool mValid = false;
+    float mHalf = 1.0f;
+    glm::vec3 mCenter = { 0.0f, 0.0f, 0.0f };
+    float mTop = 0.0f;
+    glm::mat4 mViewProj = glm::mat4(1.0f);
+    UniformBlock mBlock;
+    std::vector<SkeletalMesh3D*> mCasters;
+};
+
+static ProjShadow sProjShadows[kMaxProjShadows];
+
+static void DestroyProjShadowImages()
+{
+    for (ProjShadow& ps : sProjShadows)
+    {
+        if (ps.mImage != nullptr)
+        {
+            GetDestroyQueue()->Destroy(ps.mImage);
+            ps.mImage = nullptr;
+        }
+        ps.mValid = false;
+    }
 }
 
 void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
 {
-    sProjShadowValid = false;
+    for (ProjShadow& ps : sProjShadows)
+    {
+        ps.mValid = false;
+        ps.mCasters.clear();
+    }
     World* world = Renderer::Get()->GetCurrentWorld();
     if (casters.empty() || world == nullptr || world->GetActiveCamera() == nullptr)
         return;
 
-    if (sProjShadowImage == nullptr)
-    {
-        ImageDesc desc;
-        desc.mWidth = kProjShadowRes;
-        desc.mHeight = kProjShadowRes;
-        desc.mFormat = VK_FORMAT_R8G8B8A8_UNORM;
-        desc.mUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        SamplerDesc sampler;
-        sampler.mAddressMode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-        sampler.mBorderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;      // (outside the box: no shadow)
-        sProjShadowImage = new Image(desc, sampler, "Projected Shadow");
-        sProjShadowImage->Transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
-
-    // The camera: over the first caster (the rest ride with it), straight down.
-    SkeletalMesh3D* lead = casters[0];
-    Bounds b = lead->GetBounds();
-    float radius = (lead->GetBoundsRadiusOverride() > 0.0f) ? lead->GetBoundsRadiusOverride() : b.mRadius;
-    sProjShadowHalf = glm::max(0.25f, radius * 0.5f);
-    sProjShadowCenter = lead->GetWorldPosition();
-    sProjShadowTop = sProjShadowCenter.y + radius;
-
-    glm::mat4 view = glm::lookAt(sProjShadowCenter + glm::vec3(0.0f, 20.0f, 0.0f), sProjShadowCenter, glm::vec3(0.0f, 0.0f, -1.0f));
-    glm::mat4 proj = glm::ortho(-sProjShadowHalf, sProjShadowHalf, -sProjShadowHalf, sProjShadowHalf, 0.1f, 200.0f);
-    proj[1][1] *= -1.0f;
-    gVulkanContext->GetGlobalUniformData().mShadowViewProj = proj * view;
-    gVulkanContext->UpdateGlobalDescriptorSet();
-
-    RenderPassSetup rp;
-    rp.mColorImages[0] = sProjShadowImage;
-    rp.mLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    rp.mStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-    rp.mDebugName = "Projected Shadow";
-    gVulkanContext->BeginVkRenderPass(rp, true, glm::vec4(1.0f));    // (white: no shadow)
-
-    // its border kept white (the texture clamps: nothing smears off its edge)
-    gVulkanContext->SetViewport(0, 0, kProjShadowRes, kProjShadowRes, false, false);
-    gVulkanContext->SetScissor(2, 2, kProjShadowRes - 4, kProjShadowRes - 4, false, false);
-
-    VkCommandBuffer cb = GetCommandBuffer();
+    // the groups: each caster into the first group whose box its own box fits in (a small one walked up to a big one
+    // joins it; never the other way, cut off by the small one's box), else a group of its own over it
+    uint32_t numGroups = 0;
     for (SkeletalMesh3D* caster : casters)
     {
-        SkeletalMesh* mesh = caster->GetSkeletalMesh();
-        if (mesh == nullptr)
-            continue;
+        glm::vec3 p = caster->GetWorldPosition();
+        Bounds b = caster->GetBounds();
+        float radius = (caster->GetBoundsRadiusOverride() > 0.0f) ? caster->GetBoundsRadiusOverride() : b.mRadius;
+        float half = glm::max(0.25f, radius * 0.5f);
+        ProjShadow* group = nullptr;
+        for (uint32_t g = 0; g < numGroups; ++g)
+        {
+            ProjShadow& ps = sProjShadows[g];
+            float room = ps.mHalf + 0.01f - half;
+            if (room >= 0.0f && fabsf(p.x - ps.mCenter.x) <= room && fabsf(p.z - ps.mCenter.z) <= room)
+            {
+                group = &ps;
+                break;
+            }
+        }
 
-        BindPipelineConfig(PipelineConfig::ProjShadowCaster);
-        if (IsCpuSkinningRequired(caster))
+        if (group == nullptr)
         {
-            VkDeviceSize offset = 0;
-            VkBuffer vertexBuffer = caster->GetResource()->mVertexBuffer->Get();
-            vkCmdBindVertexBuffers(cb, 0, 1, &vertexBuffer, &offset);
-            BindSkeletalMeshResourceIndices(mesh);
-            gVulkanContext->SetVertexType(VertexType::Vertex);
-            gVulkanContext->SetVertexShader("Shadow.vert");
+            if (numGroups == kMaxProjShadows)
+                continue;
+
+            group = &sProjShadows[numGroups++];
+            group->mHalf = half;
+            group->mCenter = p;
+            group->mTop = p.y + radius;
+
+            glm::mat4 view = glm::lookAt(p + glm::vec3(0.0f, 20.0f, 0.0f), p, glm::vec3(0.0f, 0.0f, -1.0f));
+            glm::mat4 proj = glm::ortho(-group->mHalf, group->mHalf, -group->mHalf, group->mHalf, 0.1f, 200.0f);
+            proj[1][1] *= -1.0f;
+            group->mViewProj = proj * view;
+            group->mBlock = WriteUniformBlock(&group->mViewProj, sizeof(glm::mat4));
         }
-        else
-        {
-            BindSkeletalMeshResource(mesh);
-            gVulkanContext->SetVertexType(VertexType::VertexSkinned);
-            gVulkanContext->SetVertexShader("ShadowSkinned.vert");
-        }
-        gVulkanContext->CommitPipeline();
-        BindGeometryDescriptorSet(caster);
-        vkCmdDrawIndexed(cb, mesh->GetNumIndices(), 1, 0, 0, 0);
+
+        group->mCasters.push_back(caster);
     }
 
-    gVulkanContext->EndVkRenderPass();
-    sProjShadowValid = true;
+    VkCommandBuffer cb = GetCommandBuffer();
+    for (uint32_t g = 0; g < numGroups; ++g)
+    {
+        ProjShadow& ps = sProjShadows[g];
+        if (ps.mImage == nullptr)
+        {
+            ImageDesc desc;
+            desc.mWidth = kProjShadowRes;
+            desc.mHeight = kProjShadowRes;
+            desc.mFormat = VK_FORMAT_R8G8B8A8_UNORM;
+            desc.mUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            SamplerDesc sampler;
+            sampler.mAddressMode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+            sampler.mBorderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;  // (outside the box: no shadow)
+            ps.mImage = new Image(desc, sampler, "Projected Shadow");
+            ps.mImage->Transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+
+        RenderPassSetup rp;
+        rp.mColorImages[0] = ps.mImage;
+        rp.mLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        rp.mStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        rp.mDebugName = "Projected Shadow";
+        gVulkanContext->BeginVkRenderPass(rp, true, glm::vec4(1.0f));    // (white: no shadow)
+
+        // its border kept white (the texture clamps: nothing smears off its edge)
+        gVulkanContext->SetViewport(0, 0, kProjShadowRes, kProjShadowRes, false, false);
+        gVulkanContext->SetScissor(2, 2, kProjShadowRes - 4, kProjShadowRes - 4, false, false);
+
+        for (SkeletalMesh3D* caster : ps.mCasters)
+        {
+            SkeletalMesh* mesh = caster->GetSkeletalMesh();
+            if (mesh == nullptr)
+                continue;
+
+            BindPipelineConfig(PipelineConfig::ProjShadowCaster);
+            if (IsCpuSkinningRequired(caster))
+            {
+                VkDeviceSize offset = 0;
+                VkBuffer vertexBuffer = caster->GetResource()->mVertexBuffer->Get();
+                vkCmdBindVertexBuffers(cb, 0, 1, &vertexBuffer, &offset);
+                BindSkeletalMeshResourceIndices(mesh);
+                gVulkanContext->SetVertexType(VertexType::Vertex);
+                gVulkanContext->SetVertexShader("ProjShadowCaster.vert");
+            }
+            else
+            {
+                BindSkeletalMeshResource(mesh);
+                gVulkanContext->SetVertexType(VertexType::VertexSkinned);
+                gVulkanContext->SetVertexShader("ProjShadowCasterSkinned.vert");
+            }
+            gVulkanContext->CommitPipeline();
+            BindGeometryDescriptorSet(caster);
+            DescriptorSet::Begin("Projected Shadow Caster").WriteUniformBuffer(0, ps.mBlock).Build().Bind(cb, 2);
+            vkCmdDrawIndexed(cb, mesh->GetNumIndices(), 1, 0, 0, 0);
+        }
+
+        gVulkanContext->EndVkRenderPass();
+        ps.mValid = true;
+    }
 }
 
 void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receivers)
 {
-    if (!sProjShadowValid || sProjShadowImage == nullptr)
-        return;
-
     VkCommandBuffer cb = GetCommandBuffer();
-    const float reach = sProjShadowHalf * 1.42f;                     // (the box's corner)
-    for (StaticMesh3D* comp : receivers)
+    bool drew = false;
+    for (ProjShadow& ps : sProjShadows)
     {
-        StaticMesh* mesh = comp->GetStaticMesh();
-        if (mesh == nullptr)
+        if (!ps.mValid || ps.mImage == nullptr)
             continue;
 
-        // only what lies under the box, and not above the caster's top
-        Bounds b = comp->GetBounds();
-        float dx = b.mCenter.x - sProjShadowCenter.x, dz = b.mCenter.z - sProjShadowCenter.z;
-        float r = b.mRadius + reach;
-        if (dx * dx + dz * dz > r * r || b.mCenter.y - b.mRadius > sProjShadowTop)
-            continue;
+        const float reach = ps.mHalf * 1.42f;                        // (the box's corner)
+        for (StaticMesh3D* comp : receivers)
+        {
+            StaticMesh* mesh = comp->GetStaticMesh();
+            if (mesh == nullptr)
+                continue;
 
-        BindPipelineConfig(PipelineConfig::ProjShadowReceiver);
-        BindStaticMeshResource(mesh);
-        bool color = mesh->HasVertexColor();
-        gVulkanContext->SetVertexType(color ? VertexType::VertexColor : VertexType::Vertex);
-        gVulkanContext->SetVertexShader(color ? "ForwardColor.vert" : "Forward.vert");
-        gVulkanContext->CommitPipeline();
-        BindGeometryDescriptorSet(comp);
-        DescriptorSet::Begin("Projected Shadow").WriteImage(0, sProjShadowImage).Build().Bind(cb, 2);
-        vkCmdDrawIndexed(cb, mesh->GetNumIndices(), 1, 0, 0, 0);
+            // only what lies under the box, and not above the casters' top
+            Bounds b = comp->GetBounds();
+            float dx = b.mCenter.x - ps.mCenter.x, dz = b.mCenter.z - ps.mCenter.z;
+            float r = b.mRadius + reach;
+            if (dx * dx + dz * dz > r * r || b.mCenter.y - b.mRadius > ps.mTop)
+                continue;
+
+            BindPipelineConfig(PipelineConfig::ProjShadowReceiver);
+            BindStaticMeshResource(mesh);
+            bool color = mesh->HasVertexColor();
+            gVulkanContext->SetVertexType(color ? VertexType::VertexColor : VertexType::Vertex);
+            gVulkanContext->SetVertexShader(color ? "ForwardColor.vert" : "Forward.vert");
+            gVulkanContext->CommitPipeline();
+            BindGeometryDescriptorSet(comp);
+            DescriptorSet::Begin("Projected Shadow").WriteImage(0, ps.mImage).WriteUniformBuffer(1, ps.mBlock).Build().Bind(cb, 2);
+            vkCmdDrawIndexed(cb, mesh->GetNumIndices(), 1, 0, 0, 0);
+            drew = true;
+        }
     }
 
-    BindPipelineConfig(PipelineConfig::Forward);
+    if (drew)
+    {
+        BindPipelineConfig(PipelineConfig::Forward);
+    }
 }
 
 void GFX_DrawInstancedMeshComp(InstancedMesh3D* instancedMeshComp)
