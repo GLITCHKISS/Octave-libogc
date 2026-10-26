@@ -768,8 +768,8 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
             chain.mOffset.assign(numPoints, glm::vec3(0.0f));
             chain.mPrevOffset.assign(numPoints, glm::vec3(0.0f));
             chain.mLastTarget = target;
-            chain.mLastMove.assign(numPoints, glm::vec3(0.0f));
-            chain.mHasMove = false;
+            chain.mLastVel.assign(numPoints, glm::vec3(0.0f));
+            chain.mHasVel = false;
             chain.mReset = false;
         }
 
@@ -781,11 +781,13 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
 
             for (uint32_t i = 0; i < numPoints; ++i)
             {
-                // the animation's move this frame, and how much it changed from the last (its acceleration: what
-                // throws the chain -- none the first frame, nothing to compare with)
-                glm::vec3 move = target[i] - chain.mLastTarget[i];
-                glm::vec3 accel = chain.mHasMove ? (move - chain.mLastMove[i]) : glm::vec3(0.0f);
-                chain.mLastMove[i] = move;
+                // the animation's speed this frame, and how much it changed from the last (its acceleration: what
+                // throws the chain -- none the first frame, nothing to compare with). Speeds, not the moves
+                // themselves: a frame a millisecond longer moves a fast mesh further, and the difference between
+                // two moves at a steady speed threw the whole chain about, frame to frame
+                glm::vec3 vel = (target[i] - chain.mLastTarget[i]) / glm::max(deltaTime, 0.0001f);
+                glm::vec3 accel = chain.mHasVel ? (vel - chain.mLastVel[i]) * dt : glm::vec3(0.0f);
+                chain.mLastVel[i] = vel;
                 chain.mLastTarget[i] = target[i];
 
                 glm::vec3 offset = glm::vec3(0.0f);
@@ -796,7 +798,7 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                 }
                 chain.mPos[i] = target[i] + offset;
             }
-            chain.mHasMove = true;
+            chain.mHasVel = true;
         }
         else
         {

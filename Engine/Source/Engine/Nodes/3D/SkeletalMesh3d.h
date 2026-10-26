@@ -62,9 +62,9 @@ struct BoneChain
     std::vector<glm::vec3> mPos;            // the particles, world space: each bone's head, then the last's tip
     std::vector<glm::vec3> mOffset;         // each one's offset from where the animation has it, and last frame's
     std::vector<glm::vec3> mPrevOffset;
-    std::vector<glm::vec3> mLastTarget;     // where the animation had them last frame, and how far it had moved them
-    std::vector<glm::vec3> mLastMove;
-    bool mHasMove = false;
+    std::vector<glm::vec3> mLastTarget;     // where the animation had them last frame, and how fast it moved them
+    std::vector<glm::vec3> mLastVel;
+    bool mHasVel = false;
     glm::vec3 mTipLocal = {};               // the last bone's tip, in its own space (rest)
     float mStiffness = 0.2f;                // per 60th of a second: how much of the way back to the animation
     float mDamping = 0.1f;
