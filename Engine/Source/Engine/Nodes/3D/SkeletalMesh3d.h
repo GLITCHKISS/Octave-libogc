@@ -183,6 +183,9 @@ public:
     // SetBoneColliderRadius: a collider (AddBoneCollider's index) made thicker or thinner as it goes (a pose
     // that needs more room than the rest).
     void SetBoneColliderRadius(int32_t index, float radius);
+    // SetBoneDynamicsInertia: how much of each chain's own inertia the mesh's acceleration throws it by, all of them
+    // (1 as set; less to calm them a moment -- a sudden change of speed they shouldn't be flung by).
+    void SetBoneDynamicsInertia(float scale);
     // AddBoneChainLink: two chains side by side (the lines of a cloth, given by their root bones) linked joint to joint
     // across: a collider coming between them is kept off the segment across too, not only off each line -- the cloth
     // between two lines can't pass through it. Returns false if either chain isn't there.
@@ -233,6 +236,7 @@ protected:
     std::vector<BoneChain> mBoneChains;
     std::vector<BoneCollider> mBoneColliders;
     std::vector<std::pair<int32_t, int32_t>> mBoneChainLinks;
+    float mBoneInertiaScale = 1.0f;
     bool mAnimationPaused;
     bool mRevertToBindPose;
     bool mInheritPose;

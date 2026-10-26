@@ -326,6 +326,14 @@ int SkeletalMesh3D_Lua::AddBoneCollider(lua_State* L)
     return 1;
 }
 
+int SkeletalMesh3D_Lua::SetBoneDynamicsInertia(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    float scale = CHECK_NUMBER(L, 2);
+    comp->SetBoneDynamicsInertia(scale);
+    return 0;
+}
+
 int SkeletalMesh3D_Lua::SetBoneColliderRadius(lua_State* L)
 {
     SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
@@ -466,6 +474,7 @@ void SkeletalMesh3D_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, AddBoneCollider);
     REGISTER_TABLE_FUNC(L, mtIndex, AddBoneChainLink);
     REGISTER_TABLE_FUNC(L, mtIndex, SetBoneColliderRadius);
+    REGISTER_TABLE_FUNC(L, mtIndex, SetBoneDynamicsInertia);
     REGISTER_TABLE_FUNC(L, mtIndex, ResetBoneDynamics);
     REGISTER_TABLE_FUNC(L, mtIndex, ClearBoneDynamics);
 

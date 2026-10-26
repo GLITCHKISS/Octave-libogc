@@ -609,6 +609,11 @@ int32_t SkeletalMesh3D::AddBoneCollider(const std::string& bone, glm::vec3 restA
     return (int32_t)mBoneColliders.size() - 1;
 }
 
+void SkeletalMesh3D::SetBoneDynamicsInertia(float scale)
+{
+    mBoneInertiaScale = glm::max(scale, 0.0f);
+}
+
 void SkeletalMesh3D::SetBoneColliderRadius(int32_t index, float radius)
 {
     if (index >= 0 && index < (int32_t)mBoneColliders.size())
@@ -786,7 +791,7 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                 glm::vec3 offset = glm::vec3(0.0f);
                 if (i > 0)
                 {
-                    offset = chain.mOffset[i] + (chain.mOffset[i] - chain.mPrevOffset[i]) * keep - accel * chain.mInertia + fall;
+                    offset = chain.mOffset[i] + (chain.mOffset[i] - chain.mPrevOffset[i]) * keep - accel * (chain.mInertia * mBoneInertiaScale) + fall;
                     offset *= (1.0f - pull);
                 }
                 chain.mPos[i] = target[i] + offset;
