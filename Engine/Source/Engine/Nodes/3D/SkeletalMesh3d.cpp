@@ -30,8 +30,9 @@ static_assert(int32_t(AnimationUpdateMode::Count) == 3, "Need to update string c
 FORCE_LINK_DEF(SkeletalMesh3D);
 DEFINE_NODE(SkeletalMesh3D, Mesh3D);
 
-// (16: a game can layer more than 8 -- a character's 8 arm layers with its walk's 5 over them)
-#define NUM_ANIMATION_SLOTS 16
+// (24: a game can layer more than 8 -- a character's 8 arm layers with its walk's 5 over them -- and more than 16: a
+// character's moves, poses and the layers between them. Only what's playing is kept: a list, not 24 of each)
+#define NUM_ANIMATION_SLOTS 24
 
 struct DecompTransform
 {
@@ -263,7 +264,9 @@ void SkeletalMesh3D::PlayAnimation(const char* animName, bool loop, float speed,
         }
     }
 
-    if (mActiveAnimations.size() >= NUM_ANIMATION_SLOTS)
+    // (only a new one needs room: one already playing is only updated -- with every slot taken, the check here before
+    // turned away every update too, each animation's weight held where it was)
+    if (anim == nullptr && mActiveAnimations.size() >= NUM_ANIMATION_SLOTS)
     {
         LogWarning("Too many active animations. Cannot play animation.");
         return;
