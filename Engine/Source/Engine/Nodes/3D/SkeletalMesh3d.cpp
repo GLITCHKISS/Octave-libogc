@@ -589,14 +589,14 @@ int32_t SkeletalMesh3D::AddBoneChain(const std::string& rootBone, float stiffnes
     return (int32_t)mBoneChains.size() - 1;
 }
 
-void SkeletalMesh3D::AddBoneCollider(const std::string& bone, glm::vec3 restA, glm::vec3 restB, float radius)
+int32_t SkeletalMesh3D::AddBoneCollider(const std::string& bone, glm::vec3 restA, glm::vec3 restB, float radius)
 {
     SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();
     int32_t index = FindBoneIndex(bone);
     if (mesh == nullptr || index < 0)
     {
         LogWarning("AddBoneCollider: no bone %s", bone.c_str());
-        return;
+        return -1;
     }
 
     glm::mat4 toLocal = glm::inverse(mesh->GetInvRootTransform() * mesh->GetBone(index).mInvOffsetMatrix);
@@ -606,6 +606,13 @@ void SkeletalMesh3D::AddBoneCollider(const std::string& bone, glm::vec3 restA, g
     col.mB = glm::vec3(toLocal * glm::vec4(restB, 1.0f));
     col.mRadius = glm::max(radius, 0.0f);
     mBoneColliders.push_back(col);
+    return (int32_t)mBoneColliders.size() - 1;
+}
+
+void SkeletalMesh3D::SetBoneColliderRadius(int32_t index, float radius)
+{
+    if (index >= 0 && index < (int32_t)mBoneColliders.size())
+        mBoneColliders[index].mRadius = glm::max(radius, 0.0f);
 }
 
 void SkeletalMesh3D::ResetBoneDynamics()
@@ -614,10 +621,29 @@ void SkeletalMesh3D::ResetBoneDynamics()
         chain.mReset = true;
 }
 
+bool SkeletalMesh3D::AddBoneChainLink(const std::string& rootA, const std::string& rootB)
+{
+    int32_t boneA = FindBoneIndex(rootA), boneB = FindBoneIndex(rootB);
+    int32_t a = -1, b = -1;
+    for (uint32_t i = 0; i < mBoneChains.size(); ++i)
+    {
+        if (!mBoneChains[i].mBones.empty() && mBoneChains[i].mBones[0] == boneA) a = (int32_t)i;
+        if (!mBoneChains[i].mBones.empty() && mBoneChains[i].mBones[0] == boneB) b = (int32_t)i;
+    }
+    if (a < 0 || b < 0 || a == b)
+    {
+        LogWarning("AddBoneChainLink: no chains from %s and %s", rootA.c_str(), rootB.c_str());
+        return false;
+    }
+    mBoneChainLinks.push_back({ a, b });
+    return true;
+}
+
 void SkeletalMesh3D::ClearBoneDynamics()
 {
     mBoneChains.clear();
     mBoneColliders.clear();
+    mBoneChainLinks.clear();
 }
 
 // the nearest points of segments p1-q1 and p2-q2: s along the first, t along the second (0..1)
@@ -655,6 +681,33 @@ static void ClosestOnSegments(const glm::vec3& p1, const glm::vec3& q1, const gl
     }
 }
 
+// pushes the segment p-q off a capsule (reach from its line a-b), its ends moved by how near the contact is to each;
+// p pinned (not moving), only q moves, scaled up by how far along the contact is. Returns whether it touched
+static bool PushSegmentOut(glm::vec3& p, glm::vec3& q, const glm::vec3& a, const glm::vec3& b, float reach, bool pMoves)
+{
+    float s, u;
+    ClosestOnSegments(p, q, a, b, s, u);
+    glm::vec3 away = glm::mix(p, q, s) - glm::mix(a, b, u);
+    float dist = glm::length(away);
+    if (dist >= reach || dist < 0.00001f)
+        return false;
+
+    glm::vec3 push = away * ((reach - dist) / dist);
+    if (!pMoves)
+    {
+        if (s < 0.2f)                                       // (at the pinned end itself: nothing to move)
+            return false;
+        q += push / s;
+    }
+    else
+    {
+        float w = 1.0f / ((1.0f - s) * (1.0f - s) + s * s);
+        p += push * ((1.0f - s) * w);
+        q += push * (s * w);
+    }
+    return true;
+}
+
 void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
 {
     SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();
@@ -678,38 +731,38 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
         sColB[c] = glm::vec3(world * glm::vec4(col.mB, 1.0f));
     }
 
-    static std::vector<glm::vec3> sTarget;
-    static std::vector<float> sLength;
-    static std::vector<glm::mat4> sModel;
     glm::mat4 invTransform = glm::inverse(mTransform);
 
+    // each chain moved on by itself first -- all of them: the links across them want every chain stepped before
+    // they're kept off the colliders together
     for (BoneChain& chain : mBoneChains)
     {
         const uint32_t n = (uint32_t)chain.mBones.size();
         const uint32_t numPoints = n + 1;
+        std::vector<glm::vec3>& target = chain.mTarget;
 
         // where the animation puts each joint (and the tip)
-        sModel.resize(n);
-        sTarget.resize(numPoints);
+        chain.mModel.resize(n);
+        target.resize(numPoints);
         for (uint32_t k = 0; k < n; ++k)
         {
             int32_t b = chain.mBones[k];
-            sModel[k] = mBoneMatrices[b] * bones[b].mInvOffsetMatrix;
-            sTarget[k] = glm::vec3(mTransform * sModel[k][3]);
+            chain.mModel[k] = mBoneMatrices[b] * bones[b].mInvOffsetMatrix;
+            target[k] = glm::vec3(mTransform * chain.mModel[k][3]);
         }
-        sTarget[n] = glm::vec3(mTransform * sModel[n - 1] * glm::vec4(chain.mTipLocal, 1.0f));
-        sLength.resize(numPoints);
+        target[n] = glm::vec3(mTransform * chain.mModel[n - 1] * glm::vec4(chain.mTipLocal, 1.0f));
+        chain.mLength.resize(numPoints);
         for (uint32_t i = 1; i < numPoints; ++i)
-            sLength[i] = glm::distance(sTarget[i - 1], sTarget[i]);
+            chain.mLength[i] = glm::distance(target[i - 1], target[i]);
 
         if (chain.mReset ||
             chain.mOffset.size() != numPoints ||
-            glm::distance(chain.mLastTarget[0], sTarget[0]) > 1.0f)    // (teleported)
+            glm::distance(chain.mLastTarget[0], target[0]) > 1.0f)    // (teleported)
         {
-            chain.mPos = sTarget;
+            chain.mPos = target;
             chain.mOffset.assign(numPoints, glm::vec3(0.0f));
             chain.mPrevOffset.assign(numPoints, glm::vec3(0.0f));
-            chain.mLastTarget = sTarget;
+            chain.mLastTarget = target;
             chain.mLastMove.assign(numPoints, glm::vec3(0.0f));
             chain.mHasMove = false;
             chain.mReset = false;
@@ -725,10 +778,10 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
             {
                 // the animation's move this frame, and how much it changed from the last (its acceleration: what
                 // throws the chain -- none the first frame, nothing to compare with)
-                glm::vec3 move = sTarget[i] - chain.mLastTarget[i];
+                glm::vec3 move = target[i] - chain.mLastTarget[i];
                 glm::vec3 accel = chain.mHasMove ? (move - chain.mLastMove[i]) : glm::vec3(0.0f);
                 chain.mLastMove[i] = move;
-                chain.mLastTarget[i] = sTarget[i];
+                chain.mLastTarget[i] = target[i];
 
                 glm::vec3 offset = glm::vec3(0.0f);
                 if (i > 0)
@@ -736,19 +789,35 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                     offset = chain.mOffset[i] + (chain.mOffset[i] - chain.mPrevOffset[i]) * keep - accel * chain.mInertia + fall;
                     offset *= (1.0f - pull);
                 }
-                chain.mPos[i] = sTarget[i] + offset;
+                chain.mPos[i] = target[i] + offset;
             }
             chain.mHasMove = true;
+        }
+        else
+        {
+            for (uint32_t i = 0; i < numPoints; ++i)
+                chain.mPos[i] = target[i] + chain.mOffset[i];
+        }
+    }
 
-            for (uint32_t iter = 0; iter < 3; ++iter)
+    if (dt > 0.0f)
+    {
+        // each pass: the lengths and the limit; the links across off the colliders; then each line off them -- the
+        // colliders' the last word (the links last, their pushes left lines in his shoulders)
+        for (uint32_t iter = 0; iter < 4; ++iter)
+        {
+            for (BoneChain& chain : mBoneChains)
             {
+                const uint32_t numPoints = (uint32_t)chain.mBones.size() + 1;
+                const std::vector<glm::vec3>& target = chain.mTarget;
+
                 // lengths kept, from the root out
                 for (uint32_t i = 1; i < numPoints; ++i)
                 {
                     glm::vec3 d = chain.mPos[i] - chain.mPos[i - 1];
                     float len = glm::length(d);
                     if (len > 0.0001f)
-                        chain.mPos[i] = chain.mPos[i - 1] + d * (sLength[i] / len);
+                        chain.mPos[i] = chain.mPos[i - 1] + d * (chain.mLength[i] / len);
                 }
 
                 // within the limit of the animation (the tip the whole of it)
@@ -757,12 +826,40 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                     for (uint32_t i = 1; i < numPoints; ++i)
                     {
                         float most = chain.mLimit * scale * float(i) / float(numPoints - 1);
-                        glm::vec3 d = chain.mPos[i] - sTarget[i];
+                        glm::vec3 d = chain.mPos[i] - target[i];
                         float len = glm::length(d);
                         if (len > most)
-                            chain.mPos[i] = sTarget[i] + d * (most / len);
+                            chain.mPos[i] = target[i] + d * (most / len);
                     }
                 }
+            }
+
+            // the links across, joint to joint below the pinned roots, and corner to corner across each panel
+            // between them: the cloth between two lines kept off the colliders too -- a collider come up between
+            // two lines met neither, and the cloth went through it; between two links across, through a panel's middle
+            for (const std::pair<int32_t, int32_t>& link : mBoneChainLinks)
+            {
+                BoneChain& a = mBoneChains[link.first];
+                BoneChain& b = mBoneChains[link.second];
+                const uint32_t numPoints = (uint32_t)glm::min(a.mPos.size(), b.mPos.size());
+                for (uint32_t c = 0; c < mBoneColliders.size(); ++c)
+                {
+                    float reach = (mBoneColliders[c].mRadius + 0.5f * (a.mRadius + b.mRadius)) * scale;
+                    for (uint32_t i = 1; i < numPoints; ++i)
+                    {
+                        PushSegmentOut(a.mPos[i], b.mPos[i], sColA[c], sColB[c], reach, true);
+                        if (i + 1 < numPoints)
+                        {
+                            PushSegmentOut(a.mPos[i], b.mPos[i + 1], sColA[c], sColB[c], reach, true);
+                            PushSegmentOut(b.mPos[i], a.mPos[i + 1], sColA[c], sColB[c], reach, true);
+                        }
+                    }
+                }
+            }
+
+            for (BoneChain& chain : mBoneChains)
+            {
+                const uint32_t numPoints = (uint32_t)chain.mBones.size() + 1;
 
                 // out of the colliders: the whole of each segment, not only its joints (a collider can come up
                 // between two), its two ends moved by how near the contact is to each -- the root's end stays
@@ -770,61 +867,55 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                 {
                     for (uint32_t c = 0; c < mBoneColliders.size(); ++c)
                     {
-                        float s, u;
-                        ClosestOnSegments(chain.mPos[i - 1], chain.mPos[i], sColA[c], sColB[c], s, u);
-                        glm::vec3 away = glm::mix(chain.mPos[i - 1], chain.mPos[i], s) - glm::mix(sColA[c], sColB[c], u);
-                        float dist = glm::length(away);
                         float reach = (mBoneColliders[c].mRadius + chain.mRadius) * scale;
-                        if (dist >= reach || dist < 0.00001f)
-                            continue;
-
-                        glm::vec3 push = away * ((reach - dist) / dist);
                         if (i == 1)
                         {
-                            if (s < 0.2f)                   // (at the pinned root itself: nothing to move)
-                                continue;
-
                             // the pinned root already inside this collider (a shoulder's, at the root of an arm):
                             // its first segment can't come out of it, and pushing the next joint for it -- the push
-                            // scaled up by 1/s -- shoved the chain into whatever lay beyond (the body)
+                            // scaled up by 1/s -- shoved the chain into whatever lay beyond (the body). The next joint
+                            // itself kept out of it though, straight out, as far as it's in: skipped whole, that first
+                            // stretch of cloth lay in the shoulder (a thicker arm, its root inside, cut in more)
                             glm::vec3 ab = sColB[c] - sColA[c];
                             float ab2 = glm::dot(ab, ab);
                             float t = (ab2 > 0.000001f) ? glm::clamp(glm::dot(chain.mPos[0] - sColA[c], ab) / ab2, 0.0f, 1.0f) : 0.0f;
                             if (glm::distance(chain.mPos[0], sColA[c] + ab * t) < reach)
+                            {
+                                float t1 = (ab2 > 0.000001f) ? glm::clamp(glm::dot(chain.mPos[1] - sColA[c], ab) / ab2, 0.0f, 1.0f) : 0.0f;
+                                glm::vec3 away = chain.mPos[1] - (sColA[c] + ab * t1);
+                                float dist = glm::length(away);
+                                if (dist < reach && dist > 0.00001f)
+                                    chain.mPos[1] += away * ((reach - dist) / dist);
                                 continue;
-
-                            chain.mPos[i] += push / s;
+                            }
                         }
-                        else
-                        {
-                            float w = 1.0f / ((1.0f - s) * (1.0f - s) + s * s);
-                            chain.mPos[i - 1] += push * ((1.0f - s) * w);
-                            chain.mPos[i] += push * (s * w);
-                        }
+                        PushSegmentOut(chain.mPos[i - 1], chain.mPos[i], sColA[c], sColB[c], reach, i > 1);
                     }
                 }
             }
         }
-        else
-        {
-            for (uint32_t i = 0; i < numPoints; ++i)
-                chain.mPos[i] = sTarget[i] + chain.mOffset[i];
-        }
+    }
+
+    // each chain's bones posed from its particles
+    for (BoneChain& chain : mBoneChains)
+    {
+        const uint32_t n = (uint32_t)chain.mBones.size();
+        const uint32_t numPoints = n + 1;
+        std::vector<glm::mat4>& model = chain.mModel;
 
         if (dt > 0.0f)
         {
             for (uint32_t i = 0; i < numPoints; ++i)
             {
                 chain.mPrevOffset[i] = chain.mOffset[i];
-                chain.mOffset[i] = chain.mPos[i] - sTarget[i];
+                chain.mOffset[i] = chain.mPos[i] - chain.mTarget[i];
             }
         }
 
         // each bone turned to point at the next particle, the ones below it carried along
         for (uint32_t k = 0; k < n; ++k)
         {
-            glm::vec3 head = glm::vec3(sModel[k][3]);
-            glm::vec3 next = (k + 1 < n) ? glm::vec3(sModel[k + 1][3]) : glm::vec3(sModel[k] * glm::vec4(chain.mTipLocal, 1.0f));
+            glm::vec3 head = glm::vec3(model[k][3]);
+            glm::vec3 next = (k + 1 < n) ? glm::vec3(model[k + 1][3]) : glm::vec3(model[k] * glm::vec4(chain.mTipLocal, 1.0f));
             glm::vec3 want = glm::vec3(invTransform * glm::vec4(chain.mPos[k + 1], 1.0f)) - head;
             glm::vec3 have = next - head;
             if (glm::length(want) < 0.0001f || glm::length(have) < 0.0001f)
@@ -833,13 +924,13 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
             glm::quat turn = glm::rotation(glm::normalize(have), glm::normalize(want));
             glm::mat4 about = glm::translate(head) * glm::toMat4(turn) * glm::translate(-head);
             for (uint32_t j = k; j < n; ++j)
-                sModel[j] = about * sModel[j];
+                model[j] = about * model[j];
         }
 
         for (uint32_t k = 0; k < n; ++k)
         {
             int32_t b = chain.mBones[k];
-            mBoneMatrices[b] = sModel[k] * bones[b].mOffsetMatrix;
+            mBoneMatrices[b] = model[k] * bones[b].mOffsetMatrix;
         }
     }
 }

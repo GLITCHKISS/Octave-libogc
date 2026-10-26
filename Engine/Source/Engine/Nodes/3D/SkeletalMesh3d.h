@@ -73,6 +73,9 @@ struct BoneChain
     float mInertia = 1.0f;                  // how much of the mesh's acceleration throws the chain
     float mLimit = 0.0f;                    // m the tip may stray from the animation (0: no limit)
     bool mReset = true;
+    std::vector<glm::vec3> mTarget;         // (this frame's: where the animation puts each, the bones' model
+    std::vector<glm::mat4> mModel;          //  matrices, the segments' lengths -- kept while all the chains step)
+    std::vector<float> mLength;
 };
 
 struct BoneCollider
@@ -176,7 +179,14 @@ public:
     // when they're the same point). ResetBoneDynamics: the particles back on the animation (after a teleport).
     int32_t AddBoneChain(const std::string& rootBone, float stiffness, float damping, glm::vec3 gravity, float radius,
         float inertia = 1.0f, float limit = 0.0f);
-    void AddBoneCollider(const std::string& bone, glm::vec3 restA, glm::vec3 restB, float radius);
+    int32_t AddBoneCollider(const std::string& bone, glm::vec3 restA, glm::vec3 restB, float radius);
+    // SetBoneColliderRadius: a collider (AddBoneCollider's index) made thicker or thinner as it goes (a pose
+    // that needs more room than the rest).
+    void SetBoneColliderRadius(int32_t index, float radius);
+    // AddBoneChainLink: two chains side by side (the lines of a cloth, given by their root bones) linked joint to joint
+    // across: a collider coming between them is kept off the segment across too, not only off each line -- the cloth
+    // between two lines can't pass through it. Returns false if either chain isn't there.
+    bool AddBoneChainLink(const std::string& rootA, const std::string& rootB);
     void ResetBoneDynamics();
     void ClearBoneDynamics();
     glm::vec3 GetBoneRestPosition(int32_t boneIndex) const;     // its head in the rest pose, model space
@@ -222,6 +232,7 @@ protected:
     float mBoundsRadiusOverride = 0.0f;
     std::vector<BoneChain> mBoneChains;
     std::vector<BoneCollider> mBoneColliders;
+    std::vector<std::pair<int32_t, int32_t>> mBoneChainLinks;
     bool mAnimationPaused;
     bool mRevertToBindPose;
     bool mInheritPose;
