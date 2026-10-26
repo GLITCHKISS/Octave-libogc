@@ -1824,7 +1824,8 @@ bool IsCpuSkinningRequired(SkeletalMesh3D* skeletalMeshComp)
     }
     else
     {
-        return skeletalMeshComp->GetSkeletalMesh()->GetNumBones() > MAX_GPU_BONES;
+        return skeletalMeshComp->GetSkeletalMesh()->GetNumBones() > MAX_GPU_BONES ||
+            skeletalMeshComp->GetSkeletalMesh()->GetNumMorphTargets() > 0;     // (morphed on the CPU, then skinned there)
     }
 #endif
 }

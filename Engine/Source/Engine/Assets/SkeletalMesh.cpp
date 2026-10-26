@@ -183,6 +183,21 @@ void SkeletalMesh::LoadStream(Stream& stream, Platform platform)
     mBounds.mCenter = stream.ReadVec3();
     mBounds.mRadius = stream.ReadFloat();
     mBoundsScale = stream.ReadFloat();
+
+    mMorphTargets.clear();
+    if (stream.GetAssetVersion() >= ASSET_VERSION_SKELETAL_MORPHS)
+    {
+        uint32_t numMorphs = stream.ReadUint32();
+        mMorphTargets.resize(numMorphs);
+        for (MorphTarget& morph : mMorphTargets)
+        {
+            stream.ReadString(morph.mName);
+            morph.mPositions.resize(stream.ReadUint32());
+            for (glm::vec3& p : morph.mPositions) p = stream.ReadVec3();
+            morph.mNormals.resize(stream.ReadUint32());
+            for (glm::vec3& n : morph.mNormals) n = stream.ReadVec3();
+        }
+    }
 }
 
 void SkeletalMesh::SaveStream(Stream& stream, Platform platform)
@@ -290,6 +305,16 @@ void SkeletalMesh::SaveStream(Stream& stream, Platform platform)
     stream.WriteVec3(mBounds.mCenter);
     stream.WriteFloat(mBounds.mRadius);
     stream.WriteFloat(mBoundsScale);
+
+    stream.WriteUint32(uint32_t(mMorphTargets.size()));
+    for (const MorphTarget& morph : mMorphTargets)
+    {
+        stream.WriteString(morph.mName);
+        stream.WriteUint32(uint32_t(morph.mPositions.size()));
+        for (const glm::vec3& p : morph.mPositions) stream.WriteVec3(p);
+        stream.WriteUint32(uint32_t(morph.mNormals.size()));
+        for (const glm::vec3& n : morph.mNormals) stream.WriteVec3(n);
+    }
 #endif
 }
 
@@ -360,6 +385,7 @@ bool SkeletalMesh::Import(const std::string& path, ImportOptions* options)
         }
 
         Create(*scene, *scene->mMeshes[meshIndex]);
+        NameMorphTargets(path);
 
         if (!singleMeshImport)
         {
@@ -494,6 +520,26 @@ float SkeletalMesh::GetAnimationDuration(const char* name)
     }
 
     return duration;
+}
+
+uint32_t SkeletalMesh::GetNumMorphTargets() const
+{
+    return uint32_t(mMorphTargets.size());
+}
+
+const MorphTarget& SkeletalMesh::GetMorphTarget(uint32_t index) const
+{
+    return mMorphTargets[index];
+}
+
+int32_t SkeletalMesh::FindMorphTarget(const std::string& name) const
+{
+    for (uint32_t i = 0; i < mMorphTargets.size(); ++i)
+    {
+        if (mMorphTargets[i].mName == name)
+            return int32_t(i);
+    }
+    return -1;
 }
 
 const std::vector<VertexSkinned>& SkeletalMesh::GetVertices() const
@@ -689,6 +735,36 @@ void SkeletalMesh::Create(const aiScene& scene,
 
     // Setup vertex/index buffers
     SetupResource(meshData, boneWeights, boneIndices);
+
+    // Morph targets: assimp gives each as the whole mesh moved; kept as each vertex's move from the mesh (named after
+    // the file's own names by NameMorphTargets, "Morph0".. till then)
+    mMorphTargets.clear();
+    for (uint32_t m = 0; m < meshData.mNumAnimMeshes; ++m)
+    {
+        const aiAnimMesh* anim = meshData.mAnimMeshes[m];
+        MorphTarget morph;
+        morph.mName = anim->mName.length > 0 ? anim->mName.C_Str() : ("Morph" + std::to_string(m));
+        if (anim->HasPositions() && anim->mNumVertices == meshData.mNumVertices)
+        {
+            morph.mPositions.resize(meshData.mNumVertices);
+            for (uint32_t i = 0; i < meshData.mNumVertices; ++i)
+            {
+                const aiVector3D d = anim->mVertices[i] - meshData.mVertices[i];
+                morph.mPositions[i] = glm::vec3(d.x, d.y, d.z);
+            }
+        }
+        if (anim->HasNormals() && meshData.HasNormals() && anim->mNumVertices == meshData.mNumVertices)
+        {
+            morph.mNormals.resize(meshData.mNumVertices);
+            for (uint32_t i = 0; i < meshData.mNumVertices; ++i)
+            {
+                const aiVector3D d = anim->mNormals[i] - meshData.mNormals[i];
+                morph.mNormals[i] = glm::vec3(d.x, d.y, d.z);
+            }
+        }
+        if (!morph.mPositions.empty())
+            mMorphTargets.push_back(std::move(morph));
+    }
 
     // Remove event bones. Those are a work around for exporting animation events.
     for (int32_t i = int32_t(mBones.size()) - 1; i >= 0; --i)
@@ -954,6 +1030,48 @@ void SkeletalMesh::SetupAnimations(const aiScene& scene)
     }
 
     InitBindPose();
+}
+
+void SkeletalMesh::NameMorphTargets(const std::string& path)
+{
+    if (mMorphTargets.empty())
+        return;
+
+    // the glTF's JSON: a .gltf is all of it; a .glb's comes first, after its 12-byte header and its chunk's 8
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr)
+        return;
+    std::string text;
+    char buffer[4096];
+    size_t got = 0;
+    while ((got = fread(buffer, 1, sizeof(buffer), file)) > 0)
+        text.append(buffer, got);
+    fclose(file);
+    if (text.size() >= 20 && text.compare(0, 4, "glTF") == 0)
+    {
+        uint32_t jsonLength = 0;
+        memcpy(&jsonLength, text.data() + 12, 4);
+        text = text.substr(20, glm::min<size_t>(jsonLength, text.size() - 20));
+    }
+
+    // the first "targetNames": [ "...", ... ] (one skinned mesh to a file, as this importer takes them)
+    size_t at = text.find("\"targetNames\"");
+    if (at == std::string::npos)
+        return;
+    at = text.find('[', at);
+    size_t end = (at == std::string::npos) ? std::string::npos : text.find(']', at);
+    if (end == std::string::npos)
+        return;
+    uint32_t index = 0;
+    size_t q = text.find('"', at);
+    while (q != std::string::npos && q < end && index < mMorphTargets.size())
+    {
+        size_t close = text.find('"', q + 1);
+        if (close == std::string::npos || close > end)
+            break;
+        mMorphTargets[index++].mName = text.substr(q + 1, close - q - 1);
+        q = text.find('"', close + 1);
+    }
 }
 
 void SkeletalMesh::SetupResource(const aiMesh& meshData,

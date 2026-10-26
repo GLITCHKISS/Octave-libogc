@@ -614,6 +614,34 @@ void SkeletalMesh3D::SetBoneDynamicsInertia(float scale)
     mBoneInertiaScale = glm::max(scale, 0.0f);
 }
 
+uint32_t SkeletalMesh3D::GetNumMorphTargets() const
+{
+    SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();
+    return mesh ? mesh->GetNumMorphTargets() : 0;
+}
+
+void SkeletalMesh3D::SetMorphWeight(int32_t index, float weight)
+{
+    if (index < 0 || index >= int32_t(GetNumMorphTargets()))
+        return;
+    if (mMorphWeights.size() < GetNumMorphTargets())
+        mMorphWeights.resize(GetNumMorphTargets(), 0.0f);
+    mMorphWeights[index] = weight;
+}
+
+bool SkeletalMesh3D::SetMorphWeight(const std::string& name, float weight)
+{
+    SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();
+    int32_t index = mesh ? mesh->FindMorphTarget(name) : -1;
+    SetMorphWeight(index, weight);
+    return index >= 0;
+}
+
+float SkeletalMesh3D::GetMorphWeight(int32_t index) const
+{
+    return (index >= 0 && index < int32_t(mMorphWeights.size())) ? mMorphWeights[index] : 0.0f;
+}
+
 void SkeletalMesh3D::SetBoneColliderRadius(int32_t index, float radius)
 {
     if (index >= 0 && index < (int32_t)mBoneColliders.size())
@@ -1626,7 +1654,38 @@ void SkeletalMesh3D::CpuSkinVertices()
         mSkinnedVertices.swap(mSkinnedVerticesBack);
 #endif
         mSkinnedVertices.resize(mesh->GetNumVertices());
-        const std::vector<VertexSkinned>& verts = mesh->GetVertices();
+        const std::vector<VertexSkinned>* source = &mesh->GetVertices();
+
+        // the morph targets in first (each by its weight), the bones then move the result
+        static std::vector<VertexSkinned> sMorphed;
+        const uint32_t numMorphs = glm::min<uint32_t>(mesh->GetNumMorphTargets(), uint32_t(mMorphWeights.size()));
+        bool morphing = false;
+        for (uint32_t m = 0; m < numMorphs; ++m)
+            morphing = morphing || (mMorphWeights[m] != 0.0f);
+        if (morphing)
+        {
+            sMorphed = *source;
+            for (uint32_t m = 0; m < numMorphs; ++m)
+            {
+                const float w = mMorphWeights[m];
+                if (w == 0.0f)
+                    continue;
+                const MorphTarget& morph = mesh->GetMorphTarget(m);
+                const uint32_t n = glm::min<uint32_t>(uint32_t(morph.mPositions.size()), uint32_t(sMorphed.size()));
+                for (uint32_t i = 0; i < n; ++i)
+                    sMorphed[i].mPosition += morph.mPositions[i] * w;
+                const uint32_t nn = glm::min<uint32_t>(uint32_t(morph.mNormals.size()), uint32_t(sMorphed.size()));
+                for (uint32_t i = 0; i < nn; ++i)
+                    sMorphed[i].mNormal += morph.mNormals[i] * w;
+            }
+            for (VertexSkinned& v : sMorphed)
+            {
+                const float len = glm::length(v.mNormal);
+                if (len > 0.0001f) v.mNormal /= len;
+            }
+            source = &sMorphed;
+        }
+        const std::vector<VertexSkinned>& verts = *source;
 
         if (mBoneInfluenceMode == BoneInfluenceMode::One)
         {

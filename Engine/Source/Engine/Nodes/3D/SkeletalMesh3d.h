@@ -192,6 +192,13 @@ public:
     bool AddBoneChainLink(const std::string& rootA, const std::string& rootB);
     void ResetBoneDynamics();
     void ClearBoneDynamics();
+
+    // Morph targets (the mesh's: Blender's shape keys): each one's weight, 0 (the mesh as it is) .. 1 (the target), the
+    // mesh moved by them before the bones. A mesh with morph targets is skinned on the CPU.
+    void SetMorphWeight(int32_t index, float weight);
+    bool SetMorphWeight(const std::string& name, float weight);
+    float GetMorphWeight(int32_t index) const;
+    uint32_t GetNumMorphTargets() const;
     glm::vec3 GetBoneRestPosition(int32_t boneIndex) const;     // its head in the rest pose, model space
 
     void SetAnimEventHandler(AnimEventHandlerFP handler);
@@ -237,6 +244,7 @@ protected:
     std::vector<BoneCollider> mBoneColliders;
     std::vector<std::pair<int32_t, int32_t>> mBoneChainLinks;
     float mBoneInertiaScale = 1.0f;
+    std::vector<float> mMorphWeights;
     bool mAnimationPaused;
     bool mRevertToBindPose;
     bool mInheritPose;

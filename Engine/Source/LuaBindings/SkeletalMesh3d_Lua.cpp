@@ -334,6 +334,42 @@ int SkeletalMesh3D_Lua::SetBoneDynamicsInertia(lua_State* L)
     return 0;
 }
 
+// SetMorphWeight(target, weight): target a morph target's name or its index (from 0); false if it has none such
+int SkeletalMesh3D_Lua::SetMorphWeight(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    float weight = CHECK_NUMBER(L, 3);
+    bool found = false;
+    if (lua_isinteger(L, 2))
+    {
+        int32_t index = (int32_t)lua_tointeger(L, 2);
+        found = index >= 0 && index < int32_t(comp->GetNumMorphTargets());
+        comp->SetMorphWeight(index, weight);
+    }
+    else
+    {
+        const char* name = CHECK_STRING(L, 2);
+        found = comp->SetMorphWeight(std::string(name), weight);
+    }
+    lua_pushboolean(L, found);
+    return 1;
+}
+
+int SkeletalMesh3D_Lua::GetMorphWeight(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    int32_t index = (int32_t)CHECK_INTEGER(L, 2);
+    lua_pushnumber(L, comp->GetMorphWeight(index));
+    return 1;
+}
+
+int SkeletalMesh3D_Lua::GetNumMorphTargets(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    lua_pushinteger(L, (lua_Integer)comp->GetNumMorphTargets());
+    return 1;
+}
+
 int SkeletalMesh3D_Lua::SetBoneColliderRadius(lua_State* L)
 {
     SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
@@ -475,6 +511,9 @@ void SkeletalMesh3D_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, AddBoneChainLink);
     REGISTER_TABLE_FUNC(L, mtIndex, SetBoneColliderRadius);
     REGISTER_TABLE_FUNC(L, mtIndex, SetBoneDynamicsInertia);
+    REGISTER_TABLE_FUNC(L, mtIndex, SetMorphWeight);
+    REGISTER_TABLE_FUNC(L, mtIndex, GetMorphWeight);
+    REGISTER_TABLE_FUNC(L, mtIndex, GetNumMorphTargets);
     REGISTER_TABLE_FUNC(L, mtIndex, ResetBoneDynamics);
     REGISTER_TABLE_FUNC(L, mtIndex, ClearBoneDynamics);
 

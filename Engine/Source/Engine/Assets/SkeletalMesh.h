@@ -82,6 +82,15 @@ struct Animation
     std::vector<AnimEventTrack> mEventTracks;
 };
 
+// A morph target (a glTF one: Blender's shape keys): how far each vertex moves, at full weight, from the mesh as it is
+// (its rest), before the bones -- blended in by SkeletalMesh3D::SetMorphWeight
+struct MorphTarget
+{
+    std::string mName;
+    std::vector<glm::vec3> mPositions;          // each vertex's move (one per vertex)
+    std::vector<glm::vec3> mNormals;            // each normal's change (one per vertex, or none)
+};
+
 class SkeletalMesh : public Asset
 {
 public:
@@ -128,6 +137,10 @@ public:
 
     const std::vector<VertexSkinned>& GetVertices() const;
 
+    uint32_t GetNumMorphTargets() const;
+    const MorphTarget& GetMorphTarget(uint32_t index) const;
+    int32_t FindMorphTarget(const std::string& name) const;
+
     void FinalizeBoneTransforms(std::vector<glm::mat4>& inoutTransforms);
 
     void CopyBindPose(std::vector<glm::mat4>& outTransforms);
@@ -155,6 +168,7 @@ private:
     std::vector<Bone> mBones;
     std::vector<Animation> mAnimations;
     std::vector<VertexSkinned> mVertices;
+    std::vector<MorphTarget> mMorphTargets;
 
     glm::mat4 mInvRootTransform;
     std::vector<glm::mat4> mBindPoseMatrices;
@@ -168,6 +182,9 @@ private:
 
 #if EDITOR
 public:
+    // The morph targets named as the file names them (a glTF mesh's extras.targetNames: assimp leaves them unnamed)
+    void NameMorphTargets(const std::string& path);
+
     void Create(const aiScene& scene,
         const aiMesh& meshData,
         std::vector<Material>* materials = nullptr);
