@@ -186,6 +186,9 @@ public:
     // SetBoneDynamicsInertia: how much of each chain's own inertia the mesh's acceleration throws it by, all of them
     // (1 as set; less to calm them a moment -- a sudden change of speed they shouldn't be flung by).
     void SetBoneDynamicsInertia(float scale);
+    // SetBoneChainGravity: a chain's (given by its root bone) pull, world space, m/s/s, from now on -- a wind as much as
+    // gravity: the air it's moving through, gusts. Returns false if there's no such chain.
+    bool SetBoneChainGravity(const std::string& rootBone, glm::vec3 gravity);
     // AddBoneChainLink: two chains side by side (the lines of a cloth, given by their root bones) linked joint to joint
     // across: a collider coming between them is kept off the segment across too, not only off each line -- the cloth
     // between two lines can't pass through it. Returns false if either chain isn't there.

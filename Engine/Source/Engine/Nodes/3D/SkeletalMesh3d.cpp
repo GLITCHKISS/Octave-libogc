@@ -617,6 +617,21 @@ void SkeletalMesh3D::SetBoneDynamicsInertia(float scale)
     mBoneInertiaScale = glm::max(scale, 0.0f);
 }
 
+bool SkeletalMesh3D::SetBoneChainGravity(const std::string& rootBone, glm::vec3 gravity)
+{
+    SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();
+    int32_t root = mesh ? mesh->FindBoneIndex(rootBone) : -1;
+    for (BoneChain& chain : mBoneChains)
+    {
+        if (!chain.mBones.empty() && chain.mBones[0] == root)
+        {
+            chain.mGravity = gravity;
+            return true;
+        }
+    }
+    return false;
+}
+
 uint32_t SkeletalMesh3D::GetNumMorphTargets() const
 {
     SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();

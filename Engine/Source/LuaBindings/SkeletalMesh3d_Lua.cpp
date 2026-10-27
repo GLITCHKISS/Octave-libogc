@@ -334,6 +334,16 @@ int SkeletalMesh3D_Lua::SetBoneDynamicsInertia(lua_State* L)
     return 0;
 }
 
+// SetBoneChainGravity(rootBone, gravity): a chain's pull (world space, m/s/s) from now on; false if there's no such chain
+int SkeletalMesh3D_Lua::SetBoneChainGravity(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    const char* root = CHECK_STRING(L, 2);
+    glm::vec3 gravity = CHECK_VECTOR(L, 3);
+    lua_pushboolean(L, comp->SetBoneChainGravity(std::string(root), gravity));
+    return 1;
+}
+
 // SetMorphWeight(target, weight): target a morph target's name or its index (from 0); false if it has none such
 int SkeletalMesh3D_Lua::SetMorphWeight(lua_State* L)
 {
@@ -511,6 +521,7 @@ void SkeletalMesh3D_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, AddBoneChainLink);
     REGISTER_TABLE_FUNC(L, mtIndex, SetBoneColliderRadius);
     REGISTER_TABLE_FUNC(L, mtIndex, SetBoneDynamicsInertia);
+    REGISTER_TABLE_FUNC(L, mtIndex, SetBoneChainGravity);
     REGISTER_TABLE_FUNC(L, mtIndex, SetMorphWeight);
     REGISTER_TABLE_FUNC(L, mtIndex, GetMorphWeight);
     REGISTER_TABLE_FUNC(L, mtIndex, GetNumMorphTargets);

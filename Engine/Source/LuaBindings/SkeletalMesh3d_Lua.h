@@ -43,6 +43,7 @@ struct SkeletalMesh3D_Lua
     static int AddBoneChainLink(lua_State* L);
     static int SetBoneColliderRadius(lua_State* L);
     static int SetBoneDynamicsInertia(lua_State* L);
+    static int SetBoneChainGravity(lua_State* L);
     static int SetMorphWeight(lua_State* L);
     static int GetMorphWeight(lua_State* L);
     static int GetNumMorphTargets(lua_State* L);
