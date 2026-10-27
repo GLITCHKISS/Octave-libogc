@@ -332,6 +332,9 @@ struct EngineConfig
     float mEditorNearClip = 0.25f;
     float mEditorFarClip = 4096.0f;
 
+    // -play: the editor starts Play once its project's scene is open (a fix tried straight away)
+    bool mPlayOnStart = false;
+
     // Headless mode configuration
     bool mHeadless = false;
     Platform mBuildPlatform = Platform::Count;  // Count = no build requested

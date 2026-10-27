@@ -312,6 +312,10 @@ void ReadCommandLineArgs(int32_t argc, char** argv)
             sEngineConfig.mValidateGraphics = (validate != 0);
             ++i;
         }
+        else if (strcmp(argv[i], "-play") == 0)
+        {
+            sEngineConfig.mPlayOnStart = true;
+        }
         else if (strcmp(argv[i], "-packageForSteam") == 0)
         {
             sEngineConfig.mPackageForSteam = true;

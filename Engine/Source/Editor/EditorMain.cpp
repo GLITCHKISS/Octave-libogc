@@ -187,11 +187,30 @@ void EditorMain(int32_t argc, char** argv)
     Renderer::Get()->EnableStatsOverlay(false);
 
     bool ret = true;
+    bool playOnStart = false;                                   // (-play: Play started once the scene is open, a
+    for (int32_t i = 1; i < argc; ++i)                          //  few frames in; given up on if none opens. From
+    {                                                           //  the arguments: opening the project read its
+        if (strcmp(argv[i], "-play") == 0) playOnStart = true;  //  config over the engine's)
+    }
+    int32_t playWait = 0;
 
     while (ret)
     {
         InputManager::Get()->Update();
         ActionManager::Get()->Update();
+
+        if (playOnStart && ++playWait > 3)
+        {
+            if (GetEditorState()->GetEditScene() != nullptr)
+            {
+                playOnStart = false;
+                GetEditorState()->BeginPlayInEditor();
+            }
+            else if (playWait > 600)
+            {
+                playOnStart = false;
+            }
+        }
 
         bool playInEditor = GetEditorState()->mPlayInEditor;
 
