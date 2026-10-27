@@ -6,7 +6,8 @@
 // white leaves it, the silhouette's grey darkens it. Outside the texture, its white border. The GX renderer's
 // projected shadow is the reference: its multiply is on the 8-bit (sRGB) colour, so in linear colour space the
 // grey is made linear first, to darken as much. Only what's no higher than mCut.x (its first caster's feet and a
-// little): above that, white -- a block over a character's head is not under it.
+// little): above that, white -- a block over a character's head is not under it. Nor what faces down: a shadow laid
+// straight down can't fall on an underside (the bottom of what a character stands on took it too).
 
 #include "Common.glsl"
 
@@ -29,12 +30,13 @@ layout (set = 2, binding = 1) uniform ProjShadowUniformBuffer
 } projShadow;
 
 layout(location = 0) in vec3 inPosition;
+layout(location = 3) in vec3 inNormal;
 
 layout(location = 0) out vec4 outColor;
 
 void main()
 {
-    if (inPosition.y > projShadow.mCut.x)
+    if (inPosition.y > projShadow.mCut.x || inNormal.y < 0.0)
     {
         outColor = vec4(1.0);
         return;
