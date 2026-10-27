@@ -424,6 +424,16 @@ int SkeletalMesh3D_Lua::SetBoneScale(lua_State* L)
     return 0;
 }
 
+int SkeletalMesh3D_Lua::ClearBoneScale(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    const char* boneName = CHECK_STRING(L, 2);
+
+    comp->ClearBoneScale(comp->FindBoneIndex(boneName));
+
+    return 0;
+}
+
 int SkeletalMesh3D_Lua::GetNumBones(lua_State* L)
 {
     SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
@@ -529,6 +539,8 @@ void SkeletalMesh3D_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, ClearBoneDynamics);
 
     REGISTER_TABLE_FUNC(L, mtIndex, SetBoneScale);
+
+    REGISTER_TABLE_FUNC(L, mtIndex, ClearBoneScale);
 
     REGISTER_TABLE_FUNC(L, mtIndex, GetNumBones);
 

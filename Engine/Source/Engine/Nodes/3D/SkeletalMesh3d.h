@@ -154,7 +154,10 @@ public:
     void SetBoneTransform(int32_t boneIndex, const glm::mat4& transform);
     void SetBonePosition(int32_t boneIndex, glm::vec3 position);
     void SetBoneRotation(int32_t boneIndex, glm::vec3 rotation);
-    void SetBoneScale(int32_t boneIndex, glm::vec2 scale);
+    // A bone's scale held at this whatever the animations blend to (cleared by ClearBoneScale): a part swapped by
+    // scale -- one shown, another hidden -- blended between two animations otherwise came out half of each
+    void SetBoneScale(int32_t boneIndex, glm::vec3 scale);
+    void ClearBoneScale(int32_t boneIndex);
 
     uint32_t GetNumBones() const;
     BoneInfluenceMode GetBoneInfluenceMode() const;
@@ -248,6 +251,7 @@ protected:
     std::vector<std::pair<int32_t, int32_t>> mBoneChainLinks;
     float mBoneInertiaScale = 1.0f;
     std::vector<float> mMorphWeights;
+    std::vector<std::pair<int32_t, glm::vec3>> mBoneScaleOverrides;
     bool mAnimationPaused;
     bool mRevertToBindPose;
     bool mInheritPose;

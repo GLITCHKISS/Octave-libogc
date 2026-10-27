@@ -1291,9 +1291,35 @@ void SkeletalMesh3D::SetBoneRotation(int32_t boneIndex, glm::vec3 rotation)
     LogWarning("SkeletalMesh3D::SetBoneRotation() not yet implemented");
 }
 
-void SkeletalMesh3D::SetBoneScale(int32_t boneIndex, glm::vec2 scale)
+void SkeletalMesh3D::SetBoneScale(int32_t boneIndex, glm::vec3 scale)
 {
-    LogWarning("SkeletalMesh3D::SetBoneScale() not yet implemented");
+    if (boneIndex < 0)
+    {
+        return;
+    }
+
+    for (auto& over : mBoneScaleOverrides)
+    {
+        if (over.first == boneIndex)
+        {
+            over.second = scale;
+            return;
+        }
+    }
+
+    mBoneScaleOverrides.push_back({ boneIndex, scale });
+}
+
+void SkeletalMesh3D::ClearBoneScale(int32_t boneIndex)
+{
+    for (uint32_t i = 0; i < mBoneScaleOverrides.size(); ++i)
+    {
+        if (mBoneScaleOverrides[i].first == boneIndex)
+        {
+            mBoneScaleOverrides.erase(mBoneScaleOverrides.begin() + i);
+            return;
+        }
+    }
 }
 
 uint32_t SkeletalMesh3D::GetNumBones() const
@@ -1553,6 +1579,15 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
             // from the decomposed parts (position / rotation / scale);
             if (bonesUpdated)
             {
+                // Scales held from script, over whatever the animations blended to
+                for (const auto& over : mBoneScaleOverrides)
+                {
+                    if (over.first < (int32_t)numBones && sDecompTransforms[over.first].mValid)
+                    {
+                        sDecompTransforms[over.first].mScale = over.second;
+                    }
+                }
+
                 // Create matrices from lerped pos/rot/scale
                 for (uint32_t i = 0; i < numBones; ++i)
                 {
