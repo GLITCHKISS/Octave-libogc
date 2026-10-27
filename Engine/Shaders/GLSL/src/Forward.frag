@@ -36,6 +36,10 @@ layout(location = 4) in vec4 inColor;
 
 layout(location = 0) out vec4 outColor;
 
+// Specular highlights, summed apart from the diffuse light: added after the surface colour, so a highlight shows the
+// light's colour tinted by the material's colour (a coloured shine when wanted) rather than by the texture
+vec4 gSpecular = vec4(0, 0, 0, 0);
+
 vec4 CalculateLighting(uint shadingModel, vec3 L, vec3 N, vec3 V, vec4 color, float attenuation)
 {
     vec4 retLighting = vec4(0,0,0,0);
@@ -48,8 +52,9 @@ vec4 CalculateLighting(uint shadingModel, vec3 L, vec3 N, vec3 V, vec4 color, fl
         vec3 reflectDir = reflect(-L, N);  
         float specularIntensity = pow(max(dot(V, reflectDir), 0.0), material.mShininess);
         vec4 specularColor = material.mSpecular * specularIntensity * color;
+        gSpecular += attenuation * specularColor;
 
-        retLighting = attenuation * (diffuseColor + specularColor);
+        retLighting = attenuation * diffuseColor;
     }
     else if (shadingModel == SHADING_MODEL_TOON)
     {
@@ -202,6 +207,8 @@ void main()
             outColor *= inColor.a;
         }
     }
+
+    outColor.rgb += gSpecular.rgb * material.mColor.rgb;
 
     if (material.mFresnelEnabled != 0)
     {
