@@ -411,6 +411,9 @@ void GFX_DrawShadowMeshComp(ShadowMesh3D* shadowMeshComp)
 // over the first caster, left any other far from it without a shadow.) GX still draws the first group's alone.
 static const uint32_t kProjShadowRes = 128;
 static const uint32_t kMaxProjShadows = 6;
+// The shadow only on what's no higher than its group's first caster's feet and this: laid straight down, it landed
+// on anything in the column -- a block over a character's head took it too
+static const float kProjShadowAboveFeet = 0.3f;
 
 struct ProjShadow
 {
@@ -485,7 +488,8 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
             glm::mat4 proj = glm::ortho(-group->mHalf, group->mHalf, -group->mHalf, group->mHalf, 0.1f, 200.0f);
             proj[1][1] *= -1.0f;
             group->mViewProj = proj * view;
-            group->mBlock = WriteUniformBlock(&group->mViewProj, sizeof(glm::mat4));
+            struct { glm::mat4 mViewProj; glm::vec4 mCut; } block = { group->mViewProj, glm::vec4(p.y + kProjShadowAboveFeet, 0.0f, 0.0f, 0.0f) };
+            group->mBlock = WriteUniformBlock(&block, sizeof(block));   // (the caster's shader reads only the matrix)
         }
 
         group->mCasters.push_back(caster);
