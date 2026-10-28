@@ -58,6 +58,9 @@ public:
     const std::string& GetDiscPath() const { return mDiscPath; }
     uint32_t GetDiscOffset() const { return mDiscOffset; }
     uint32_t GetDiscSize() const { return mDiscSize; }
+    // That range is PCM, not Vorbis: a Stream sound cooked uncompressed (Compress off), in the format it plays in --
+    // as a sound effect's PCM (little-endian 16-bit or unsigned 8-bit, channels interleaved). Nothing to decode.
+    bool GetDiscPcm() const { return mDiscPcm; }
 
     // GameCube: the PCM moved to ARAM (see Audio_Dolphin.cpp), at this ARAM address; 0 while it
     // is in main memory. GetWaveData() is null once it has moved; GetWaveDataSize() still holds.
@@ -77,6 +80,7 @@ protected:
     std::string mDiscPath;
     uint32_t mDiscOffset = 0;
     uint32_t mDiscSize = 0;
+    bool mDiscPcm = false;
 
     uint32_t mAramAddress = 0;
 

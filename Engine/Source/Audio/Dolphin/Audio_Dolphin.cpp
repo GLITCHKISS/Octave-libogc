@@ -29,6 +29,7 @@
 #define ov_read(vf, buffer, length, bigendian, word, sgned, bitstream) ((void)(vf), 0L)
 static inline int OvNoSeek(OggVorbis_File* vf) { (void)vf; return -1; }   // (a value, for a restart's check)
 #define ov_pcm_seek(vf, pos) OvNoSeek(vf)
+#define ov_pcm_total(vf, i) ((void)(vf), (ogg_int64_t)-1)
 #define ov_clear(vf) ((void)(vf))
 #endif
 
@@ -130,6 +131,7 @@ static sem_t sAudioIoSem = LWP_SEM_NULL;
 static lwp_t sAudioIoThread = LWP_THREAD_NULL;
 static sem_t sAudioDecodeSem = LWP_SEM_NULL;
 static lwp_t sAudioDecodeThread = LWP_THREAD_NULL;
+static lwp_t sAudioTrackThread = LWP_THREAD_NULL;   // (GameCube: a streamed track's copy made in ARAM, AudioTrackThread)
 // PCM the decode thread decoded since the main thread last looked (AUD_Update: the AudDecKB perf figure). Interrupts
 // off around each change: one CPU.
 static volatile uint32_t sDecodedBytes = 0;
@@ -160,6 +162,9 @@ struct StreamVoice
     int            bytesPerSample = 1;   // 1 = 8-bit unsigned, 2 = 16-bit LE
     bool           loop = false;
     bool           eof = false;
+    // A disc stream that is PCM already (SoundWave::GetDiscPcm, cooked uncompressed): copied from the disc window as it
+    // is, no vf at all (vfOpen stays false: never opened, cleared or parked), its loop's start its first byte.
+    bool           raw = false;
     // Opened by the I/O thread (OPEN_*): while REQUESTED only it touches vf, the disc source and
     // buf[0]; DONE hands them back with the first buffer decoded (openFilled bytes), and the voice
     // is set as AUD_Play asked (the open* fields).
@@ -279,6 +284,15 @@ static void ServeReadAheads()
     }
 }
 
+// A PCM stream back at its start (its loop): the start's window read here too, so the thread decoding it next has it.
+static void StreamRawRewind(StreamVoice* sv)
+{
+    uint8_t first;
+    sv->disc.pos = 0;
+    if (DiscRead(&first, 1, 1, &sv->disc) == 1)
+        sv->disc.pos = 0;                      // (the byte read only for the window: read again from it)
+}
+
 static void* AudioIoThread(void*)
 {
 #if PLATFORM_GAMECUBE
@@ -307,7 +321,9 @@ static void* AudioIoThread(void*)
             }
 
             bool ok;
-            if (sv->restart)                   // kept open (StreamPark): back to its start, as a loop goes back
+            if (sv->raw)                       // PCM: nothing to open (its start read below, into the first buffers)
+                ok = true;
+            else if (sv->restart)              // kept open (StreamPark): back to its start, as a loop goes back
                 ok = (ov_pcm_seek(&sv->vf, 0) == 0);
             else
             {
@@ -344,6 +360,8 @@ static void* AudioIoThread(void*)
                 continue;
             if (sv->vfOpen)
                 ov_pcm_seek(&sv->vf, 0);       // (its reads through DiscRead, here: none on the main thread)
+            else if (sv->raw)
+                StreamRawRewind(sv);
             __asm__ volatile("" ::: "memory");
             sv->loopState = LOOP_DONE;
         }
@@ -413,7 +431,7 @@ static size_t DiscRead(void* ptr, size_t size, size_t nmemb, void* ds)
             // Not read ahead (the stream's start, a seek, a loop): read it here. (Timed only on the main
             // thread: the profiler's stats aren't the audio threads' to touch, and they open and decode streams.)
             const lwp_t self = LWP_GetSelf();
-            const bool onMain = (self != sAudioIoThread && self != sAudioDecodeThread);
+            const bool onMain = (self != sAudioIoThread && self != sAudioDecodeThread && self != sAudioTrackThread);
             if (onMain) BEGIN_FRAME_STAT("AudRead");
             uint32_t fill = d->size - d->pos;
             if (fill > kDiscWindowBytes) fill = kDiscWindowBytes;
@@ -495,6 +513,40 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
 {
     uint32_t written = 0;
     int32_t errors = 0;
+
+    if (sv->raw)
+    {
+        // PCM as it plays: copied from the disc window. At its end, a loop goes back to its first byte -- asked of the
+        // I/O thread as a Vorbis loop's seek is (StreamDeferLoop), or done here.
+        while (written < want)
+        {
+            if (errors > 32)
+            {
+                LogError("Audio stream: disc reads kept failing; stream ended.");
+                sv->eof = true;
+                break;
+            }
+            written += (uint32_t)DiscRead(dst + written, 1, want - written, &sv->disc);
+            if (written == want)
+                break;
+            if (sv->disc.pos < sv->disc.size)
+            {
+                ++errors;                      // (a read failed: DiscRead logged it)
+                continue;
+            }
+            if (!sv->loop)
+            {
+                sv->eof = true;
+                break;
+            }
+            if (StreamDeferLoop(sv))
+                break;
+            sv->disc.pos = 0;
+            ++errors;                          // (a loop with nothing in it counts as an error too)
+        }
+        return written;
+    }
+
     while (written < want)
     {
         // ov_read can go on returning an error (a read that keeps failing, a broken stream).
@@ -1253,14 +1305,17 @@ static void AramVoiceStop(uint32_t voice)
         sAramVoices[voice].active = false;
 }
 
-static void AramVoiceStart(uint32_t voice, SoundWave* soundWave, int32_t format, int32_t pitchHz, int32_t volL, int32_t volR, bool loop)
+// A voice playing `size` bytes of PCM from ARAM at `aram`: a sound effect's (AramVoiceStart), or a streamed track's
+// copy (AramTrack).
+static void AramVoiceStartAt(uint32_t voice, uint32_t aram, uint32_t size, int32_t format, int32_t pitchHz, int32_t volL,
+                             int32_t volR, bool loop)
 {
     ASND_StopVoice(voice);
 
     AramVoice& v = sAramVoices[voice];
     v.active = false;
-    v.aram = soundWave->GetAramAddress();
-    v.size = soundWave->GetWaveDataSize();
+    v.aram = aram;
+    v.size = size;
     v.loop = loop;
 
     const uint32_t n = glm::min(kAramVoiceBuf, v.size);
@@ -1279,6 +1334,11 @@ static void AramVoiceStart(uint32_t voice, SoundWave* soundWave, int32_t format,
     _CPU_ISR_Restore(level);
 }
 
+static void AramVoiceStart(uint32_t voice, SoundWave* soundWave, int32_t format, int32_t pitchHz, int32_t volL, int32_t volR, bool loop)
+{
+    AramVoiceStartAt(voice, soundWave->GetAramAddress(), soundWave->GetWaveDataSize(), format, pitchHz, volL, volR, loop);
+}
+
 // A loaded sound effect's PCM moves to ARAM. Called on whichever thread loaded the sound.
 static void AramStoreWave(SoundWave* soundWave)
 {
@@ -1295,6 +1355,374 @@ static void AramStoreWave(SoundWave* soundWave)
 
     AramDma(AR_MRAMTOARAM, soundWave->GetWaveData(), at, size);
     soundWave->MoveWaveDataToAram(at);
+}
+
+// ---------------------------------------------------------------------------
+// Streamed tracks copied to ARAM (GameCube; Config.ini AudioDecodeThread=1)
+//
+// (A track cooked uncompressed -- Stream on, Compress off -- is PCM on the disc already: copied to ARAM as it is, with
+// no Vorbis on the console at all. What follows is for one cooked as Vorbis.)
+//
+// A long track streams from the disc because its PCM doesn't fit main memory: a 3.4 MB track, with about 4.5 MB free,
+// and a sound that isn't streamed is read into main memory whole before it moves to ARAM. But a stream decodes as it
+// plays, every frame: three 44.1 kHz stereo streams at once were 4-5 ms of Vorbis a frame on hardware, with 2 ms of
+// the frame to spare, and the decode thread raised above the main thread to keep them going made 33-50 ms frames.
+//
+// So each disc-streamed sound, as it loads (AUD_ProcessWaveBuffer), is decoded once, in the background, straight into
+// a block of ARAM a piece at a time (kTrackChunkBytes: no copy of the whole track in main memory), by the track thread
+// (AudioTrackThread): far below the main thread and the other audio threads, in what time is left once they've had
+// theirs. It never goes above the main thread. Once a copy is whole (TRACK_READY, and only then), AUD_Play plays the
+// sound from it as an ARAM sound effect plays (AramVoiceStartAt, looped as asked): nothing decoded as it plays. Till
+// then, or when ARAM hasn't room for it, it streams as before.
+// ---------------------------------------------------------------------------
+enum { TRACK_FREE = 0, TRACK_PENDING, TRACK_DECODING, TRACK_READY, TRACK_SKIPPED };
+
+struct AramTrack
+{
+    SoundWave*       wave = nullptr;        // whose copy (only compared: nullptr once it has gone)
+    std::string      path;                  // its Vorbis: this range of this file (the SoundWave's)
+    uint32_t         base = 0;
+    uint32_t         size = 0;
+    char             name[32] = {};
+    int32_t          channels = 2;
+    int32_t          bytesPerSample = 2;
+    bool             raw = false;           // PCM on the disc (SoundWave::GetDiscPcm): copied as it is, not decoded
+    uint32_t         aram = 0;              // its ARAM block (0: none)
+    uint32_t         pcmBytes = 0;          // the PCM in it, once READY
+    // FREE -> PENDING (TrackRegister) -> DECODING (the track thread's) -> READY or SKIPPED (still streamed); back to
+    // FREE when its SoundWave goes (AUD_ReleaseTrack). Changed under sTrackMutex; READY is read without it (AUD_Play).
+    volatile int32_t state = TRACK_FREE;
+    volatile bool    released = false;      // its SoundWave gone while it decodes: the track thread frees it
+};
+
+static const int32_t  kMaxAramTracks = 8;
+static const uint32_t kTrackChunkBytes = 16 * 1024;           // PCM decoded, then copied to ARAM, at a time
+static const uint32_t kTrackAramReserve = 1024 * 1024;        // ARAM left free for what loads later (sound effects,
+                                                              //  texture stashes)
+// Priority 30: below everything else that works -- the main thread (64), the decode thread (56), the I/O thread (50),
+// the background reader (45), the asset loader (40) -- so it only gets what they leave; above the SD log's thread (10),
+// which a rest after each chunk lets in.
+static const u32      kTrackPriority = 30;
+// AUD_WaitForTracks: the main thread asleep till they're made (a loading screen's), the rests left out
+static volatile bool  sTrackRush = false;
+static AramTrack sAramTracks[kMaxAramTracks];
+static mutex_t   sTrackMutex = LWP_MUTEX_NULL;
+static sem_t     sTrackSem = LWP_SEM_NULL;
+
+// The decoder's disc source and state, the track thread's alone (one track at a time).
+static DiscSource     sTrackDisc;
+static OggVorbis_File sTrackVf;
+
+// A disc-streamed sound to copy to ARAM (as it loads, on whichever thread loads it). Vorbis: 16-bit only, the stream's
+// format; PCM: 8 or 16-bit, as it is.
+static void TrackRegister(SoundWave* wave)
+{
+    if (sTrackSem == LWP_SEM_NULL || !wave->GetStream() || wave->GetDiscSize() == 0)
+        return;
+    const uint32_t bits = wave->GetBitsPerSample();
+    if (wave->GetDiscPcm() ? (bits != 8 && bits != 16) : (bits != 16))
+        return;
+
+    AramTrack* slot = nullptr;
+    bool known = false;
+    LWP_MutexLock(sTrackMutex);
+    for (AramTrack& t : sAramTracks)
+    {
+        if (t.state != TRACK_FREE && t.wave == wave)
+            known = true;
+        else if (t.state == TRACK_FREE && slot == nullptr)
+            slot = &t;
+    }
+    if (!known && slot != nullptr)
+    {
+        slot->wave = wave;
+        slot->path = wave->GetDiscPath();
+        slot->base = wave->GetDiscOffset();
+        slot->size = wave->GetDiscSize();
+        strncpy(slot->name, wave->GetName().c_str(), sizeof(slot->name) - 1);
+        slot->name[sizeof(slot->name) - 1] = 0;
+        slot->channels = (int32_t)wave->GetNumChannels();
+        slot->bytesPerSample = int32_t(bits / 8);
+        slot->raw = wave->GetDiscPcm();
+        slot->aram = 0;
+        slot->pcmBytes = 0;
+        slot->released = false;
+        __asm__ volatile("" ::: "memory");
+        slot->state = TRACK_PENDING;
+    }
+    LWP_MutexUnlock(sTrackMutex);
+
+    if (known)
+        return;
+    if (slot == nullptr)
+    {
+        LogWarning("AUDIO %s not in ARAM: no room in the track list (it streams)", wave->GetName().c_str());
+        return;
+    }
+    LWP_SemPost(sTrackSem);
+}
+
+// One track decoded into its ARAM block (the track thread's). Marked READY only once all of it is there; failed,
+// stopped or without room, its block is freed and it goes on streaming.
+static void TrackDecode(AramTrack* t)
+{
+    const uint64_t fromUs = SYS_GetTimeMicroseconds();
+    const uint32_t frameBytes = uint32_t(glm::max<int32_t>(t->channels, 1)) * uint32_t(t->bytesPerSample);
+
+    sTrackDisc.path = t->path;
+    sTrackDisc.base = t->base;
+    sTrackDisc.size = t->size;
+    sTrackDisc.pos = 0;
+    sTrackDisc.windowAt = 0;
+    sTrackDisc.windowSize = 0;
+    sTrackDisc.window = (uint8_t*)malloc(kDiscWindowBytes);
+    sTrackDisc.ahead = nullptr;               // (no read-ahead: it reads here, in its own time)
+    sTrackDisc.aheadState = AHEAD_EMPTY;
+    uint8_t* stage = (uint8_t*)memalign(32, kTrackChunkBytes);
+
+    const char* why = nullptr;
+    bool opened = false;
+    uint32_t pcm = 0;
+    uint32_t freeBytes = 0;
+    if (sTrackDisc.window == nullptr || stage == nullptr)
+        why = "no memory to decode it";
+    else if (t->raw)
+    {
+        pcm = t->size - t->size % frameBytes;   // (PCM already: its size is all there is to know)
+        uint32_t total = 0, sounds = 0;
+        AUD_GetAramStats(total, freeBytes, sounds);
+        if (pcm == 0)
+            why = "no audio in it";
+        else if (freeBytes < pcm + kTrackAramReserve || (t->aram = AramAlloc(pcm)) == 0)
+            why = "no room";
+    }
+    else
+    {
+        ov_callbacks dcb = { DiscRead, DiscSeek, MemClose, DiscTell };
+        opened = (ov_open_callbacks(&sTrackDisc, &sTrackVf, NULL, 0, dcb) >= 0);
+        const ogg_int64_t frames = opened ? ov_pcm_total(&sTrackVf, -1) : -1;
+        if (!opened)
+            why = "it would not open";
+        else if (frames <= 0 || frames > ogg_int64_t((16u << 20) / frameBytes))
+            why = "its length is unknown";
+        else
+        {
+            pcm = uint32_t(frames) * frameBytes;
+            uint32_t total = 0, sounds = 0;
+            AUD_GetAramStats(total, freeBytes, sounds);
+            if (freeBytes < pcm + kTrackAramReserve || (t->aram = AramAlloc(pcm)) == 0)   // (rounded up to 32 there)
+                why = "no room";
+        }
+    }
+
+    // A chunk at a time: decoded into `stage`, copied to the block. Every chunk but the last is whole, so each copy
+    // starts 32-byte aligned. Errors skipped as a stream skips them (StreamFill): the same samples it would play.
+    uint32_t written = 0;
+    int32_t errors = 0;
+    bool eof = false;
+
+    // PCM: read into `stage` a chunk at a time and copied to the block as it is -- nothing decoded.
+    while (t->raw && why == nullptr && written < pcm)
+    {
+        if (t->released)
+        {
+            why = "stopped";
+            break;
+        }
+        const uint32_t want = glm::min(kTrackChunkBytes, pcm - written);
+        if (DiscRead(stage, 1, want, &sTrackDisc) != want)
+        {
+            why = "a disc read failed";
+            break;
+        }
+        AramDma(AR_MRAMTOARAM, stage, t->aram + written, want);   // (rounded up to 32: the block has room for it)
+        written += want;
+        if (!sTrackRush)
+            usleep(1000);                    // (a rest each chunk, as below)
+    }
+    if (t->raw)
+        eof = true;
+
+    while (why == nullptr && !eof)
+    {
+        if (t->released)
+        {
+            why = "stopped";
+            break;
+        }
+        uint32_t n = 0;
+        while (n < kTrackChunkBytes && !eof && why == nullptr)
+        {
+            long ret;
+            if (written + n >= pcm)
+            {
+                char probe[64];             // (all it said it has: nothing more, or it's longer than it said)
+                ret = ov_read(&sTrackVf, probe, (int)sizeof(probe), 0, 2, 1, NULL);
+                if (ret > 0) why = "longer than it said";
+            }
+            else
+            {
+                const uint32_t want = glm::min(kTrackChunkBytes - n, pcm - written - n);
+                ret = ov_read(&sTrackVf, (char*)(stage + n), (int)want, 0, 2, 1, NULL);
+                if (ret > 0) n += (uint32_t)ret;
+            }
+            if (ret == 0) eof = true;
+            else if (ret < 0 && ++errors > 32) why = "the decoder kept failing";
+        }
+        if (why != nullptr)
+            break;
+        if (n > 0)
+        {
+            AramDma(AR_MRAMTOARAM, stage, t->aram + written, n);   // (rounded up to 32: the block has room for it)
+            written += n;
+        }
+        if (!sTrackRush)
+            usleep(1000);                    // (a rest each chunk: the SD log's thread, below this one, gets a turn)
+    }
+    if (why == nullptr && written == 0)
+        why = "no audio in it";
+
+    if (opened) ov_clear(&sTrackVf);
+    if (sTrackDisc.window) { free(sTrackDisc.window); sTrackDisc.window = nullptr; }
+    if (stage) free(stage);
+    sTrackDisc.windowSize = 0;
+
+    const uint32_t ms = uint32_t((SYS_GetTimeMicroseconds() - fromUs) / 1000);
+    char name[sizeof(t->name)];
+    memcpy(name, t->name, sizeof(name));
+    LWP_MutexLock(sTrackMutex);
+    if (why == nullptr && !t->released)
+    {
+        t->pcmBytes = written;
+        __asm__ volatile("" ::: "memory");   // (all of it in ARAM, and its size set, before AUD_Play may use it)
+        t->state = TRACK_READY;
+    }
+    else
+    {
+        if (why == nullptr) why = "stopped";
+        if (t->aram != 0) { AUD_FreeAram(t->aram); t->aram = 0; }
+        if (t->released)
+        {
+            t->wave = nullptr;
+            t->released = false;
+            t->state = TRACK_FREE;
+        }
+        else
+            t->state = TRACK_SKIPPED;
+    }
+    LWP_MutexUnlock(sTrackMutex);
+
+    if (why == nullptr)
+        LogWarning("AUDIO %s in ARAM: %u KB, %u ms%s", name, written / 1024, ms, t->raw ? " (PCM, copied)" : "");
+    else if (strcmp(why, "no room") == 0)
+        LogWarning("AUDIO %s not in ARAM: %u KB, %u KB free (it streams)", name, pcm / 1024, freeBytes / 1024);
+    else
+        LogWarning("AUDIO %s not in ARAM: %s (it streams)", name, why);
+}
+
+// Copies the tracks registered to ARAM, the smallest first (more of them ready sooner), one at a time.
+static void* AudioTrackThread(void*)
+{
+    OctSd_NoteThreadPriority(kTrackPriority);   // (as created in AUD_Initialize: its disc reads as the I/O thread's)
+    while (true)
+    {
+        LWP_SemWait(sTrackSem);
+        while (true)
+        {
+            AramTrack* next = nullptr;
+            LWP_MutexLock(sTrackMutex);
+            for (AramTrack& t : sAramTracks)
+            {
+                if (t.state == TRACK_PENDING && (next == nullptr || t.size < next->size))
+                    next = &t;
+            }
+            if (next != nullptr)
+                next->state = TRACK_DECODING;
+            LWP_MutexUnlock(sTrackMutex);
+            if (next == nullptr)
+                break;
+            TrackDecode(next);
+        }
+    }
+    return nullptr;
+}
+
+// The tracks registered so far made now, while the game loads: the main thread sleeps till none is waiting or being
+// made (or timeoutMs), so the track thread -- below everything -- has the CPU, without its rests. Loading takes that
+// much longer (a few seconds for a few MB of Vorbis); a track then never streams in play. Nothing without
+// AudioDecodeThread=1.
+void AUD_WaitForTracks(uint32_t timeoutMs)
+{
+    if (sTrackSem == LWP_SEM_NULL)
+        return;
+    const uint64_t fromUs = SYS_GetTimeMicroseconds();
+    sTrackRush = true;
+    LWP_SemPost(sTrackSem);                 // (should it be waiting for work)
+    while (true)
+    {
+        bool busy = false;
+        LWP_MutexLock(sTrackMutex);
+        for (const AramTrack& t : sAramTracks)
+            busy = busy || t.state == TRACK_PENDING || t.state == TRACK_DECODING;
+        LWP_MutexUnlock(sTrackMutex);
+        if (!busy || SYS_GetTimeMicroseconds() - fromUs > uint64_t(timeoutMs) * 1000u)
+            break;
+        usleep(2000);
+    }
+    sTrackRush = false;
+    LogWarning("AUDIO tracks made while loading: %u ms", (unsigned)((SYS_GetTimeMicroseconds() - fromUs) / 1000));
+}
+
+// The sound's whole copy in ARAM, or nullptr (not made yet, no room, or not a track). The main thread's: a READY track
+// only changes on it (AUD_ReleaseTrack).
+static const AramTrack* TrackReady(SoundWave* wave)
+{
+    if (sTrackSem == LWP_SEM_NULL)
+        return nullptr;
+    for (const AramTrack& t : sAramTracks)
+    {
+        if (t.state == TRACK_READY && t.wave == wave)
+            return &t;
+    }
+    return nullptr;
+}
+
+// A sound going (SoundWave::Destroy, on the main thread): its copy's ARAM freed, any voice playing from it stopped
+// first. One the track thread is decoding is freed there, as it stops. True if a voice could have played from it.
+bool AUD_ReleaseTrack(SoundWave* soundWave)
+{
+    if (sTrackSem == LWP_SEM_NULL)
+        return false;
+    bool hadCopy = false;
+    LWP_MutexLock(sTrackMutex);
+    for (AramTrack& t : sAramTracks)
+    {
+        if (t.state == TRACK_FREE || t.wave != soundWave)
+            continue;
+        if (t.state == TRACK_DECODING)
+        {
+            t.wave = nullptr;
+            t.released = true;
+            continue;
+        }
+        if (t.state == TRACK_READY)
+        {
+            hadCopy = true;
+            for (uint32_t v = 0; v < AUDIO_MAX_VOICES; ++v)
+            {
+                if (sAramVoices[v].active && sAramVoices[v].aram == t.aram)
+                {
+                    AramVoiceStop(v);         // (no more of it read, from here or the audio interrupt)
+                    ASND_StopVoice(v);
+                }
+            }
+        }
+        if (t.aram != 0) { AUD_FreeAram(t.aram); t.aram = 0; }
+        t.wave = nullptr;
+        t.state = TRACK_FREE;
+    }
+    LWP_MutexUnlock(sTrackMutex);
+    return hadCopy;
 }
 
 #endif // PLATFORM_GAMECUBE
@@ -1368,6 +1796,24 @@ void AUD_Initialize()
         sAudioDecodeSem = LWP_SEM_NULL;   // no thread: streams decoded on the main thread, a slice a frame, as before
         sAudioDecodeThread = LWP_THREAD_NULL;
     }
+
+#if PLATFORM_GAMECUBE
+    // The track thread (AudioTrackThread): streamed tracks copied to ARAM, with the decode thread (AudioDecodeThread=1).
+    // 128 KB, as the I/O thread: it opens and decodes, and reads the disc (libfat). Without it, tracks only stream.
+    if (GetEngineConfig()->mAudioDecodeThread && sAramReady && LWP_MutexInit(&sTrackMutex, false) == 0)
+    {
+        if (LWP_SemInit(&sTrackSem, 0, 64) != 0)
+        {
+            sTrackSem = LWP_SEM_NULL;
+        }
+        else if (LWP_CreateThread(&sAudioTrackThread, AudioTrackThread, nullptr, nullptr, 128 * 1024, kTrackPriority) != 0)
+        {
+            LWP_SemDestroy(sTrackSem);
+            sTrackSem = LWP_SEM_NULL;
+            sAudioTrackThread = LWP_THREAD_NULL;
+        }
+    }
+#endif
 }
 
 void AUD_Shutdown()
@@ -1614,6 +2060,20 @@ void AUD_Play(
     // than playing a fully-decoded PCM buffer.
     const bool fromDisc = soundWave->GetStream() && soundWave->GetDiscSize() > 0;
 
+#if PLATFORM_GAMECUBE
+    // A disc stream's whole copy in ARAM (AramTrack): played from there, as a sound effect is -- nothing decoded as it
+    // plays. Till it's ready, streamed below.
+    const AramTrack* track = fromDisc ? TrackReady(soundWave) : nullptr;
+    if (track != nullptr)
+    {
+        StreamStop(VoiceStream(voiceIndex));   // (any stream on this voice before)
+        LogWarning("AUDIO start %s (from ARAM)", soundWave->GetName().c_str());
+        AramVoiceStartAt(voiceIndex, track->aram, track->pcmBytes, voiceFormat, pitchHz,
+                         spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop);
+        return;
+    }
+#endif
+
     if (fromDisc || (soundWave->GetStream() && soundWave->GetCompressedData() != nullptr))
     {
         StreamStop(VoiceStream(voiceIndex));   // clean any previous stream on this voice (the I/O thread's to free, if busy)
@@ -1626,6 +2086,7 @@ void AUD_Play(
         sv->active = true;  // so a failure below can StreamStop() what it allocated
         sv->buf[0] = sv->buf[1] = sv->buf[2] = nullptr;
         sv->memOwned = nullptr;
+        sv->raw = fromDisc && soundWave->GetDiscPcm();   // (never parked, so never a restart)
 
         if (fromDisc)
         {
@@ -1635,6 +2096,11 @@ void AUD_Play(
             sv->disc.path = soundWave->GetDiscPath();
             sv->disc.base = soundWave->GetDiscOffset();
             sv->disc.size = soundWave->GetDiscSize();
+            if (sv->raw)
+            {
+                const uint32_t frame = soundWave->GetNumChannels() * (bit16 ? 2 : 1);
+                sv->disc.size -= sv->disc.size % glm::max<uint32_t>(frame, 1);   // (whole sample frames)
+            }
             if (!restart)
                 sv->disc.pos = 0;   // (a restart's is where its decoder left it: vorbisfile seeks from what it knows)
             sv->disc.windowAt = 0;
@@ -1648,7 +2114,7 @@ void AUD_Play(
             // here only without one.
             ov_callbacks dcb = { DiscRead, DiscSeek, MemClose, DiscTell };
             if (sv->disc.window == nullptr ||
-                (sAudioIoSem == LWP_SEM_NULL && ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) < 0))
+                (sAudioIoSem == LWP_SEM_NULL && !sv->raw && ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) < 0))
             {
                 LogError("SoundWave '%s': failed to open Vorbis stream on disc.", soundWave->GetName().c_str());
                 WaitReadAhead(&sv->disc);
@@ -1659,7 +2125,7 @@ void AUD_Play(
                 return;
             }
             if (!restart)
-                sv->vfOpen = (sAudioIoSem == LWP_SEM_NULL);
+                sv->vfOpen = (sAudioIoSem == LWP_SEM_NULL && !sv->raw);
         }
         else
         {
@@ -1730,7 +2196,7 @@ void AUD_Play(
             return;
         }
 
-        if (fromDisc && (restart || !sv->vfOpen))
+        if (fromDisc && sAudioIoSem != LWP_SEM_NULL && (restart || !sv->vfOpen))
         {
             // The I/O thread opens it (or, kept open, seeks it to its start) and decodes the first buffer;
             // AUD_Update sets the voice then.
@@ -1885,6 +2351,7 @@ void AUD_ProcessWaveBuffer(SoundWave* soundWave)
 {
 #if PLATFORM_GAMECUBE
     AramStoreWave(soundWave);     // a sound effect's PCM moves to ARAM
+    TrackRegister(soundWave);     // a disc stream's copy made in ARAM, in the background (AramTrack)
 #else
     (void)soundWave;
 #endif

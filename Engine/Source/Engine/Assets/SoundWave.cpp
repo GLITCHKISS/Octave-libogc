@@ -7,6 +7,7 @@
 
 #include "Audio/Audio.h"
 #include "System/System.h"
+#include "Engine.h"
 
 FORCE_LINK_DEF(SoundWave);
 DEFINE_ASSET(SoundWave);
@@ -52,10 +53,12 @@ SoundWave::~SoundWave()
 int32_t SoundWave::GetFileReadLimit(const char* path)
 {
 #if PLATFORM_DOLPHIN && !EDITOR
-    // A Stream sound leaves its compressed audio ON THE DISC and reads it as it plays (see
-    // Audio_Dolphin). So only the front of the file is loaded: everything up to the audio.
-    // Peek at it to find out whether this is one, and where its audio starts.
+    // A Stream sound leaves its audio ON THE DISC and reads it as it plays (see Audio_Dolphin):
+    // its Vorbis, or -- cooked uncompressed -- its PCM. So only the front of the file is loaded:
+    // everything up to the audio. Peek at it to find out whether this is one, and where its audio
+    // starts.
     mDiscSize = 0;
+    mDiscPcm = false;
 
     Stream head;
     if (!head.ReadFile(path, true, 1024))
@@ -94,14 +97,17 @@ int32_t SoundWave::GetFileReadLimit(const char* path)
     }
     bool compressed = head.ReadBool();
 
-    if (!streamed || !compressed)
+    // (PCM left on the disc only with AudioDecodeThread=1, as the rest of the ARAM tracks: without it, an uncompressed
+    //  Stream sound is loaded whole, as ever)
+    if (!streamed || (!compressed && !GetEngineConfig()->mAudioDecodeThread))
     {
         return 0;
     }
 
-    mDiscSize = head.ReadUint32();
+    mDiscSize = head.ReadUint32();      // (the Vorbis's size, or the PCM's: the same word either way)
     mDiscOffset = head.GetPos();
     mDiscPath = path;
+    mDiscPcm = !compressed;
     return int32_t(mDiscOffset);
 #else
     (void)path;
@@ -195,6 +201,16 @@ void SoundWave::LoadStream(Stream& stream, Platform platform)
     }
     else
     {
+#if PLATFORM_DOLPHIN && !EDITOR
+        if (mStream && mDiscSize > 0)
+        {
+            // Streamed from the disc as PCM (cooked uncompressed): GetFileReadLimit() stopped the
+            // load short of it, so nothing more is read here. Played from ARAM once copied there,
+            // streamed till then (Audio_Dolphin).
+            AUD_ProcessWaveBuffer(this);
+            return;
+        }
+#endif
         // Waveform
         mWaveDataSize = stream.ReadUint32();
         mWaveData = AUD_AllocWaveBuffer(mWaveDataSize);
@@ -418,6 +434,10 @@ void SoundWave::Destroy()
         AudioManager::StopSounds(this);
         AUD_FreeAram(mAramAddress);
         mAramAddress = 0;
+    }
+    if (mStream && mDiscSize > 0 && AUD_ReleaseTrack(this))
+    {
+        AudioManager::StopSounds(this);   // (its voices from its ARAM copy already stopped there: the sources too)
     }
 #endif
 

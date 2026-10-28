@@ -40,6 +40,12 @@ void AUD_ProcessWaveBuffer(SoundWave* soundWave);
 void AUD_FreeAram(uint32_t aramAddress);
 // ARAM: total and free bytes, and the bytes of sound held there.
 void AUD_GetAramStats(uint32_t& total, uint32_t& free, uint32_t& sounds);
+// A disc-streamed sound's copy in ARAM (made in the background, AudioDecodeThread=1) freed as the sound goes, any voice
+// playing from it stopped. True if one could have been.
+bool AUD_ReleaseTrack(SoundWave* soundWave);
+// The disc-streamed sounds loaded so far copied to ARAM now (a loading screen's wait), not in the background in play:
+// returns once they're all made or skipped, or after timeoutMs. Nothing without AudioDecodeThread=1.
+void AUD_WaitForTracks(uint32_t timeoutMs);
 #endif
 
 // Streaming PCM voices: push audio that is produced at runtime (e.g. a video's
