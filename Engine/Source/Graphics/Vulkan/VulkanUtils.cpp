@@ -288,7 +288,7 @@ void CopyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
     EndCommandBuffer(commandBuffer);
 }
 
-void CopyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height)
+void CopyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height, uint32_t mipLevel)
 {
     VkCommandBuffer commandBuffer = BeginCommandBuffer();
 
@@ -298,7 +298,7 @@ void CopyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t 
     region.bufferImageHeight = 0;
 
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.mipLevel = mipLevel;
     region.imageSubresource.baseArrayLayer = 0;
     region.imageSubresource.layerCount = 1;
 
@@ -995,6 +995,9 @@ void WriteMaterialLiteUniformData(MaterialData& outData, MaterialLite* material)
     outData.mApplyFog = static_cast<uint32_t>(material->ShouldApplyFog());
     outData.mEmission = material->GetEmission();
     outData.mWrapLighting = material->GetWrapLighting();
+    outData.mAlphaKeepBelow = material->GetAlphaKeepBelow();
+    outData.mAlphaKeepAbove = material->GetAlphaKeepAbove();
+    outData.mMipBiasFollowsHeight = material->MipBiasFollowsHeight() ? 1.0f : 0.0f;
     outData.mUvMaps[0] = material->GetUvMap(0);
     outData.mUvMaps[1] = material->GetUvMap(1);
     outData.mUvMaps[2] = material->GetUvMap(2);
@@ -1042,6 +1045,16 @@ VkPipelineColorBlendAttachmentState GetBasicBlendState(BasicBlendState basicBlen
         blendState.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
         blendState.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
         blendState.colorBlendOp = VK_BLEND_OP_ADD;
+        blendState.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        blendState.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        blendState.alphaBlendOp = VK_BLEND_OP_ADD;
+        break;
+    case BasicBlendState::Subtractive:   // (what's behind less the colour, as GX_BM_SUBTRACT)
+        blendState.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        blendState.blendEnable = true;
+        blendState.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendState.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendState.colorBlendOp = VK_BLEND_OP_REVERSE_SUBTRACT;
         blendState.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
         blendState.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
         blendState.alphaBlendOp = VK_BLEND_OP_ADD;
@@ -1147,6 +1160,8 @@ void CreateTextureResource(Texture* texture, uint8_t* pixels)
     default: break;
     }
 
+    samplerDesc.mLodBias = texture->GetLodBias();
+
     resource->mImage = new Image(imageDesc, samplerDesc, "Texture (Asset)");
 
     if (pixels != nullptr)
@@ -1161,6 +1176,18 @@ void CreateTextureResource(Texture* texture, uint8_t* pixels)
     if (texture->IsMipmapped())
     {
         resource->mImage->GenerateMips();
+
+        // its own mip levels laid over the made ones (level 1 on, RGBA8, one after another)
+        const std::vector<uint8_t>& custom = texture->GetCustomMips();
+        size_t offset = 0;
+        for (uint32_t level = 1; level < texture->GetMipLevels(); ++level)
+        {
+            size_t size = size_t(glm::max(texture->GetWidth() >> level, 1u)) * glm::max(texture->GetHeight() >> level, 1u) * 4;
+            if (offset + size > custom.size())
+                break;
+            resource->mImage->UpdateLevel(level, custom.data() + offset);
+            offset += size;
+        }
     }
 }
 
@@ -1336,6 +1363,10 @@ void BindMaterialResource(Material* material)
         break;
     case BlendMode::Additive:
         ctx->SetBlendState(BasicBlendState::Additive, 0);
+        ctx->SetDepthWriteEnabled(false);
+        break;
+    case BlendMode::Subtractive:
+        ctx->SetBlendState(BasicBlendState::Subtractive, 0);
         ctx->SetDepthWriteEnabled(false);
         break;
     }

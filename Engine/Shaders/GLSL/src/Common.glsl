@@ -29,6 +29,9 @@
 // Not a colour stage: the slot's texture offsets the other slots' coordinates (indirect warp).
 // Matches TevMode::Warp; see MATERIAL_LITE_WARP_MIN_SLOT in Constants.h.
 #define TEV_MODE_WARP 8
+// A line where the colour so far equals the slot's texture alpha (its red compared): the slot's
+// texture colour added there. Matches TevMode::Contour (GX_TEV_COMP_R8_EQ on the GameCube).
+#define TEV_MODE_CONTOUR 9
 
 // A texture slot's UV map: 0 and 1 are the mesh's UV channels; UV_MAP_ENVIRONMENT takes the
 // coordinates from the view-space normal (sphere map / matcap). Matches Constants.h.
@@ -218,9 +221,9 @@ struct MaterialUniforms
     float mEmission;
 
     float mWrapLighting;
-    float mPad0;
-    float mPad1;
-    float mPad2;
+    float mAlphaKeepBelow;     // (kept: alpha at most this, or at least mAlphaKeepAbove)
+    float mAlphaKeepAbove;
+    float mMipBiasFollowsHeight;   // (1: the textures' mip bias up log2(height / 548))
 
     uvec4 mUvMaps; // MAX_TEXTURES
     uvec4 mTevModes; // MAX_TEXTURES
@@ -241,6 +244,10 @@ vec2 EnvironmentUv(vec3 worldNormal, mat4 viewToWorld)
     return vec2(n.x * 0.5 + 0.5, -n.y * 0.5 + 0.5);
 }
 
+// mip levels more to sample the material's textures at (Forward.frag sets it: the alpha band's mip bias, following the
+// picture's height)
+float gMipShift = 0.0;
+
 vec4 BlendTextureEnv(MaterialUniforms material, vec4 prevColor, uint texIdx, sampler2D texSampler, vec2 uv0, vec2 uv1, vec2 uvEnv, float vertexIntensity, uint tevMode, uint vertexColorMode)
 {
     vec4 outColor = prevColor;
@@ -249,7 +256,11 @@ vec4 BlendTextureEnv(MaterialUniforms material, vec4 prevColor, uint texIdx, sam
 
     if (tevMode < TEV_MODE_PASS)
     {
+#ifdef OCT_FRAGMENT_DERIVATIVES
+        vec4 texColor = texture(texSampler, uv, gMipShift);
+#else
         vec4 texColor = texture(texSampler, uv);
+#endif
 
         if (vertexColorMode == VERTEX_COLOR_TEXTURE_BLEND && texIdx <= 2)
             outColor = mix(texIdx == 0 ? texColor : prevColor, texColor, vertexIntensity);
@@ -267,6 +278,20 @@ vec4 BlendTextureEnv(MaterialUniforms material, vec4 prevColor, uint texIdx, sam
             outColor = prevColor - texColor;
         else
             outColor = texColor;
+    }
+    else if (tevMode == TEV_MODE_CONTOUR)
+    {
+        // The GameCube's test is exact on 8 bits; here it is a band as wide as the value changes
+        // over about a pixel, softened, so the line keeps one thickness whatever its slope.
+        vec4 texColor = texture(texSampler, uv);
+        float d = abs(prevColor.r - texColor.a);
+#ifdef OCT_FRAGMENT_DERIVATIVES
+        float w = max(fwidth(prevColor.r), 0.5 / 255.0);
+#else
+        float w = 1.0 / 255.0;
+#endif
+        float line = 1.0 - smoothstep(0.5 * w, 1.5 * w, d);
+        outColor = vec4(prevColor.rgb + texColor.rgb * line, prevColor.a);
     }
 
     return outColor;

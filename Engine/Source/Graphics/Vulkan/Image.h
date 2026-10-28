@@ -27,6 +27,7 @@ struct SamplerDesc
     VkBorderColor mBorderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
     float mMaxAnisotropy = 1.0;
     bool mAnisotropyEnable = false;
+    float mLodBias = 0.0f;
 };
 
 class Image
@@ -46,6 +47,7 @@ public:
     uint32_t GetHeight() const;
 
     void Update(const void* srcData);
+    void UpdateLevel(uint32_t level, const void* srcData);   // (one mip level's pixels)
 
     void Transition(VkImageLayout layout, VkCommandBuffer commandBuffer = VK_NULL_HANDLE);
     void GenerateMips();
@@ -77,6 +79,7 @@ private:
     VkBorderColor mBorderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
     float mMaxAnisotropy = 1.0;
     bool mAnisotropyEnable = false;
+    float mLodBias = 0.0f;
 
     VkImageLayout mLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
 

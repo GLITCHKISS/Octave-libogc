@@ -808,6 +808,15 @@ void Texture::LoadStream(Stream& stream, Platform platform)
         mLowQualityDownsampleFactor = stream.ReadUint8();
     }
 
+    if (mVersion >= ASSET_VERSION_ALPHA_BAND_CUSTOM_MIPS)
+    {
+        mLodBias = stream.ReadFloat();
+        uint32_t customMipSize = stream.ReadUint32();
+        mCustomMips.resize(customMipSize);
+        if (customMipSize > 0)
+            stream.ReadBytes(mCustomMips.data(), customMipSize);
+    }
+
     if (UseCookedTextures(platform))
     {
         if (mVersion >= ASSET_VERSION_TEXTURE_COOKED_PROPERTIES)
@@ -856,6 +865,11 @@ void Texture::SaveStream(Stream& stream, Platform platform)
 
     stream.WriteBool(mForceHighQuality);
     stream.WriteUint8(mLowQualityDownsampleFactor);
+
+    stream.WriteFloat(mLodBias);
+    stream.WriteUint32(uint32_t(mCustomMips.size()));
+    if (mCustomMips.size() > 0)
+        stream.WriteBytes(mCustomMips.data(), uint32_t(mCustomMips.size()));
 
     if (UseCookedTextures(platform))
     {

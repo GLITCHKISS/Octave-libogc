@@ -115,6 +115,17 @@ protected:
     bool mSrgb;
     bool mForceHighQuality;
     uint8_t mLowQualityDownsampleFactor;
+
+    // Sampled this many levels smaller (a mip bias, as GX_InitTexObjLOD's), and mip levels of its own (RGBA8, level 1
+    // on, one after another) laid over the made ones: hand-drawn mips, as GameCube games' water has
+    float mLodBias = 0.0f;
+    std::vector<uint8_t> mCustomMips;
+
+public:
+    float GetLodBias() const { return mLodBias; }
+    const std::vector<uint8_t>& GetCustomMips() const { return mCustomMips; }
+
+protected:
     bool mDynamic = false;
     bool mYuv = false;
 

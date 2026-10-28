@@ -22,6 +22,7 @@ enum class BasicBlendState
     Opaque,
     Translucent,
     Additive,
+    Subtractive,
 
     Count
 };
@@ -277,9 +278,9 @@ struct MaterialData
     float mEmission;
 
     float mWrapLighting;
-    float mPad0;
-    float mPad1;
-    float mPad2;
+    float mAlphaKeepBelow;
+    float mAlphaKeepAbove;
+    float mMipBiasFollowsHeight;
 
     uint32_t mUvMaps[MATERIAL_LITE_MAX_TEXTURES];
     uint32_t mTevModes[MATERIAL_LITE_MAX_TEXTURES];

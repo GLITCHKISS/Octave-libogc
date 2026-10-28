@@ -1,6 +1,7 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
 
+#define OCT_FRAGMENT_DERIVATIVES 1     // (Common.glsl's Contour: a line a pixel wide)
 #include "Common.glsl"
 #include "Fog.glsl"
 
@@ -107,6 +108,7 @@ void main()
 
     vec4 vertColor = (kVertexColorMode == VERTEX_COLOR_NONE) ? vec4(1,1,1,1) : inColor;
     vec4 diffuse = vec4(1,1,1,1);
+    gMipShift = (material.mMipBiasFollowsHeight > 0.5) ? log2(max(global.mSceneViewport.w, 1.0) / 548.0) : 0.0;
 
     if (kNumTextures >= 1)
         diffuse = BlendTextureEnv(material, diffuse, 0, sampler0, texCoord0, texCoord1, texCoordEnv, vertColor.r, kTev0, kVertexColorMode);
@@ -123,6 +125,12 @@ void main()
     diffuse *= material.mColor;
 
     if (kBlendMode == BLEND_MODE_MASKED && diffuse.a < material.mMaskCutoff)
+    {
+        discard;
+    }
+
+    // the alpha band: kept only at most mAlphaKeepBelow or at least mAlphaKeepAbove (the GameCube's alpha compare)
+    if (diffuse.a > material.mAlphaKeepBelow && diffuse.a < material.mAlphaKeepAbove)
     {
         discard;
     }

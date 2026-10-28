@@ -88,6 +88,7 @@ enum class BlendMode : uint32_t
     Masked,
     Translucent,
     Additive,
+    Subtractive,    // what's behind less the colour (GX_BM_SUBTRACT): a tint that only takes away
 
     Count
 };
@@ -117,6 +118,13 @@ enum class TevMode : uint32_t
     // MATERIAL_LITE_WARP_* in Constants.h. Appended so that values 0..7 in .oct files keep
     // their meaning.
     Warp,
+
+    // A line where the colour so far equals a value: where the previous stage's red is the
+    // slot's texture alpha, the slot's texture colour is added (GX_TEV_COMP_R8_EQ: exact on the
+    // GameCube; on the PC a band about a pixel wide, so the line is the same thickness at any
+    // slope). Alpha passes through. Two smooth textures scrolled apart and added before it give
+    // drifting contour lines: closed, rounded cells that change shape as they move.
+    Contour,
 
     Count
 };

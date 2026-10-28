@@ -901,6 +901,7 @@ void Renderer::GatherDrawData(World* world)
                             break;
                         case BlendMode::Translucent:
                         case BlendMode::Additive:
+                        case BlendMode::Subtractive:
                             mTranslucentDraws.push_back(data);
                             break;
                         default:

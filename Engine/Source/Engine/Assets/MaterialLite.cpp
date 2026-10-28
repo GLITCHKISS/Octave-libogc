@@ -49,9 +49,10 @@ static const char* sTevModeStrings[] =
     "Subtract",
     "Interpolate",
     "Pass",
-    "Warp"
+    "Warp",
+    "Contour"
 };
-static_assert(int32_t(TevMode::Count) == 9, "Need to update string conversion table");
+static_assert(int32_t(TevMode::Count) == 10, "Need to update string conversion table");
 
 FORCE_LINK_DEF(MaterialLite);
 DEFINE_ASSET(MaterialLite);
@@ -182,6 +183,13 @@ void MaterialLite::LoadStream(Stream& stream, Platform platform)
     mLiteParams.mFresnelEnabled = stream.ReadBool();
     mLiteParams.mApplyFog = stream.ReadBool();
     mLiteParams.mCullMode = (CullMode)stream.ReadUint8();
+
+    if (mVersion >= ASSET_VERSION_ALPHA_BAND_CUSTOM_MIPS)
+    {
+        mLiteParams.mAlphaKeepBelow = stream.ReadFloat();
+        mLiteParams.mAlphaKeepAbove = stream.ReadFloat();
+        mLiteParams.mMipBiasFollowsHeight = stream.ReadBool();
+    }
 }
 
 void MaterialLite::SaveStream(Stream& stream, Platform platform)
@@ -222,6 +230,9 @@ void MaterialLite::SaveStream(Stream& stream, Platform platform)
     stream.WriteBool(mLiteParams.mFresnelEnabled);
     stream.WriteBool(mLiteParams.mApplyFog);
     stream.WriteUint8((uint8_t)mLiteParams.mCullMode);
+    stream.WriteFloat(mLiteParams.mAlphaKeepBelow);
+    stream.WriteFloat(mLiteParams.mAlphaKeepAbove);
+    stream.WriteBool(mLiteParams.mMipBiasFollowsHeight);
 }
 
 void MaterialLite::Create()
@@ -289,6 +300,9 @@ void MaterialLite::GatherProperties(std::vector<Property>& outProps)
     outProps.push_back(Property(DatumType::Color, "Color", this, &mLiteParams.mColor, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Float, "Opacity", this, &mLiteParams.mOpacity, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Float, "Mask Cutoff", this, &mLiteParams.mMaskCutoff, 1, HandlePropChange));
+    outProps.push_back(Property(DatumType::Float, "Alpha Keep Below", this, &mLiteParams.mAlphaKeepBelow, 1, HandlePropChange));
+    outProps.push_back(Property(DatumType::Float, "Alpha Keep Above", this, &mLiteParams.mAlphaKeepAbove, 1, HandlePropChange));
+    outProps.push_back(Property(DatumType::Bool, "Mip Bias Follows Height", this, &mLiteParams.mMipBiasFollowsHeight, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Integer, "Sort Priority", this, &mLiteParams.mSortPriority, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Bool, "Disable Depth Test", this, &mLiteParams.mDisableDepthTest, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Bool, "Fresnel", this, &mLiteParams.mFresnelEnabled, 1, HandlePropChange));

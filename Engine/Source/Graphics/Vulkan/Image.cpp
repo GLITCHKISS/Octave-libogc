@@ -42,6 +42,7 @@ Image::Image(ImageDesc imageDesc, SamplerDesc samplerDesc, const char* debugObje
     mBorderColor = samplerDesc.mBorderColor;
     mMaxAnisotropy = samplerDesc.mMaxAnisotropy;
     mAnisotropyEnable = samplerDesc.mAnisotropyEnable;
+    mLodBias = samplerDesc.mLodBias;
 
     VkDevice device = GetVulkanDevice();
 
@@ -111,7 +112,7 @@ Image::Image(ImageDesc imageDesc, SamplerDesc samplerDesc, const char* debugObje
     ciSampler.addressModeU = mAddressMode;
     ciSampler.addressModeV = mAddressMode;
     ciSampler.addressModeW = mAddressMode;
-    ciSampler.mipLodBias = 0.0f;
+    ciSampler.mipLodBias = mLodBias;
     ciSampler.compareEnable = VK_FALSE;
     ciSampler.compareOp = VK_COMPARE_OP_NEVER;
     ciSampler.minLod = 0.0f;
@@ -233,6 +234,22 @@ void Image::Update(const void* srcData)
 
         GetDestroyQueue()->Destroy(stagingBuffer);
     }
+}
+
+void Image::UpdateLevel(uint32_t level, const void* srcData)
+{
+    OCT_ASSERT(srcData != nullptr && level < mMipLevels);
+    uint32_t w = glm::max(mWidth >> level, 1u);
+    uint32_t h = glm::max(mHeight >> level, 1u);
+    uint32_t size = GetFormatPixelSize(mFormat) * w * h;
+    Buffer* stagingBuffer = new Buffer(BufferType::Transfer, size, "Staging Buffer", srcData);
+
+    VkImageLayout savedLayout = mLayout;
+    Transition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    CopyBufferToImage(stagingBuffer->Get(), mImage, w, h, level);
+    Transition(savedLayout != VK_IMAGE_LAYOUT_PREINITIALIZED ? savedLayout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    GetDestroyQueue()->Destroy(stagingBuffer);
 }
 
 void Image::Transition(VkImageLayout layout, VkCommandBuffer commandBuffer)

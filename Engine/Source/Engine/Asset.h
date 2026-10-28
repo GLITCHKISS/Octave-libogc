@@ -35,7 +35,8 @@ class AssetDir;
 #define ASSET_VERSION_SOUND_STREAM 14
 #define ASSET_VERSION_SOUND_MAX_INSTANCES 15
 #define ASSET_VERSION_SKELETAL_MORPHS 16
-#define ASSET_VERSION_CURRENT 16
+#define ASSET_VERSION_ALPHA_BAND_CUSTOM_MIPS 17   // (MaterialLite's alpha band; Texture's mip bias, its own mips)
+#define ASSET_VERSION_CURRENT 17
 // ----------------------------------------------------
 
 #define DECLARE_ASSET(Base, Parent) DECLARE_FACTORY(Base, Asset); DECLARE_OBJECT(Base, Parent);

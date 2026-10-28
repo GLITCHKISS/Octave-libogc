@@ -247,11 +247,12 @@ Pipeline* MaterialPipelineCache::GetPipeline(Material* material, VertexType vert
 
     MaterialLite* matLite = (MaterialLite*)material;
 
-    // A tev mode takes 3 bits of the id, so TevMode::Warp (8) does not fit, and ForwardSpec.frag
-    // does not warp. Warp materials draw with the general Forward pipeline.
+    // A tev mode takes 3 bits of the id, so TevMode::Warp (8) and TevMode::Contour (9) do not
+    // fit, and ForwardSpec.frag does not warp. Those materials draw with the general Forward
+    // pipeline.
     for (uint32_t i = 0; i < MATERIAL_LITE_MAX_TEXTURES; ++i)
     {
-        if (matLite->GetTevMode(i) == TevMode::Warp)
+        if (matLite->GetTevMode(i) == TevMode::Warp || matLite->GetTevMode(i) == TevMode::Contour)
             return nullptr;
     }
 

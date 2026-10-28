@@ -31,6 +31,9 @@ void BindBlendMode()
     lua_pushinteger(L, (int)BlendMode::Additive);
     lua_setfield(L, tableIdx, "Additive");
 
+    lua_pushinteger(L, (int)BlendMode::Subtractive);
+    lua_setfield(L, tableIdx, "Subtractive");
+
     lua_pushinteger(L, (int)BlendMode::Count);
     lua_setfield(L, tableIdx, "Count");
 
@@ -98,6 +101,9 @@ void BindTevMode()
 
     lua_pushinteger(L, (int)TevMode::Warp);
     lua_setfield(L, tableIdx, "Warp");
+
+    lua_pushinteger(L, (int)TevMode::Contour);
+    lua_setfield(L, tableIdx, "Contour");
 
     lua_pushinteger(L, (int)TevMode::Count);
     lua_setfield(L, tableIdx, "Count");

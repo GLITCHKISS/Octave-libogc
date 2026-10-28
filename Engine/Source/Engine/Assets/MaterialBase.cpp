@@ -28,9 +28,10 @@ const char* gBlendModeStrings[] =
     "Opaque",
     "Masked",
     "Transparent",
-    "Additive"
+    "Additive",
+    "Subtractive"
 };
-static_assert(int32_t(BlendMode::Count) == 4, "Need to update string conversion table");
+static_assert(int32_t(BlendMode::Count) == 5, "Need to update string conversion table");
 
 const char* gCullModeStrings[] =
 {

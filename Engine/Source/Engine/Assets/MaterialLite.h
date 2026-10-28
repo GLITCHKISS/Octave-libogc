@@ -24,6 +24,14 @@ struct MaterialLiteParams
     uint32_t mToonSteps = 2;
     float mOpacity = 1.0f;
     float mMaskCutoff = 0.5f;
+    // Kept only where alpha is at most mAlphaKeepBelow or at least mAlphaKeepAbove, the rest discarded (the GameCube's
+    // alpha compare, GX_LEQUAL OR GX_GEQUAL): 1, 1 keeps all of it. The band between drops out, so what's kept has
+    // a crisp edge.
+    float mAlphaKeepBelow = 1.0f;
+    float mAlphaKeepAbove = 1.0f;
+    // Its textures sampled log2(picture height / 548) mip levels smaller on top of their own bias: hand-drawn mip
+    // levels made for the GameCube's 640 x 548 picture land where they were meant to, whatever the window.
+    bool mMipBiasFollowsHeight = false;
     float mShininess = 32.0f;
     int32_t mSortPriority = 0;
     uint32_t mNumTextures = 1;
@@ -103,6 +111,10 @@ public:
 
     virtual float GetMaskCutoff() const override;
     void SetMaskCutoff(float cutoff);
+    float GetAlphaKeepBelow() const { return mLiteParams.mAlphaKeepBelow; }
+    float GetAlphaKeepAbove() const { return mLiteParams.mAlphaKeepAbove; }
+    bool HasAlphaBand() const { return mLiteParams.mAlphaKeepBelow < 1.0f; }
+    bool MipBiasFollowsHeight() const { return mLiteParams.mMipBiasFollowsHeight; }
 
     float GetShininess() const;
     void SetShininess(float shininess);

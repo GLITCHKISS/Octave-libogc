@@ -260,9 +260,10 @@ void BindMaterial(MaterialLite* material, Primitive3D* primitive, bool useVertex
             if (i == 0 && texture == nullptr)
                 texture = Renderer::Get()->mWhiteTexture.Get<Texture>();
 
-            // Warp (indirect) slots are not done on the 3DS: the slot is skipped like Pass.
+            // Warp (indirect) and Contour slots are not done on the 3DS: the slot is skipped like Pass.
             if (tevMode != TevMode::Pass &&
                 tevMode != TevMode::Warp &&
+                tevMode != TevMode::Contour &&
                 tevMode != TevMode::Count &&
                 texture != nullptr)
             {
@@ -382,7 +383,7 @@ void BindMaterial(MaterialLite* material, Primitive3D* primitive, bool useVertex
             //C3D_EarlyDepthTest(true, GPU_EARLYDEPTH_GREATER, 0);
             C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_ZERO, GPU_ZERO);
         }
-        else if (blendMode == BlendMode::Additive)
+        else if (blendMode == BlendMode::Additive || blendMode == BlendMode::Subtractive)   // (no subtract here: added)
         {
             C3D_AlphaTest(false, GPU_ALWAYS, 0);
             C3D_DepthTest(depthEnabled, GPU_GREATER, GPU_WRITE_COLOR);

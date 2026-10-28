@@ -585,6 +585,22 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
         GX_SetZCompLoc(GX_TRUE);
         GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_ONE, GX_LO_CLEAR);
     }
+    else if (blendMode == BlendMode::Subtractive)
+    {
+        GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
+        GX_SetZMode(depthEnabled, GX_LEQUAL, GX_FALSE);
+        GX_SetZCompLoc(GX_TRUE);
+        GX_SetBlendMode(GX_BM_SUBTRACT, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
+    }
+
+    // the alpha band: kept only at most the one value or at least the other (GX_LEQUAL OR GX_GEQUAL)
+    if (material->IsLite() && ((MaterialLite*)material)->HasAlphaBand())
+    {
+        MaterialLite* lite = (MaterialLite*)material;
+        GX_SetAlphaCompare(GX_LEQUAL, uint8_t(glm::clamp(lite->GetAlphaKeepBelow(), 0.0f, 1.0f) * 255.0f), GX_AOP_OR,
+                           GX_GEQUAL, uint8_t(glm::clamp(lite->GetAlphaKeepAbove(), 0.0f, 1.0f) * 255.0f));
+        GX_SetZCompLoc(GX_FALSE);
+    }
 
     bool matApplyFog = material->ShouldApplyFog();
     if (gGxContext.mFogType != GX_FOG_NONE && 
@@ -1019,6 +1035,14 @@ uint8_t ConfigTev(uint8_t tevStage, uint32_t textureSlot, TevMode mode, bool ver
                 GX_SetTevColorOp(tevStage, GX_TEV_SUB, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
                 GX_SetTevAlphaIn(tevStage, GX_CA_TEXA, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
                 GX_SetTevAlphaOp(tevStage, GX_TEV_SUB, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+            break;
+
+            case TevMode::Contour:
+                // prev + (prev.r == tex.a ? tex.rgb : 0); alpha passes through
+                GX_SetTevColorIn(tevStage, GX_CC_CPREV, GX_CC_TEXA, GX_CC_TEXC, GX_CC_CPREV);
+                GX_SetTevColorOp(tevStage, GX_TEV_COMP_R8_EQ, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+                GX_SetTevAlphaIn(tevStage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+                GX_SetTevAlphaOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
             break;
 
             case TevMode::Replace:
