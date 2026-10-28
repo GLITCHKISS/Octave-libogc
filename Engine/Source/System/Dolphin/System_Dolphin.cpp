@@ -1269,6 +1269,7 @@ namespace
 // instead, and freeze the game (it froze DolphinWorks' Gecko test). A full queue drops lines too, and the
 // next line that gets through says how many.
 void OctGeckoLog(const char* line);
+extern "C" void OctSqrtSelfTest(double* worstD, double* worstF);   // (FastSqrt_Dolphin.c)
 
 namespace
 {
@@ -1405,6 +1406,12 @@ bool OctGeckoLogEnable()
     char ids[96];
     snprintf(ids, sizeof(ids), "Octave: EXI IDs at boot: slot A %08x, slot B %08x", (unsigned)idA, (unsigned)idB);
     OctGeckoLog(ids);
+    {   // (the engine's own square root, FastSqrt_Dolphin.c, against newlib's exact one)
+        double wd = 0.0, wf = 0.0;
+        OctSqrtSelfTest(&wd, &wf);
+        snprintf(ids, sizeof(ids), "Octave: sqrt worst error %.2e (double), %.2e (float)", wd, wf);
+        OctGeckoLog(ids);
+    }
     return true;
 }
 

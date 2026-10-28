@@ -239,6 +239,9 @@ protected:
     std::vector<glm::mat4> mBoneMatrices;
     std::vector<Vertex> mSkinnedVertices; // Used by CPU skinning only.
     std::vector<Vertex> mSkinnedVerticesBack; // (GX: the other of the two, in turn -- CpuSkinVertices)
+    // (GX: the parent whose CPU-skinned vertices this one draws instead of its own, this frame -- an inherited pose
+    //  of the same mesh, no morphs: the same vertices exactly. UpdateAnimation sets it, GetSkinnedVertices reads it)
+    SkeletalMesh3D* mSkinShare = nullptr;
 
     ScriptableFP<AnimEventHandlerFP> mAnimEventHandler;
     std::string mDefaultAnimation;

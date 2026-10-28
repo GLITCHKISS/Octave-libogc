@@ -12,6 +12,18 @@
 #include "Graphics/GX/GxUtils.h"
 #endif
 
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+#include <ogc/lwp_watchdog.h>
+// The pose's parts, for the console perf log's SKIN line (Renderer.cpp reads and clears them): the keys and the
+// layers' blend, the bone matrices, the hierarchy (FinalizeBoneTransforms), the dynamic bones, and UpdateAnimation
+// whole -- what "anim" holds beyond it is the rest of the skeletal mesh's cull and update
+uint64_t gOctPoseKeysTicks = 0, gOctPoseMatsTicks = 0, gOctPoseFinalTicks = 0, gOctPoseDynTicks = 0, gOctPoseAllTicks = 0;
+uint64_t gOctDynStepTicks = 0, gOctDynIterTicks = 0, gOctDynPoseTicks = 0;   // (the dynamic bones' own parts)
+#define OCT_POSE_MARK(var) const uint64_t var = gettime()
+#else
+#define OCT_POSE_MARK(var)
+#endif
+
 static const char* sBoneInfluenceModeStrings[] =
 {
     "One Bone",
@@ -732,6 +744,34 @@ static void ClosestOnSegments(const glm::vec3& p1, const glm::vec3& q1, const gl
     }
 }
 
+// 1/sqrt(x), x > 0: on the GameCube the hardware's estimate (frsqrte) refined twice by Newton's method -- to about a
+// millionth, far finer than a normal's 8 bits on the console -- with no software square root and no divide
+static inline float OctRsqrt(float x)
+{
+#if PLATFORM_DOLPHIN
+    double y;
+    __asm__("frsqrte %0,%1" : "=f"(y) : "f"((double)x));
+    const double h = 0.5 * x;
+    y = y * (1.5 - h * y * y);
+    y = y * (1.5 - h * y * y);
+    y = y * (1.5 - h * y * y);
+    return (float)y;
+#else
+    return 1.0f / sqrtf(x);
+#endif
+}
+
+// whether the segment p-q can come within reach of a capsule's line, its box lo-hi: the segment's box grown by reach
+// not meeting the line's and it can't -- PushSegmentOut would find nothing, so it's skipped. Only comparisons: the
+// GameCube has no square root instruction (newlib's sqrtf is software), and every chain segment against every collider,
+// four passes a frame, was 2.6 ms of Mario's dynamic bones, almost all of them far apart
+static inline bool NearCapsule(const glm::vec3& p, const glm::vec3& q, const glm::vec3& lo, const glm::vec3& hi, float reach)
+{
+    return glm::min(p.x, q.x) - reach <= hi.x && glm::max(p.x, q.x) + reach >= lo.x &&
+           glm::min(p.y, q.y) - reach <= hi.y && glm::max(p.y, q.y) + reach >= lo.y &&
+           glm::min(p.z, q.z) - reach <= hi.z && glm::max(p.z, q.z) + reach >= lo.z;
+}
+
 // pushes the segment p-q off a capsule (reach from its line a-b), its ends moved by how near the contact is to each;
 // p pinned (not moving), only q moves, scaled up by how far along the contact is. Returns whether it touched
 static bool PushSegmentOut(glm::vec3& p, glm::vec3& q, const glm::vec3& a, const glm::vec3& b, float reach, bool pMoves)
@@ -771,18 +811,23 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
     const float scale = glm::length(glm::vec3(mTransform[0]));
 
     // the colliders where the animation has them this frame, world space
-    static std::vector<glm::vec3> sColA, sColB;
+    static std::vector<glm::vec3> sColA, sColB, sColLo, sColHi;
     sColA.resize(mBoneColliders.size());
     sColB.resize(mBoneColliders.size());
+    sColLo.resize(mBoneColliders.size());
+    sColHi.resize(mBoneColliders.size());
     for (uint32_t c = 0; c < mBoneColliders.size(); ++c)
     {
         const BoneCollider& col = mBoneColliders[c];
         glm::mat4 world = mTransform * mBoneMatrices[col.mBone] * bones[col.mBone].mInvOffsetMatrix;
         sColA[c] = glm::vec3(world * glm::vec4(col.mA, 1.0f));
         sColB[c] = glm::vec3(world * glm::vec4(col.mB, 1.0f));
+        sColLo[c] = glm::min(sColA[c], sColB[c]);                 // (the line's box, for NearCapsule)
+        sColHi[c] = glm::max(sColA[c], sColB[c]);
     }
 
     glm::mat4 invTransform = glm::inverse(mTransform);
+    OCT_POSE_MARK(tDynStep0);
 
     // each chain moved on by itself first -- all of them: the links across them want every chain stepped before
     // they're kept off the colliders together
@@ -853,6 +898,7 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
         }
     }
 
+    OCT_POSE_MARK(tDynIter0);
     if (dt > 0.0f)
     {
         // each pass: the lengths and the limit; the links across off the colliders; then each line off them -- the
@@ -900,11 +946,14 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                     float reach = (mBoneColliders[c].mRadius + 0.5f * (a.mRadius + b.mRadius)) * scale;
                     for (uint32_t i = 1; i < numPoints; ++i)
                     {
-                        PushSegmentOut(a.mPos[i], b.mPos[i], sColA[c], sColB[c], reach, true);
+                        if (NearCapsule(a.mPos[i], b.mPos[i], sColLo[c], sColHi[c], reach))
+                            PushSegmentOut(a.mPos[i], b.mPos[i], sColA[c], sColB[c], reach, true);
                         if (i + 1 < numPoints)
                         {
-                            PushSegmentOut(a.mPos[i], b.mPos[i + 1], sColA[c], sColB[c], reach, true);
-                            PushSegmentOut(b.mPos[i], a.mPos[i + 1], sColA[c], sColB[c], reach, true);
+                            if (NearCapsule(a.mPos[i], b.mPos[i + 1], sColLo[c], sColHi[c], reach))
+                                PushSegmentOut(a.mPos[i], b.mPos[i + 1], sColA[c], sColB[c], reach, true);
+                            if (NearCapsule(b.mPos[i], a.mPos[i + 1], sColLo[c], sColHi[c], reach))
+                                PushSegmentOut(b.mPos[i], a.mPos[i + 1], sColA[c], sColB[c], reach, true);
                         }
                     }
                 }
@@ -941,13 +990,15 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                                 continue;
                             }
                         }
-                        PushSegmentOut(chain.mPos[i - 1], chain.mPos[i], sColA[c], sColB[c], reach, i > 1);
+                        if (NearCapsule(chain.mPos[i - 1], chain.mPos[i], sColLo[c], sColHi[c], reach))
+                            PushSegmentOut(chain.mPos[i - 1], chain.mPos[i], sColA[c], sColB[c], reach, i > 1);
                     }
                 }
             }
         }
     }
 
+    OCT_POSE_MARK(tDynPose0);
     // each chain's bones posed from its particles
     for (BoneChain& chain : mBoneChains)
     {
@@ -986,6 +1037,12 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
             mBoneMatrices[b] = model[k] * bones[b].mOffsetMatrix;
         }
     }
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+    const uint64_t tDynEnd = gettime();
+    gOctDynStepTicks += tDynIter0 - tDynStep0;
+    gOctDynIterTicks += tDynPose0 - tDynIter0;
+    gOctDynPoseTicks += tDynEnd - tDynPose0;
+#endif
 }
 
 void SkeletalMesh3D::SetAnimEventHandler(AnimEventHandlerFP handler)
@@ -1025,6 +1082,23 @@ glm::vec3 SkeletalMesh3D::InterpolateScale(float time, const Channel& channel)
     return retScale;
 }
 
+// Normalized lerp of two rotations, the shorter way round: no trig, where glm::slerp takes an acos and three sines. Between
+// neighbouring keys (a few degrees apart at most) it's slerp to a fraction of a degree; blending animation layers, the
+// ends are exact and only the speed through the middle differs. On the GameCube, Mario's pose (65 bones, several layers,
+// two slerps a bone a layer) spent most of its 3.6 ms in sinf/acosf.
+static inline glm::quat NLerpQuat(const glm::quat& a, const glm::quat& b, float t)
+{
+    const float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    const float s = (d < 0.0f) ? -t : t;
+    const float u = 1.0f - t;
+    glm::quat r(u * a.w + s * b.w, u * a.x + s * b.x, u * a.y + s * b.y, u * a.z + s * b.z);
+    const float len2 = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+    if (len2 <= 1e-12f)
+        return a;
+    const float inv = 1.0f / sqrtf(len2);
+    return glm::quat(r.w * inv, r.x * inv, r.y * inv, r.z * inv);
+}
+
 glm::quat SkeletalMesh3D::InterpolateRotation(float time, const Channel& channel)
 {
     if (channel.mRotationKeys.size() == 1)
@@ -1043,9 +1117,7 @@ glm::quat SkeletalMesh3D::InterpolateRotation(float time, const Channel& channel
 
     glm::quat startQuat = channel.mRotationKeys[index].mValue;
     glm::quat endQuat = channel.mRotationKeys[nextIndex].mValue;
-    glm::quat retQuat = glm::slerp(startQuat, endQuat, factor);
-    retQuat = glm::normalize(retQuat);
-    return retQuat;
+    return NLerpQuat(startQuat, endQuat, factor);
 }
 
 glm::vec3 SkeletalMesh3D::InterpolatePosition(float time, const Channel& channel)
@@ -1344,11 +1416,16 @@ void SkeletalMesh3D::SetAnimationUpdateMode(AnimationUpdateMode mode)
 
 Vertex* SkeletalMesh3D::GetSkinnedVertices()
 {
+    // (sharing its parent's this frame: the parent's array as it is now -- the one of its two it skinned into last)
+    if (mSkinShare != nullptr && mSkinShare == mParent.Get())
+        return mSkinShare->mSkinnedVertices.data();
     return mSkinnedVertices.data();
 }
 
 uint32_t SkeletalMesh3D::GetNumSkinnedVertices()
 {
+    if (mSkinShare != nullptr && mSkinShare == mParent.Get())
+        return (uint32_t) mSkinShare->mSkinnedVertices.size();
     return (uint32_t) mSkinnedVertices.size();
 }
 
@@ -1394,6 +1471,10 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
 {
     if (mHasAnimatedThisFrame)
         return;
+    mSkinShare = nullptr;                                       // (set again below while it still holds)
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+    struct PoseAllTimer { uint64_t t0; ~PoseAllTimer() { gOctPoseAllTicks += gettime() - t0; } } poseAllTimer{ gettime() };
+#endif
 
     static std::vector<DecompTransform> sDecompTransforms;
     static std::vector<AnimEvent> sAnimEvents;
@@ -1449,6 +1530,7 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
         }
 
         bool bonesUpdated = false;
+        OCT_POSE_MARK(tKeys0);
 
         for (int32_t i = 0; i < (int32_t)mActiveAnimations.size(); ++i)
         {
@@ -1517,7 +1599,7 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
                                     if (bonesUpdated)
                                     {
                                         sDecompTransforms[boneIndex].mPosition = glm::mix(sDecompTransforms[boneIndex].mPosition, position, weight);
-                                        sDecompTransforms[boneIndex].mRotation = glm::slerp(sDecompTransforms[boneIndex].mRotation, rotation, weight);
+                                        sDecompTransforms[boneIndex].mRotation = NLerpQuat(sDecompTransforms[boneIndex].mRotation, rotation, weight);
                                         sDecompTransforms[boneIndex].mScale = glm::mix(sDecompTransforms[boneIndex].mScale, scale, weight);
                                     }
                                     else
@@ -1573,6 +1655,10 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
             }
         }
 
+        OCT_POSE_MARK(tKeys1);
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+        gOctPoseKeysTicks += tKeys1 - tKeys0;
+#endif
         if (updateBones)
         {
             // Unless no animations were computed, create bone matrices for all the bones
@@ -1593,19 +1679,27 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
                 {
                     if (sDecompTransforms[i].mValid)
                     {
-                        glm::mat4& transform = mBoneMatrices[i];
-
-                        transform = glm::mat4(1.0f);
-
-                        transform = glm::translate(transform, sDecompTransforms[i].mPosition);
-                        transform *= glm::toMat4(sDecompTransforms[i].mRotation);
-                        transform = glm::scale(transform, sDecompTransforms[i].mScale);
+                        // translate * rotate * scale, written out: the rotation's columns times the scale, the
+                        // position the last column (the same matrix, without three 4x4 multiplies a bone)
+                        const glm::mat3 r = glm::mat3_cast(sDecompTransforms[i].mRotation);
+                        const glm::vec3& s = sDecompTransforms[i].mScale;
+                        const glm::vec3& p = sDecompTransforms[i].mPosition;
+                        mBoneMatrices[i] = glm::mat4(glm::vec4(r[0] * s.x, 0.0f), glm::vec4(r[1] * s.y, 0.0f),
+                                                     glm::vec4(r[2] * s.z, 0.0f), glm::vec4(p, 1.0f));
                     }
                 }
             }
 
+            OCT_POSE_MARK(tMats1);
             mesh->FinalizeBoneTransforms(mBoneMatrices);
+            OCT_POSE_MARK(tFinal1);
             SimulateBoneDynamics(deltaTime);
+            OCT_POSE_MARK(tDyn1);
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+            gOctPoseMatsTicks += tMats1 - tKeys1;
+            gOctPoseFinalTicks += tFinal1 - tMats1;
+            gOctPoseDynTicks += tDyn1 - tFinal1;
+#endif
 
             if (GFX_IsCpuSkinningRequired(this))
             {
@@ -1647,6 +1741,27 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
         mesh != nullptr &&
         GFX_IsCpuSkinningRequired(this))
     {
+#if API_GX && !EDITOR
+        // An inherited pose of the parent's own mesh, the same influences, no morphs on either: its skinned vertices
+        // are the parent's exactly -- drawn from the parent's array (GetSkinnedVertices) instead of skinned again.
+        // (A Starman's five afterimages, each Mario's mesh in Mario's pose: 2468 vertices each, ~0.9 ms each on the
+        // GameCube.) The parent was updated first (above); its array is the one it skinned into this frame.
+        SkeletalMesh3D* parentSkel = inheritPose ? mParent->As<SkeletalMesh3D>() : nullptr;
+        bool share = parentSkel != nullptr &&
+            parentSkel->mSkeletalMesh.Get<SkeletalMesh>() == mesh &&
+            parentSkel->mSkinShare == nullptr &&
+            parentSkel->mBoneInfluenceMode == mBoneInfluenceMode &&
+            parentSkel->mSkinnedVertices.size() == mesh->GetNumVertices() &&
+            parentSkel->GetNumBones() == GetNumBones() &&
+            GFX_IsCpuSkinningRequired(parentSkel);
+        for (uint32_t m = 0; share && m < (uint32_t)mMorphWeights.size(); ++m)
+            share = (mMorphWeights[m] == 0.0f);
+        for (uint32_t m = 0; share && m < (uint32_t)parentSkel->mMorphWeights.size(); ++m)
+            share = (parentSkel->mMorphWeights[m] == 0.0f);
+        if (share)
+            mSkinShare = parentSkel;
+        else
+#endif
         CpuSkinVertices();
     }
 
@@ -1679,7 +1794,6 @@ void SkeletalMesh3D::UpdateAttachedChildren(float deltaTime)
 }
 
 #if PLATFORM_DOLPHIN && PROFILING_ENABLED
-#include <ogc/lwp_watchdog.h>
 // CPU skinning's share of the animation, for the console perf log's CULL line (Renderer.cpp reads and clears them each
 // frame): the rest of "anim" is the pose -- the keys, the bone matrices, the hierarchy
 uint64_t gOctSkinTicks = 0;
@@ -1707,73 +1821,70 @@ void SkeletalMesh3D::CpuSkinVertices()
         mSkinnedVertices.swap(mSkinnedVerticesBack);
 #endif
         mSkinnedVertices.resize(mesh->GetNumVertices());
-        const std::vector<VertexSkinned>* source = &mesh->GetVertices();
+        const std::vector<VertexSkinned>& verts = mesh->GetVertices();
+        const uint32_t numVerts = mesh->GetNumVertices();
 
-        // the morph targets in first (each by its weight), the bones then move the result
-        static std::vector<VertexSkinned> sMorphed;
+        // One pass a vertex: its morph targets' moves added (each by its weight), its normal made unit again, then its
+        // bones' blended transform -- as a 3x4 (the bottom row of a bone matrix is always 0 0 0 1). It used to copy
+        // the whole mesh each frame for the morphs, walk it again for each target and once more for the normals, and
+        // blend and apply full 4x4s: the parachute (morph targets, ~2500 vertices) took 4-6 ms on the GameCube.
+        // The same sums, the same result.
+        struct ActiveMorph { const glm::vec3* mPos; const glm::vec3* mNrm; uint32_t mNumPos; uint32_t mNumNrm; float mWeight; };
+        static std::vector<ActiveMorph> sMorphs;
+        sMorphs.clear();
         const uint32_t numMorphs = glm::min<uint32_t>(mesh->GetNumMorphTargets(), uint32_t(mMorphWeights.size()));
-        bool morphing = false;
         for (uint32_t m = 0; m < numMorphs; ++m)
-            morphing = morphing || (mMorphWeights[m] != 0.0f);
-        if (morphing)
         {
-            sMorphed = *source;
-            for (uint32_t m = 0; m < numMorphs; ++m)
-            {
-                const float w = mMorphWeights[m];
-                if (w == 0.0f)
-                    continue;
-                const MorphTarget& morph = mesh->GetMorphTarget(m);
-                const uint32_t n = glm::min<uint32_t>(uint32_t(morph.mPositions.size()), uint32_t(sMorphed.size()));
-                for (uint32_t i = 0; i < n; ++i)
-                    sMorphed[i].mPosition += morph.mPositions[i] * w;
-                const uint32_t nn = glm::min<uint32_t>(uint32_t(morph.mNormals.size()), uint32_t(sMorphed.size()));
-                for (uint32_t i = 0; i < nn; ++i)
-                    sMorphed[i].mNormal += morph.mNormals[i] * w;
-            }
-            for (VertexSkinned& v : sMorphed)
-            {
-                const float len = glm::length(v.mNormal);
-                if (len > 0.0001f) v.mNormal /= len;
-            }
-            source = &sMorphed;
+            const float w = mMorphWeights[m];
+            if (w == 0.0f)
+                continue;
+            const MorphTarget& morph = mesh->GetMorphTarget(m);
+            sMorphs.push_back({ morph.mPositions.data(), morph.mNormals.data(),
+                                uint32_t(morph.mPositions.size()), uint32_t(morph.mNormals.size()), w });
         }
-        const std::vector<VertexSkinned>& verts = *source;
+        const uint32_t numActive = uint32_t(sMorphs.size());
+        const bool oneBone = (mBoneInfluenceMode == BoneInfluenceMode::One);
 
-        if (mBoneInfluenceMode == BoneInfluenceMode::One)
+        static_assert(MAX_BONE_INFLUENCES == 4, "Need to adjust this code or convert to loop.");
+        for (uint32_t i = 0; i < numVerts; ++i)
         {
-            for (uint32_t i = 0; i < mesh->GetNumVertices(); ++i)
+            const VertexSkinned& srcVert = verts[i];
+            Vertex& dstVert = mSkinnedVertices[i];
+
+            glm::vec3 pos = srcVert.mPosition;
+            glm::vec3 nrm = srcVert.mNormal;
+            if (numActive > 0)
             {
-                const VertexSkinned& srcVert = verts[i];
-                Vertex& dstVert = mSkinnedVertices[i];
-
-                glm::mat4 transform = mBoneMatrices[srcVert.mBoneIndices[0]];
-
-                dstVert.mPosition = transform * glm::vec4(srcVert.mPosition, 1.0f);
-                dstVert.mNormal = transform * glm::vec4(srcVert.mNormal, 0.0f);
-                dstVert.mTexcoord0 = srcVert.mTexcoord0;
-                dstVert.mTexcoord1 = srcVert.mTexcoord1;
+                for (uint32_t m = 0; m < numActive; ++m)
+                {
+                    const ActiveMorph& am = sMorphs[m];
+                    if (i < am.mNumPos) pos += am.mPos[i] * am.mWeight;
+                    if (i < am.mNumNrm) nrm += am.mNrm[i] * am.mWeight;
+                }
+                const float len2 = nrm.x * nrm.x + nrm.y * nrm.y + nrm.z * nrm.z;
+                if (len2 > 1e-8f) nrm *= OctRsqrt(len2);
             }
-        }
-        else
-        {
-            for (uint32_t i = 0; i < mesh->GetNumVertices(); ++i)
+
+            // the bones' blended transform, its top three rows only (columns c0..c2 the rotation-scale, c3 the move);
+            // the rest, weighted 0, left out (most vertices have one or two bones)
+            const glm::mat4& b0 = mBoneMatrices[srcVert.mBoneIndices[0]];
+            const float w0 = oneBone ? 1.0f : srcVert.mBoneWeights[0];
+            glm::vec3 c0 = glm::vec3(b0[0]) * w0, c1 = glm::vec3(b0[1]) * w0, c2 = glm::vec3(b0[2]) * w0, c3 = glm::vec3(b0[3]) * w0;
+            if (!oneBone)
             {
-                const VertexSkinned& srcVert = verts[i];
-                Vertex& dstVert = mSkinnedVertices[i];
-
-                static_assert(MAX_BONE_INFLUENCES == 4, "Need to adjust this code or convert to loop.");
-                // (most vertices have one or two bones: the rest, weighted 0, left out)
-                glm::mat4 transform = mBoneMatrices[srcVert.mBoneIndices[0]] * srcVert.mBoneWeights[0];
-                if (srcVert.mBoneWeights[1] != 0.0f) transform += mBoneMatrices[srcVert.mBoneIndices[1]] * srcVert.mBoneWeights[1];
-                if (srcVert.mBoneWeights[2] != 0.0f) transform += mBoneMatrices[srcVert.mBoneIndices[2]] * srcVert.mBoneWeights[2];
-                if (srcVert.mBoneWeights[3] != 0.0f) transform += mBoneMatrices[srcVert.mBoneIndices[3]] * srcVert.mBoneWeights[3];
-
-                dstVert.mPosition = transform * glm::vec4(srcVert.mPosition, 1.0f);
-                dstVert.mNormal = transform * glm::vec4(srcVert.mNormal, 0.0f);
-                dstVert.mTexcoord0 = srcVert.mTexcoord0;
-                dstVert.mTexcoord1 = srcVert.mTexcoord1;
+                for (uint32_t k = 1; k < 4; ++k)
+                {
+                    const float w = srcVert.mBoneWeights[k];
+                    if (w == 0.0f) continue;
+                    const glm::mat4& b = mBoneMatrices[srcVert.mBoneIndices[k]];
+                    c0 += glm::vec3(b[0]) * w; c1 += glm::vec3(b[1]) * w; c2 += glm::vec3(b[2]) * w; c3 += glm::vec3(b[3]) * w;
+                }
             }
+
+            dstVert.mPosition = c0 * pos.x + c1 * pos.y + c2 * pos.z + c3;
+            dstVert.mNormal = c0 * nrm.x + c1 * nrm.y + c2 * nrm.z;
+            dstVert.mTexcoord0 = srcVert.mTexcoord0;
+            dstVert.mTexcoord1 = srcVert.mTexcoord1;
         }
 
         GFX_UpdateSkeletalMeshCompVertexBuffer(this, mSkinnedVertices);

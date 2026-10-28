@@ -23,6 +23,8 @@
 #include "Nodes/3D/StaticMesh3d.h"
 #include <ogc/lwp_watchdog.h>       // (gettime: the CPU's timebase, 40.5 MHz)
 void OctLog(const char* format, ...);
+extern uint64_t gOctPoseKeysTicks, gOctPoseMatsTicks, gOctPoseFinalTicks, gOctPoseDynTicks, gOctPoseAllTicks;
+extern uint64_t gOctDynStepTicks, gOctDynIterTicks, gOctDynPoseTicks;
 extern uint64_t gOctSkinTicks;      // (SkeletalMesh3d.cpp: CPU skinning's time and vertices since the last frame)
 extern uint32_t gOctSkinVerts;
 // The console perf log's CULL line, every 5 s: what the "Culling" stat spends its time on, a frame -- each kind of node
@@ -73,6 +75,7 @@ namespace
             sCullUpdateTicks = 0;
             sSkinTicks = 0; sSkinVerts = 0;
             gOctSkinTicks = 0; gOctSkinVerts = 0;
+            gOctPoseKeysTicks = gOctPoseMatsTicks = gOctPoseFinalTicks = gOctPoseDynTicks = gOctPoseAllTicks = 0;
             sCullFrames = 0;
             sCullStartUs = SYS_GetTimeMicroseconds();
             sCullNodeTicks = 0;
@@ -112,6 +115,14 @@ namespace
             OctLog("SKIN anim=%.2fms: pose=%.2fms skin=%.2fms (%.0f vertices a frame)", animMs, animMs - skinMs, skinMs,
                    (double)sSkinVerts / sCullFrames);
             sSkinTicks = 0; sSkinVerts = 0;
+            const double f = perMs * sCullFrames;
+            OctLog("POSE keys=%.2fms mats=%.2fms hierarchy=%.2fms dynbones=%.2fms (UpdateAnimation %.2fms of anim)",
+                   gOctPoseKeysTicks / f, gOctPoseMatsTicks / f, gOctPoseFinalTicks / f, gOctPoseDynTicks / f,
+                   gOctPoseAllTicks / f);
+            OctLog("DYNBONES step=%.2fms passes=%.2fms posing=%.2fms (the rest of dynbones: colliders and targets)",
+                   gOctDynStepTicks / f, gOctDynIterTicks / f, gOctDynPoseTicks / f);
+            gOctDynStepTicks = gOctDynIterTicks = gOctDynPoseTicks = 0;
+            gOctPoseKeysTicks = gOctPoseMatsTicks = gOctPoseFinalTicks = gOctPoseDynTicks = gOctPoseAllTicks = 0;
         }
 
         at = snprintf(line, sizeof(line), "ANIM");          // (the costliest first)
