@@ -142,6 +142,20 @@ public:
     const MorphTarget& GetMorphTarget(uint32_t index) const;
     int32_t FindMorphTarget(const std::string& name) const;
 
+    // The GameCube's morph targets: all of their moves (and normal changes), a vertex at a time, in one array --
+    // mStride floats a vertex, target m's move at mPosOfs[m] in it and its normal change at mNrmOfs[m] (-1: none).
+    // Built when the mesh loads on the console, the targets' own arrays then let go: skinning a parachute read its four
+    // targets' moves and two normal changes as six streams beside the vertices, and the Gekko, with only a few cache
+    // misses in flight at once, waited on them (~2.5 ms a glide). Empty elsewhere: the PC reads the targets as ever.
+    struct MorphBlock
+    {
+        std::vector<float> mData;
+        uint32_t mStride = 0;
+        std::vector<int32_t> mPosOfs;
+        std::vector<int32_t> mNrmOfs;
+    };
+    const MorphBlock& GetMorphBlock() const { return mMorphBlock; }
+
     void FinalizeBoneTransforms(std::vector<glm::mat4>& inoutTransforms);
 
     void CopyBindPose(std::vector<glm::mat4>& outTransforms);
@@ -170,6 +184,7 @@ private:
     std::vector<Animation> mAnimations;
     std::vector<VertexSkinned> mVertices;
     std::vector<MorphTarget> mMorphTargets;
+    MorphBlock mMorphBlock;                     // (the console's: GetMorphBlock)
 
     glm::mat4 mInvRootTransform;
     std::vector<glm::mat4> mBindPoseMatrices;

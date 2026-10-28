@@ -207,6 +207,53 @@ void SkeletalMesh::LoadStream(Stream& stream, Platform platform)
                 morph.mNormals.clear();
         }
     }
+
+    mMorphBlock = MorphBlock();
+#if PLATFORM_DOLPHIN && !EDITOR
+    // the console's: every target's moves and normal changes interleaved, a vertex at a time (GetMorphBlock) -- a move
+    // past a target's own count left 0 (adding it changes nothing) -- and the targets' own arrays let go
+    if (!mMorphTargets.empty())
+    {
+        MorphBlock& block = mMorphBlock;
+        const uint32_t numMorphs = uint32_t(mMorphTargets.size());
+        block.mPosOfs.assign(numMorphs, -1);
+        block.mNrmOfs.assign(numMorphs, -1);
+        for (uint32_t m = 0; m < numMorphs; ++m)
+        {
+            if (!mMorphTargets[m].mPositions.empty()) { block.mPosOfs[m] = int32_t(block.mStride); block.mStride += 3; }
+        }
+        for (uint32_t m = 0; m < numMorphs; ++m)
+        {
+            if (!mMorphTargets[m].mNormals.empty()) { block.mNrmOfs[m] = int32_t(block.mStride); block.mStride += 3; }
+        }
+        const uint32_t numVerts = uint32_t(mVertices.size());
+        block.mData.assign(size_t(numVerts) * block.mStride, 0.0f);
+        for (uint32_t m = 0; m < numMorphs; ++m)
+        {
+            MorphTarget& morph = mMorphTargets[m];
+            if (block.mPosOfs[m] >= 0)
+            {
+                const uint32_t n = glm::min<uint32_t>(uint32_t(morph.mPositions.size()), numVerts);
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    float* d = &block.mData[size_t(i) * block.mStride + block.mPosOfs[m]];
+                    d[0] = morph.mPositions[i].x; d[1] = morph.mPositions[i].y; d[2] = morph.mPositions[i].z;
+                }
+            }
+            if (block.mNrmOfs[m] >= 0)
+            {
+                const uint32_t n = glm::min<uint32_t>(uint32_t(morph.mNormals.size()), numVerts);
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    float* d = &block.mData[size_t(i) * block.mStride + block.mNrmOfs[m]];
+                    d[0] = morph.mNormals[i].x; d[1] = morph.mNormals[i].y; d[2] = morph.mNormals[i].z;
+                }
+            }
+            std::vector<glm::vec3>().swap(morph.mPositions);   // (let go: nothing on the console reads them again)
+            std::vector<glm::vec3>().swap(morph.mNormals);
+        }
+    }
+#endif
 }
 
 void SkeletalMesh::SaveStream(Stream& stream, Platform platform)

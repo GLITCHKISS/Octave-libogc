@@ -772,6 +772,15 @@ static inline bool NearCapsule(const glm::vec3& p, const glm::vec3& q, const glm
            glm::min(p.z, q.z) - reach <= hi.z && glm::max(p.z, q.z) + reach >= lo.z;
 }
 
+// whether a box lo-hi (some points') grown by reach meets a capsule line's box clo-chi: if not, no segment between those
+// points can come within reach of it (each segment's own box is inside lo-hi), so NearCapsule would turn every one down
+static inline bool BoxNearBox(const glm::vec3& lo, const glm::vec3& hi, const glm::vec3& clo, const glm::vec3& chi, float reach)
+{
+    return lo.x - reach <= chi.x && hi.x + reach >= clo.x &&
+           lo.y - reach <= chi.y && hi.y + reach >= clo.y &&
+           lo.z - reach <= chi.z && hi.z + reach >= clo.z;
+}
+
 // pushes the segment p-q off a capsule (reach from its line a-b), its ends moved by how near the contact is to each;
 // p pinned (not moving), only q moves, scaled up by how far along the contact is. Returns whether it touched
 static bool PushSegmentOut(glm::vec3& p, glm::vec3& q, const glm::vec3& a, const glm::vec3& b, float reach, bool pMoves)
@@ -941,19 +950,41 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                 BoneChain& a = mBoneChains[link.first];
                 BoneChain& b = mBoneChains[link.second];
                 const uint32_t numPoints = (uint32_t)glm::min(a.mPos.size(), b.mPos.size());
+                if (numPoints < 2)
+                    continue;
+                // (the two lines' box, below the roots: a collider it can't reach skipped whole -- grown as pushes
+                //  move their points, so it stays around them)
+                glm::vec3 lo = glm::min(a.mPos[1], b.mPos[1]), hi = glm::max(a.mPos[1], b.mPos[1]);
+                for (uint32_t i = 2; i < numPoints; ++i)
+                {
+                    lo = glm::min(lo, glm::min(a.mPos[i], b.mPos[i]));
+                    hi = glm::max(hi, glm::max(a.mPos[i], b.mPos[i]));
+                }
                 for (uint32_t c = 0; c < mBoneColliders.size(); ++c)
                 {
                     float reach = (mBoneColliders[c].mRadius + 0.5f * (a.mRadius + b.mRadius)) * scale;
+                    if (!BoxNearBox(lo, hi, sColLo[c], sColHi[c], reach))
+                        continue;
                     for (uint32_t i = 1; i < numPoints; ++i)
                     {
+                        bool moved = false;
                         if (NearCapsule(a.mPos[i], b.mPos[i], sColLo[c], sColHi[c], reach))
-                            PushSegmentOut(a.mPos[i], b.mPos[i], sColA[c], sColB[c], reach, true);
+                            moved |= PushSegmentOut(a.mPos[i], b.mPos[i], sColA[c], sColB[c], reach, true);
                         if (i + 1 < numPoints)
                         {
                             if (NearCapsule(a.mPos[i], b.mPos[i + 1], sColLo[c], sColHi[c], reach))
-                                PushSegmentOut(a.mPos[i], b.mPos[i + 1], sColA[c], sColB[c], reach, true);
+                                moved |= PushSegmentOut(a.mPos[i], b.mPos[i + 1], sColA[c], sColB[c], reach, true);
                             if (NearCapsule(b.mPos[i], a.mPos[i + 1], sColLo[c], sColHi[c], reach))
-                                PushSegmentOut(b.mPos[i], a.mPos[i + 1], sColA[c], sColB[c], reach, true);
+                                moved |= PushSegmentOut(b.mPos[i], a.mPos[i + 1], sColA[c], sColB[c], reach, true);
+                        }
+                        if (moved)
+                        {
+                            const uint32_t last = glm::min(i + 1, numPoints - 1);
+                            for (uint32_t j = i; j <= last; ++j)
+                            {
+                                lo = glm::min(lo, glm::min(a.mPos[j], b.mPos[j]));
+                                hi = glm::max(hi, glm::max(a.mPos[j], b.mPos[j]));
+                            }
                         }
                     }
                 }
@@ -963,12 +994,36 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
             {
                 const uint32_t numPoints = (uint32_t)chain.mBones.size() + 1;
 
+                // (the colliders this line's box -- all its points -- can reach, in their order: the others can't
+                //  touch any of its segments, nor have its root inside them, and are skipped whole. A push moves its
+                //  points: the box grown by them and the list made again, the colliders still taken in their order)
+                glm::vec3 lo = chain.mPos[0], hi = chain.mPos[0];
+                for (uint32_t i = 1; i < numPoints; ++i)
+                {
+                    lo = glm::min(lo, chain.mPos[i]);
+                    hi = glm::max(hi, chain.mPos[i]);
+                }
+                static std::vector<uint32_t> sNear;
+                auto listNear = [&]()
+                {
+                    sNear.clear();
+                    for (uint32_t c = 0; c < mBoneColliders.size(); ++c)
+                    {
+                        if (BoxNearBox(lo, hi, sColLo[c], sColHi[c], (mBoneColliders[c].mRadius + chain.mRadius) * scale))
+                            sNear.push_back(c);
+                    }
+                };
+                listNear();
+
                 // out of the colliders: the whole of each segment, not only its joints (a collider can come up
                 // between two), its two ends moved by how near the contact is to each -- the root's end stays
                 for (uint32_t i = 1; i < numPoints; ++i)
                 {
-                    for (uint32_t c = 0; c < mBoneColliders.size(); ++c)
+                    for (uint32_t ni = 0; ni < sNear.size(); ++ni)
                     {
+                        const uint32_t c = sNear[ni];
+                        const glm::vec3 was0 = chain.mPos[i - 1], was1 = chain.mPos[i];
+                        bool moved = false;
                         float reach = (mBoneColliders[c].mRadius + chain.mRadius) * scale;
                         if (i == 1)
                         {
@@ -986,12 +1041,25 @@ void SkeletalMesh3D::SimulateBoneDynamics(float deltaTime)
                                 glm::vec3 away = chain.mPos[1] - (sColA[c] + ab * t1);
                                 float dist = glm::length(away);
                                 if (dist < reach && dist > 0.00001f)
+                                {
                                     chain.mPos[1] += away * ((reach - dist) / dist);
-                                continue;
+                                    moved = true;
+                                }
                             }
+                            else if (NearCapsule(chain.mPos[i - 1], chain.mPos[i], sColLo[c], sColHi[c], reach))
+                                moved = PushSegmentOut(chain.mPos[i - 1], chain.mPos[i], sColA[c], sColB[c], reach, i > 1);
                         }
-                        if (NearCapsule(chain.mPos[i - 1], chain.mPos[i], sColLo[c], sColHi[c], reach))
-                            PushSegmentOut(chain.mPos[i - 1], chain.mPos[i], sColA[c], sColB[c], reach, i > 1);
+                        else if (NearCapsule(chain.mPos[i - 1], chain.mPos[i], sColLo[c], sColHi[c], reach))
+                            moved = PushSegmentOut(chain.mPos[i - 1], chain.mPos[i], sColA[c], sColB[c], reach, i > 1);
+                        if (moved && (chain.mPos[i - 1] != was0 || chain.mPos[i] != was1))
+                        {
+                            lo = glm::min(lo, glm::min(chain.mPos[i - 1], chain.mPos[i]));
+                            hi = glm::max(hi, glm::max(chain.mPos[i - 1], chain.mPos[i]));
+                            listNear();                             // (again, the colliders after this one taken
+                            ni = 0;                                 //  from where it is in the new list)
+                            while (ni < sNear.size() && sNear[ni] <= c) ++ni;
+                            --ni;
+                        }
                     }
                 }
             }
@@ -1178,7 +1246,7 @@ void SkeletalMesh3D::DetectTriggeredAnimEvents(
 // past them all -- found by halving, not walked from the start. Animations baked a key a frame (hundreds
 // of keys) walked every key up to the time, for every channel of every bone of every playing animation, each frame.
 template<typename KeyT>
-static uint32_t FindKeyIndex(const std::vector<KeyT>& keys, float time)
+static uint32_t FindKeyIndexSearch(const std::vector<KeyT>& keys, float time)
 {
     const uint32_t n = uint32_t(keys.size());
     if (n < 2)
@@ -1197,6 +1265,41 @@ static uint32_t FindKeyIndex(const std::vector<KeyT>& keys, float time)
         else lo = mid + 1;
     }
     return lo - 1;
+}
+
+// The same key, found by guessing first: keys baked a frame apart are evenly spaced, so where `time` falls between the
+// first key and the last says which it is; a step or two either way confirms it (the binary search's own answer: the
+// last g with every key from 1 to g at or before `time`, and the key after it past it). Keys unevenly spaced: after a
+// few steps, the search. Mario's pose looked up ~1000 keys a frame (three a channel, every bone, every layer) at ~8
+// probes each, scattered through each channel's keys -- 0.55 ms on the GameCube.
+template<typename KeyT>
+static uint32_t FindKeyIndex(const std::vector<KeyT>& keys, float time)
+{
+    const uint32_t n = uint32_t(keys.size());
+    if (n < 2)
+    {
+        return 0;
+    }
+    const float t0 = keys[0].mTime, t1 = keys[n - 1].mTime;
+    uint32_t g = 0;
+    if (t1 > t0)
+    {
+        const float f = (time - t0) * (float(n - 1) / (t1 - t0));
+        if (f >= float(n - 2)) g = n - 2;
+        else if (f > 0.0f) g = uint32_t(f);
+    }
+    uint32_t steps = 0;
+    while (g > 0 && time < keys[g].mTime)
+    {
+        --g;
+        if (++steps > 4) return FindKeyIndexSearch(keys, time);
+    }
+    while (g < n - 2 && !(time < keys[g + 1].mTime))
+    {
+        ++g;
+        if (++steps > 4) return FindKeyIndexSearch(keys, time);
+    }
+    return g;
 }
 
 uint32_t SkeletalMesh3D::FindScaleIndex(float time, const Channel& channel)
@@ -1833,11 +1936,31 @@ void SkeletalMesh3D::CpuSkinVertices()
         // its sums kept aside then read back, only pulled more memory through the cache -- it was ~3.9 ms of a glide
         // on the GameCube, nearly all of it waiting on memory: eight streams a vertex (the mesh's vertex, four targets'
         // moves, two targets' normal changes, the scratch sums), none asked for ahead.
+        bool morphNormals = false;
+        const uint32_t numMorphs = glm::min<uint32_t>(mesh->GetNumMorphTargets(), uint32_t(mMorphWeights.size()));
+#if PLATFORM_DOLPHIN && !EDITOR
+        // (the console: the mesh's interleaved block -- SkeletalMesh::GetMorphBlock -- every target's moves for a vertex
+        //  side by side, one stream beside the vertices instead of one a target: the same sums in the same order)
+        struct ActiveBlock { int32_t mPos; int32_t mNrm; float mWeight; };
+        static std::vector<ActiveBlock> sMorphs;
+        sMorphs.clear();
+        const SkeletalMesh::MorphBlock& block = mesh->GetMorphBlock();
+        for (uint32_t m = 0; m < numMorphs && m < block.mPosOfs.size(); ++m)
+        {
+            const float w = mMorphWeights[m];
+            if (w == 0.0f || (block.mPosOfs[m] < 0 && block.mNrmOfs[m] < 0))
+                continue;
+            sMorphs.push_back({ block.mPosOfs[m], block.mNrmOfs[m], w });
+            morphNormals = morphNormals || (block.mNrmOfs[m] >= 0);
+        }
+        const uint32_t numActive = (block.mData.size() >= size_t(numVerts) * block.mStride) ? uint32_t(sMorphs.size()) : 0u;
+        const ActiveBlock* active = sMorphs.data();
+        const float* morphData = block.mData.data();
+        const uint32_t morphStride = block.mStride;
+#else
         struct ActiveMorph { const glm::vec3* mPos; const glm::vec3* mNrm; uint32_t mNumPos; uint32_t mNumNrm; float mWeight; };
         static std::vector<ActiveMorph> sMorphs;
         sMorphs.clear();
-        bool morphNormals = false;
-        const uint32_t numMorphs = glm::min<uint32_t>(mesh->GetNumMorphTargets(), uint32_t(mMorphWeights.size()));
         for (uint32_t m = 0; m < numMorphs; ++m)
         {
             const float w = mMorphWeights[m];
@@ -1853,6 +1976,7 @@ void SkeletalMesh3D::CpuSkinVertices()
         }
         const uint32_t numActive = uint32_t(sMorphs.size());
         const ActiveMorph* active = sMorphs.data();
+#endif
         const bool oneBone = (mBoneInfluenceMode == BoneInfluenceMode::One);
 
 #if PLATFORM_DOLPHIN
@@ -1863,6 +1987,13 @@ void SkeletalMesh3D::CpuSkinVertices()
         const bool zeroLines = sizeof(Vertex) == 2 * sizeof(glm::vec3) + 2 * sizeof(glm::vec2);   // (no padding)
         uintptr_t nextLine = ((uintptr_t)dst + 31) & ~(uintptr_t)31;
         const uintptr_t dstEnd = (uintptr_t)(dst + numVerts);
+        // (the streams read asked for a cache line at a time, PF_AHEAD vertices ahead: each line once, not a dcbt for
+        //  every vertex and target whether its line was asked for already or not)
+        const uint32_t PF_AHEAD = 6;
+        uintptr_t srcPf = (uintptr_t)src & ~(uintptr_t)31;
+        const uintptr_t srcEnd = (uintptr_t)(src + numVerts);
+        uintptr_t morphPf = (numActive > 0) ? ((uintptr_t)morphData & ~(uintptr_t)31) : 0;
+        const uintptr_t morphEnd = (numActive > 0) ? (uintptr_t)(morphData + size_t(numVerts) * morphStride) : 0;
 #endif
 
         static_assert(MAX_BONE_INFLUENCES == 4, "Need to adjust this code or convert to loop.");
@@ -1880,10 +2011,22 @@ void SkeletalMesh3D::CpuSkinVertices()
                     nextLine += 32;
                 }
             }
-            if (i + 4 < numVerts)
             {
-                __asm__ volatile("dcbt 0,%0" : : "r"(src + i + 4));                                // (a source vertex is
-                __asm__ volatile("dcbt 0,%0" : : "r"((const char*)(src + i + 4) + 32));            //  two cache lines)
+                const uintptr_t want = (uintptr_t)(src + glm::min(i + PF_AHEAD, numVerts));
+                while (srcPf < want && srcPf < srcEnd)
+                {
+                    __asm__ volatile("dcbt 0,%0" : : "r"(srcPf));
+                    srcPf += 32;
+                }
+            }
+            if (numActive > 0)
+            {
+                const uintptr_t want = (uintptr_t)(morphData + size_t(glm::min(i + PF_AHEAD, numVerts)) * morphStride);
+                while (morphPf < want && morphPf < morphEnd)
+                {
+                    __asm__ volatile("dcbt 0,%0" : : "r"(morphPf));
+                    morphPf += 32;
+                }
             }
 #endif
 
@@ -1891,19 +2034,22 @@ void SkeletalMesh3D::CpuSkinVertices()
             glm::vec3 nrm = srcVert.mNormal;
             if (numActive > 0)
             {
+#if PLATFORM_DOLPHIN && !EDITOR
+                const float* md = morphData + size_t(i) * morphStride;
+                for (uint32_t m = 0; m < numActive; ++m)
+                {
+                    const ActiveBlock& am = active[m];
+                    if (am.mPos >= 0) pos += glm::vec3(md[am.mPos], md[am.mPos + 1], md[am.mPos + 2]) * am.mWeight;
+                    if (am.mNrm >= 0) nrm += glm::vec3(md[am.mNrm], md[am.mNrm + 1], md[am.mNrm + 2]) * am.mWeight;
+                }
+#else
                 for (uint32_t m = 0; m < numActive; ++m)
                 {
                     const ActiveMorph& am = active[m];
-#if PLATFORM_DOLPHIN
-                    // (its moves 8 vertices ahead asked for: 12 bytes a vertex, a cache line every 2-3 vertices)
-                    if (i + 8 < am.mNumPos)
-                        __asm__ volatile("dcbt 0,%0" : : "r"(am.mPos + i + 8));
-                    if (i + 8 < am.mNumNrm)
-                        __asm__ volatile("dcbt 0,%0" : : "r"(am.mNrm + i + 8));
-#endif
                     if (i < am.mNumPos) pos += am.mPos[i] * am.mWeight;
                     if (i < am.mNumNrm) nrm += am.mNrm[i] * am.mWeight;
                 }
+#endif
                 if (morphNormals)                                   // (the normal turned: made unit again)
                 {
                     const float len2 = nrm.x * nrm.x + nrm.y * nrm.y + nrm.z * nrm.z;
