@@ -44,6 +44,7 @@ struct World_Lua
     static int GetGravity(lua_State* L);
 
     static int RayTest(lua_State* L);
+    static int RayTestFast(lua_State* L);
     static int RayTestMulti(lua_State* L);
     static int SweepTest(lua_State* L);
 

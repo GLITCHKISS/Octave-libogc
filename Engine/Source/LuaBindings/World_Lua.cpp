@@ -306,6 +306,39 @@ int World_Lua::GetGravity(lua_State* L)
     return 1;
 }
 
+// RayTest without a table or a Vector: its ends as six numbers, its hit as plain numbers -- nothing for the
+// garbage collector. A script casting dozens of rays a frame (a character's walls) made tens of KB of garbage a
+// frame through RayTest, and on the GameCube the collector's catching up took 60-80 ms at a time.
+int World_Lua::RayTestFast(lua_State* L)
+{
+    World* world = CHECK_WORLD(L, 1);
+    float sx = CHECK_NUMBER(L, 2);
+    float sy = CHECK_NUMBER(L, 3);
+    float sz = CHECK_NUMBER(L, 4);
+    float ex = CHECK_NUMBER(L, 5);
+    float ey = CHECK_NUMBER(L, 6);
+    float ez = CHECK_NUMBER(L, 7);
+    uint8_t colMask = (uint8_t) CHECK_INTEGER(L, 8);
+
+    RayTestResult result;
+    world->RayTest(glm::vec3(sx, sy, sz), glm::vec3(ex, ey, ez), colMask, result);
+    if (result.mHitNode == nullptr)
+    {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_pushnumber(L, result.mHitFraction);
+    lua_pushnumber(L, result.mHitPosition.x);
+    lua_pushnumber(L, result.mHitPosition.y);
+    lua_pushnumber(L, result.mHitPosition.z);
+    lua_pushnumber(L, result.mHitNormal.x);
+    lua_pushnumber(L, result.mHitNormal.y);
+    lua_pushnumber(L, result.mHitNormal.z);
+    Node_Lua::Create(L, result.mHitNode);   // (the node's own wrapper, kept by the registry: not a new one)
+    return 8;
+}
+
 int World_Lua::RayTest(lua_State* L)
 {
     World* world = CHECK_WORLD(L, 1);
@@ -631,6 +664,8 @@ void World_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, GetGravity);
 
     REGISTER_TABLE_FUNC(L, mtIndex, RayTest);
+
+    REGISTER_TABLE_FUNC(L, mtIndex, RayTestFast);
 
     REGISTER_TABLE_FUNC(L, mtIndex, RayTestMulti);
 

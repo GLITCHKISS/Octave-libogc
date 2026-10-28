@@ -192,6 +192,20 @@ Sig: `res = World:RayTest(start, end, colMask, ignoreObjects=nil, ignorePureOver
    - `Vector hitPosition`
    - `number hitFraction`
 ---
+### RayTestFast
+RayTest with no garbage: the ends as six numbers, the hit as plain return values. No table or Vector is made, so
+it's for rays cast many times a frame (a character's walls and ground). On the GameCube, RayTest's tables and
+Vectors at dozens of rays a frame made the garbage collector stall the game for 60-80 ms at a time.
+
+Sig: `fraction, px, py, pz, nx, ny, nz, node = World:RayTestFast(sx, sy, sz, ex, ey, ez, colMask)`
+ - Arg: `number sx, sy, sz` Start position
+ - Arg: `number ex, ey, ez` End position
+ - Arg: `integer colMask` Collision mask (use 0xff for all collision groups)
+ - Ret: `number fraction` How far along the ray the hit is (0 to 1), or `nil` if nothing was hit (and nothing else)
+ - Ret: `number px, py, pz` Hit position
+ - Ret: `number nx, ny, nz` Hit normal
+ - Ret: `Primitive3D node` Hit node
+---
 ### RayTestMulti
 Find all primitive nodes that intersect a ray.
 
