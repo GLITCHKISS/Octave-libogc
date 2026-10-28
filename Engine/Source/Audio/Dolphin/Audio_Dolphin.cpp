@@ -1270,6 +1270,58 @@ void AUD_GetAramStats(uint32_t& total, uint32_t& free, uint32_t& sounds)
     LWP_MutexUnlock(sAramMutex);
 }
 
+// ARAM read at any byte (AramDma's are 32-byte aligned at both ends): its 32-byte span into this, then the bytes
+// wanted out of it. (The audio interrupt's, and AramVoiceStartAt's with interrupts off: never two at once.)
+static uint8_t sAramScratch[kAramVoiceBuf + 64] __attribute__((aligned(32)));
+static void AramRead(uint8_t* dst, uint32_t aram, uint32_t len)
+{
+    const uint32_t lo = aram & ~31u;
+    const uint32_t skip = aram - lo;
+    AramDma(AR_ARAMTOMRAM, sAramScratch, lo, skip + len);
+    memcpy(dst, sAramScratch + skip, len);
+}
+
+// A voice's next buffer filled from ARAM: its bytes, a multiple of 32 as libasnd wants (0: played out). Looping, always
+// a whole buffer -- the track's end and then its start in the same buffer, the seam inside it, not a buffer of
+// whatever was left at the end (a few odd bytes: a hitch at every loop). Once, the last piece padded with silence to
+// 32 bytes (under 8 sample frames) rather than handed over at an odd size.
+static uint32_t AramVoiceFill(AramVoice& v, uint8_t* dst)
+{
+    uint32_t filled = 0;
+    bool copied = false;                    // (bytes written by the CPU: out of its cache before the DSP reads them)
+    while (filled < kAramVoiceBuf)
+    {
+        if (v.pos >= v.size)
+        {
+            if (!v.loop || v.size == 0)
+                break;
+            v.pos = 0;
+        }
+        const uint32_t n = glm::min(kAramVoiceBuf - filled, v.size - v.pos);
+        const uint32_t at = v.aram + v.pos;
+        if (filled == 0 && (at & 31u) == 0 && (n & 31u) == 0)
+            AramDma(AR_ARAMTOMRAM, dst, at, n);     // (the usual case: straight in)
+        else
+        {
+            AramRead(dst + filled, at, n);
+            copied = true;
+        }
+        filled += n;
+        v.pos += n;
+    }
+    if (filled == 0)
+        return 0;
+    const uint32_t padded = (filled + 31u) & ~31u;
+    if (padded != filled)
+    {
+        memset(dst + filled, 0, padded - filled);
+        copied = true;
+    }
+    if (copied)
+        DCFlushRange(dst, padded);
+    return padded;
+}
+
 // Reads the voice's next piece into its free buffer and queues it. Runs in the audio interrupt
 // (libasnd calls it while the voice has no buffer queued) and once from AramVoiceStart.
 static void AramVoiceCallback(s32 voice)
@@ -1279,24 +1331,20 @@ static void AramVoiceCallback(s32 voice)
     AramVoice& v = sAramVoices[voice];
     if (!v.active)
         return;
-
-    if (v.pos >= v.size)
-    {
-        if (!v.loop)
-            return;     // played out: the voice runs dry and waits (AUD_IsPlaying is then false)
-        v.pos = 0;
-    }
+    if (v.pos >= v.size && !v.loop)
+        return;         // played out: the voice runs dry and waits (AUD_IsPlaying is then false)
 
     if (ASND_TestVoiceBufferReady(voice) != 1 || ASND_TestPointer(voice, v.buf[v.next]) == SND_BUSY)
         return;         // no room yet; libasnd calls again
 
-    const uint32_t n = glm::min(kAramVoiceBuf, v.size - v.pos);
-    AramDma(AR_ARAMTOMRAM, v.buf[v.next], v.aram + v.pos, n);
+    const uint32_t pos0 = v.pos;
+    const uint32_t n = AramVoiceFill(v, v.buf[v.next]);
+    if (n == 0)
+        return;
     if (ASND_AddVoice(voice, v.buf[v.next], n) == SND_OK)
-    {
-        v.pos += n;
         v.next ^= 1;
-    }
+    else
+        v.pos = pos0;   // (refused: the same bytes again next time)
 }
 
 static void AramVoiceStop(uint32_t voice)
@@ -1318,9 +1366,8 @@ static void AramVoiceStartAt(uint32_t voice, uint32_t aram, uint32_t size, int32
     v.size = size;
     v.loop = loop;
 
-    const uint32_t n = glm::min(kAramVoiceBuf, v.size);
-    AramDma(AR_ARAMTOMRAM, v.buf[0], v.aram, n);
-    v.pos = n;
+    v.pos = 0;
+    const uint32_t n = AramVoiceFill(v, v.buf[0]);
     v.next = 1;
     v.active = true;
 

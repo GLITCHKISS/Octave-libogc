@@ -337,6 +337,17 @@ sound started again is a seek, not an open. It's opt-in: the thread costs a
 128 KB stack, and a game near its memory limit, or with card saves sharing the
 SD, should be played on hardware with it first.
 
+**Do** copy long tracks that may play together into ARAM
+(`AUD_CopyTrackToAram`, then `AUD_WaitForTracks` on a loading screen): three
+Vorbis tracks decoded at once in play were 4-5 ms a frame. Keep them Vorbis on
+the disc: from an SD card, decoding 0.5 MB of Vorbis into ARAM took 2.3 s on
+hardware, and copying the same tracks cooked as PCM (7.8 MB) took 2.9 s: the
+SD read costs more than the decode.
+
+**Don't** hand libasnd a buffer whose size isn't a multiple of 32 bytes, nor
+a short odd piece at a loop's end: the loop seam hitched. Fill a looping
+voice's buffers whole, the track's end then its start in the same buffer.
+
 **Don't** mount a memory card while libasnd is running. A locked card is
 unlocked as it mounts, by a DSP task, and libasnd's mixer holds the DSP for
 good: the mount waits forever and the game goes black. A real card unlocked
