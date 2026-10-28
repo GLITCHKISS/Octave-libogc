@@ -38,6 +38,7 @@ SOURCES		:=	Source \
 				Source/Input/Dolphin \
 				Source/Audio \
 				Source/Audio/Dolphin \
+				Source/Audio/Dolphin/asnd \
 				Source/Network \
 				Source/Network/Dolphin \
 				Source/LuaBindings \
@@ -166,6 +167,10 @@ $(OUTPUT): $(OFILES) $(OFILES_EXTRA)
 $(OFILES_EXTRA):
 
 $(OFILES_SOURCES) : $(HFILES)
+
+# libasnd, vendored (Source/Audio/Dolphin/asnd: it's linked from here, not -lasnd), built with libogc's own flags for
+# it: its machine code is then the shipped libasnd.a's, instruction for instruction.
+asndlib.o: CFLAGS += -msdata=eabi -fno-strict-aliasing
 
 #---------------------------------------------------------------------------------
 %.txt.o	%_txt.h :	%.txt

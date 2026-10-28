@@ -22,6 +22,9 @@ the sound's PCM (or Vorbis): the property does nothing there.
 - On the console it's decoded on the CPU into the 16-bit PCM it plays as: a sound effect into ARAM as it loads; a
   Stream sound as `AUD_CopyTrackToAram` copies it, or as it plays from the disc before that. It then plays (and loops)
   as any sound does. Compress is ignored for a DSP-ADPCM sound on the GameCube.
+- Config.ini `DspAdpcm=1` (the editor's Optimization menu): the DSP decodes it instead, as it plays, from ARAM, which
+  then holds it as it is (3.5x less than as PCM; a Stream sound too, once `AUD_CopyTrackToAram` has copied it). Needs
+  DSP LLE in Dolphin. `0`, the default: decoded on the CPU, as above.
 - Config.ini `GameCubeSoundCodec=0` (the default) or `1`, also in the editor's Optimization menu: the codec for the sounds
   left at Project Default.
 - By script: `Tools/octkit.py`'s `set_sound_gc_codec(path, 'adpcm')` sets it in a source `.oct`: the byte after Max

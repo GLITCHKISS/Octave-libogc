@@ -1319,6 +1319,7 @@ void WriteEngineConfig(std::string path)
         fprintf(configIni, "OpaqueFrontToBack=%d\n", sEngineConfig.mOpaqueFrontToBack);
         fprintf(configIni, "CookQuantizedMeshes=%d\n", sEngineConfig.mCookQuantizedMeshes);
         fprintf(configIni, "GameCubeSoundCodec=%d\n", sEngineConfig.mGameCubeSoundCodec);
+        fprintf(configIni, "DspAdpcm=%d\n", sEngineConfig.mDspAdpcm);
 
         fclose(configIni);
         configIni = nullptr;
@@ -1455,6 +1456,8 @@ void ReadEngineConfig(std::string path)
                 sEngineConfig.mCookQuantizedMeshes = strToBool(value);
             else if (keyStr == "GameCubeSoundCodec")
                 sEngineConfig.mGameCubeSoundCodec = atoi(value);
+            else if (keyStr == "DspAdpcm")
+                sEngineConfig.mDspAdpcm = strToBool(value);
 
             strcpy(key, "");
             strcpy(value, "");

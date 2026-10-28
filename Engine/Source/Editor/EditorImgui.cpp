@@ -4241,6 +4241,11 @@ static void DrawViewportPanel()
             ImGui::Combo("Sounds (GameCube)", &sGcSoundCodec, "PCM\0DSP-ADPCM\0");
             ImGui::TextDisabled("For sounds at Project Default (not Stream). DSP-ADPCM: 3.5x smaller, lossy.");
 
+            // Config.ini DspAdpcm: the DSP decodes DSP-ADPCM sounds itself (the engine's libasnd mixer with them).
+            static bool sDspAdpcm = GetEngineConfig()->mDspAdpcm;
+            ImGui::Checkbox("DSP decodes DSP-ADPCM (GameCube)", &sDspAdpcm);
+            ImGui::TextDisabled("Kept in ARAM as it is: 3.5x less. Dolphin needs DSP LLE for it.");
+
             ImGui::Separator();
             if (ImGui::Button("Apply"))
             {
@@ -4254,6 +4259,7 @@ static void DrawViewportPanel()
                 GetMutableEngineConfig()->mLqTextureFormat = sLqFormatIdx - 1;
                 GetMutableEngineConfig()->mLqEnableMipMaps = sLqMips;
                 GetMutableEngineConfig()->mGameCubeSoundCodec = (sGcSoundCodec == 1) ? 1 : 0;
+                GetMutableEngineConfig()->mDspAdpcm = sDspAdpcm;
                 WriteEngineConfig();
             }
             ImGui::EndMenu();

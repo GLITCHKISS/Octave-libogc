@@ -353,6 +353,19 @@ cheaper than Vorbis. It's lossy: check the cook log's SNR, and listen on the
 console to bright, noisy sounds (under ~35 dB). Only the GameCube cook writes
 it; the editor and the PC keep the source.
 
+**Do** set Config.ini `DspAdpcm=1` (the editor's Optimization menu) to have
+the DSP decode DSP-ADPCM itself, through its accelerator, straight from
+ARAM: ARAM then holds the sounds and the `AUD_CopyTrackToAram` tracks
+compressed (3.5x less than as PCM: 9.3 MB of a game's sounds became 2.7 MB),
+nothing is decoded on the CPU, and copying a track is a plain copy. It
+uploads the engine's own copy of libasnd's mixer with DSP-ADPCM voices
+(`Engine/Source/Audio/Dolphin/asnd`); PCM voices mix in it exactly as in the
+stock one. **Don't** ship it to players on Dolphin's default DSP HLE: HLE
+doesn't know the changed microcode (it says "Unknown ucode", and the audio
+breaks). It needs DSP LLE, as libasnd games want anyway. `DspAdpcm=0` (the
+default) uploads libogc's stock mixer, byte for byte, and decodes the same
+sounds on the CPU.
+
 **Don't** hand libasnd a buffer whose size isn't a multiple of 32 bytes, nor
 a short odd piece at a loop's end: the loop seam hitched. Fill a looping
 voice's buffers whole, the track's end then its start in the same buffer.

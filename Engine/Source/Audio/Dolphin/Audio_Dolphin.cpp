@@ -13,7 +13,11 @@
 #include "Engine.h"
 
 #include <gccore.h>
+#if PLATFORM_GAMECUBE
+#include "Audio/Dolphin/asnd/asndlib.h"   // libasnd, vendored: with DSP-ADPCM voices (DspAdpcm=1)
+#else
 #include <asndlib.h>
+#endif
 #include <ogc/semaphore.h>
 #include <ogc/lwp_watchdog.h>
 #include <unistd.h>
@@ -1578,6 +1582,87 @@ static void AramVoiceStart(uint32_t voice, SoundWave* soundWave, int32_t format,
     AramVoiceStartAt(voice, soundWave->GetAramAddress(), soundWave->GetWaveDataSize(), format, pitchHz, volL, volR, loop);
 }
 
+// ---------------------------------------------------------------------------
+// DSP-ADPCM decoded by the DSP (GameCube, Config.ini DspAdpcm=1)
+//
+// The vendored libasnd's mixer with DSP-ADPCM voices (asnd/dsp/dsp_mixer_adpcm.s) is uploaded in place of the stock
+// one, and a DSP-ADPCM sound's data goes to ARAM as it is: the DSP's accelerator decodes it from there as it plays.
+// ARAM holds 3.5x less than its PCM, nothing is decoded on the CPU, and a voice needs no main-memory buffers. Its
+// loop (the whole sound, as the cook makes it) is the DSP's too: sample-exact, no seam. Off (DspAdpcm=0) the stock
+// mixer runs, byte for byte, and such a sound is decoded on the CPU into ARAM as PCM (AUD_StoreAdpcm), as before.
+// ---------------------------------------------------------------------------
+
+static bool sDspAdpcm = false;                      // the mixer with DSP-ADPCM voices is the one running
+static uint32_t sAdpcmVoiceAram[AUDIO_MAX_VOICES];  // the ARAM a voice's DSP-ADPCM is playing from (0: none)
+
+// A voice playing a DSP-ADPCM sound from ARAM at `aram` (the channels' data one after the other, channelBytes each):
+// set going on the DSP, as a PCM one is (ASND_SetVoice). False: it couldn't be (the caller plays it otherwise).
+static bool AdpcmVoiceStart(uint32_t voice, const SoundAdpcmInfo& a, uint32_t aram, int32_t pitchHz, int32_t volL,
+                            int32_t volR, bool loop)
+{
+    if (!sDspAdpcm || aram == 0 || a.samples == 0 || a.channels < 1 || a.channels > 2 || voice >= AUDIO_MAX_VOICES)
+        return false;
+    ASND_AdpcmChannel ch[2];
+    memset(ch, 0, sizeof(ch));
+    for (uint32_t c = 0; c < a.channels; ++c)
+    {
+        const uint32_t base = (aram + c * a.channelBytes) * 2;   // (nibbles)
+        ch[c].start_nibble = base + DspAdpcm::SampleToNibble(0);
+        ch[c].end_nibble = base + DspAdpcm::SampleToNibble(a.samples - 1);
+        ch[c].loop_nibble = ch[c].start_nibble;                  // (the cook's loop: from its first sample)
+        ch[c].ps = a.ps[c];
+        ch[c].yn1 = a.yn1[c];
+        ch[c].yn2 = a.yn2[c];
+        ch[c].loop_ps = a.loopPs[c];
+        ch[c].loop_yn1 = a.loopYn1[c];
+        ch[c].loop_yn2 = a.loopYn2[c];
+        memcpy(ch[c].coefs, a.coefs[c], sizeof(ch[c].coefs));
+    }
+    sAdpcmVoiceAram[voice] = aram;
+    if (ASND_SetVoiceAdpcm(voice, a.channels, pitchHz, 0, ch, a.samples, 0, volL, volR, loop ? 1 : 0) != SND_OK)
+    {
+        sAdpcmVoiceAram[voice] = 0;
+        return false;
+    }
+    return true;
+}
+
+static void AdpcmVoiceStop(uint32_t voice)
+{
+    if (voice < AUDIO_MAX_VOICES)
+        sAdpcmVoiceAram[voice] = 0;
+}
+
+// The DSP-ADPCM data at `data` (the channels one after the other: SoundAdpcmInfo layout 0, or a Stream sound's blocks,
+// layout 1) copied into ARAM as it is, the channels one after the other, through a 32-byte aligned buffer (`data`'s
+// alignment is the file buffer's). 0: no room (or no memory for the buffer).
+static uint32_t AdpcmCopyToAram(const SoundAdpcmInfo& a, const uint8_t* data)
+{
+    const uint32_t bytes = a.channels * a.channelBytes;
+    const uint32_t at = AramAlloc(bytes);
+    if (at == 0)
+        return 0;
+    uint8_t* bounce = (uint8_t*)memalign(32, kAramDmaPiece);
+    if (bounce == nullptr)
+    {
+        AUD_FreeAram(at);
+        return 0;
+    }
+    const uint32_t piece = (a.layout == 1) ? a.interleave : kAramDmaPiece;   // a channel's bytes a piece
+    for (uint32_t off = 0; off < a.channelBytes; off += piece)
+    {
+        const uint32_t len = glm::min(piece, a.channelBytes - off);          // (a multiple of 32: channelBytes is)
+        for (uint32_t c = 0; c < a.channels; ++c)
+        {
+            const uint8_t* src = (a.layout == 1) ? data + off * a.channels + c * len : data + c * a.channelBytes + off;
+            memcpy(bounce, src, len);
+            AramDma(AR_MRAMTOARAM, bounce, at + c * a.channelBytes + off, len);
+        }
+    }
+    free(bounce);
+    return at;
+}
+
 // A loaded sound effect's PCM moves to ARAM. Called on whichever thread loaded the sound.
 static void AramStoreWave(SoundWave* soundWave)
 {
@@ -1606,6 +1691,19 @@ bool AUD_StoreAdpcm(SoundWave* soundWave, const uint8_t* data, uint32_t size)
     const uint32_t pcmBytes = a.samples * a.channels * 2;
     if (pcmBytes == 0 || size < a.channels * a.channelBytes)
         return false;
+
+    // DspAdpcm=1: into ARAM as it is, for the DSP to decode as it plays. (No room: decoded as below, into main memory.)
+    if (sDspAdpcm && sAramReady)
+    {
+        const uint32_t adpcmAt = AdpcmCopyToAram(a, data);
+        if (adpcmAt != 0)
+        {
+            soundWave->SetAdpcmInAram(adpcmAt);
+            OctLog("AUDIO %s: DSP-ADPCM in ARAM as it is, %u KB (as PCM %u KB): decoded by the DSP",
+                   soundWave->GetName().c_str(), (a.channels * a.channelBytes) / 1024, pcmBytes / 1024);
+            return true;
+        }
+    }
     const uint32_t piece = (a.layout == 1) ? a.interleave : kAdpcmPieceBytes;   // a channel's bytes a piece
 
     uint32_t at = sAramReady ? AramAlloc(pcmBytes) : 0;
@@ -1690,9 +1788,11 @@ struct AramTrack
     int32_t          bytesPerSample = 2;
     bool             raw = false;           // PCM on the disc (SoundWave::GetDiscPcm): copied as it is, not decoded
     bool             adpcm = false;         // DSP-ADPCM on the disc (SoundWave::GetDiscAdpcm): decoded on the CPU as it's
-    SoundAdpcmInfo   adpcmInfo;             //  copied (cheap: no Vorbis)
+    SoundAdpcmInfo   adpcmInfo;             //  copied (cheap: no Vorbis) -- or, DspAdpcm=1, copied as it is (onDsp)
+    bool             onDsp = false;         // its DSP-ADPCM in the block as it is (the channels one after the other),
+                                            //  decoded by the DSP as it plays (AdpcmVoiceStart)
     uint32_t         aram = 0;              // its ARAM block (0: none)
-    uint32_t         pcmBytes = 0;          // the PCM in it, once READY
+    uint32_t         pcmBytes = 0;          // the PCM in it, once READY (onDsp: the DSP-ADPCM)
     // FREE -> PENDING (TrackRegister) -> DECODING (the track thread's) -> READY or SKIPPED (still streamed); back to
     // FREE when its SoundWave goes (AUD_ReleaseTrack). Changed under sTrackMutex; READY is read without it (AUD_Play).
     volatile int32_t state = TRACK_FREE;
@@ -1751,6 +1851,7 @@ static void TrackRegister(SoundWave* wave)
         slot->adpcm = wave->GetDiscAdpcm();
         if (slot->adpcm)
             slot->adpcmInfo = wave->GetAdpcmInfo();
+        slot->onDsp = false;
         slot->aram = 0;
         slot->pcmBytes = 0;
         slot->released = false;
@@ -1788,7 +1889,8 @@ static void TrackDecode(AramTrack* t)
     uint8_t* stage = (uint8_t*)memalign(32, kTrackChunkBytes);
     static_assert(kAdpcmPiecePcmBytes <= kTrackChunkBytes, "A DSP-ADPCM block's PCM fits the stage");
     const SoundAdpcmInfo& adpcm = t->adpcmInfo;
-    uint8_t* adpcmBlock = t->adpcm ? (uint8_t*)malloc(adpcm.channels * adpcm.interleave) : nullptr;
+    uint8_t* adpcmBlock = t->adpcm ? (uint8_t*)memalign(32, adpcm.channels * adpcm.interleave) : nullptr;
+    t->onDsp = t->adpcm && sDspAdpcm;       // DspAdpcm=1: copied as it is, for the DSP to decode
 
     const char* why = nullptr;
     bool opened = false;
@@ -1798,10 +1900,11 @@ static void TrackDecode(AramTrack* t)
         why = "no memory to decode it";
     else if (t->adpcm)
     {
-        pcm = adpcm.samples * adpcm.channels * 2;   // (16-bit, as it decodes)
+        pcm = t->onDsp ? adpcm.channels * adpcm.channelBytes   // (as it is)
+                       : adpcm.samples * adpcm.channels * 2;   // (16-bit, as it decodes)
         uint32_t total = 0, sounds = 0;
         AUD_GetAramStats(total, freeBytes, sounds);
-        if (pcm == 0 || adpcm.interleave == 0 || adpcm.interleave > kAdpcmPieceBytes)
+        if (pcm == 0 || adpcm.samples == 0 || adpcm.interleave == 0 || adpcm.interleave > kAdpcmPieceBytes)
             why = "no audio in it";
         else if (freeBytes < pcm + kTrackAramReserve || (t->aram = AramAlloc(pcm)) == 0)
             why = "no room";
@@ -1865,7 +1968,35 @@ static void TrackDecode(AramTrack* t)
 
     // DSP-ADPCM: a block of each channel read at a time (the channels' blocks in turn on the disc), decoded into `stage`
     // and copied to the block. Every block but the last is whole, so each copy starts 32-byte aligned.
-    if (t->adpcm && why == nullptr)
+    // DspAdpcm=1: no decoding at all -- each channel's part of a block copied to its place in the block (the channels
+    // one after the other, as a sound effect's). Every part is whole 32-byte units (the interleave and a channel's
+    // bytes are), so each copy is 32-byte aligned at both ends.
+    if (t->adpcm && t->onDsp && why == nullptr)
+    {
+        uint32_t at = 0;                        // a channel's data read so far
+        while (at < adpcm.channelBytes)
+        {
+            if (t->released)
+            {
+                why = "stopped";
+                break;
+            }
+            const uint32_t len = glm::min(adpcm.interleave, adpcm.channelBytes - at);
+            if (DiscRead(adpcmBlock, 1, len * adpcm.channels, &sTrackDisc) != len * adpcm.channels)
+            {
+                why = "a disc read failed";
+                break;
+            }
+            for (uint32_t c = 0; c < adpcm.channels; ++c)
+                AramDma(AR_MRAMTOARAM, adpcmBlock + c * len, t->aram + c * adpcm.channelBytes + at, len);
+            written += len * adpcm.channels;
+            at += len;
+            if (!sTrackRush)
+                usleep(1000);                // (a rest each block, as below)
+        }
+    }
+
+    if (t->adpcm && !t->onDsp && why == nullptr)
     {
         AdpcmDecoder dec;
         AdpcmStart(dec, adpcm);
@@ -1972,7 +2103,8 @@ static void TrackDecode(AramTrack* t)
 
     if (why == nullptr)
         LogWarning("AUDIO %s in ARAM: %u KB, %u ms%s", name, written / 1024, ms,
-                   t->raw ? " (PCM, copied)" : (t->adpcm ? " (DSP-ADPCM, decoded)" : ""));
+                   t->raw ? " (PCM, copied)" : (t->onDsp ? " (DSP-ADPCM as it is: the DSP decodes it)" :
+                                                (t->adpcm ? " (DSP-ADPCM, decoded)" : "")));
     else if (strcmp(why, "no room") == 0)
         LogWarning("AUDIO %s not in ARAM: %u KB, %u KB free (it streams)", name, pcm / 1024, freeBytes / 1024);
     else
@@ -2104,6 +2236,11 @@ bool AUD_ReleaseTrack(SoundWave* soundWave)
                     AramVoiceStop(v);         // (no more of it read, from here or the audio interrupt)
                     ASND_StopVoice(v);
                 }
+                if (t.aram != 0 && sAdpcmVoiceAram[v] == t.aram)
+                {
+                    AdpcmVoiceStop(v);        // (the DSP's: no more of it read after the mix it's in)
+                    ASND_StopVoice(v);
+                }
             }
         }
         if (t.aram != 0) { AUD_FreeAram(t.aram); t.aram = 0; }
@@ -2135,7 +2272,7 @@ bool AUD_SuspendForCard()
 
 void AUD_ResumeAfterCard()
 {
-    ASND_Init();
+    ASND_InitEx(sDspAdpcm ? 1 : 0);   // (the microcode it ran before)
     ASND_Pause(0);
     sAsndRunning = true;
 }
@@ -2143,7 +2280,16 @@ void AUD_ResumeAfterCard()
 
 void AUD_Initialize()
 {
+#if PLATFORM_GAMECUBE
+    // Config.ini DspAdpcm=1: the mixer with DSP-ADPCM voices; else libogc's stock one, byte for byte.
+    sDspAdpcm = GetEngineConfig()->mDspAdpcm;
+    ASND_InitEx(sDspAdpcm ? 1 : 0);
+    sDspAdpcm = sDspAdpcm && ASND_HasAdpcm();
+    if (sDspAdpcm)
+        OctLog("AUDIO DSP-ADPCM: the DSP decodes it (DspAdpcm=1: libasnd's mixer with DSP-ADPCM voices)");
+#else
     ASND_Init();
+#endif
     ASND_Pause(0);
 #if PLATFORM_GAMECUBE
     sAsndRunning = true;
@@ -2404,6 +2550,7 @@ void AUD_Play(
 {
 #if PLATFORM_GAMECUBE
     AramVoiceStop(voiceIndex);      // whatever this voice played before
+    AdpcmVoiceStop(voiceIndex);
 #endif
 
     //float startPercent = startTime / soundWave->GetDuration();
@@ -2440,7 +2587,14 @@ void AUD_Play(
     if (track != nullptr)
     {
         StreamStop(VoiceStream(voiceIndex));   // (any stream on this voice before)
-        LogWarning("AUDIO start %s (from ARAM)", soundWave->GetName().c_str());
+        LogWarning("AUDIO start %s (from ARAM%s)", soundWave->GetName().c_str(), track->onDsp ? ", DSP-ADPCM" : "");
+        if (track->onDsp)
+        {
+            if (!AdpcmVoiceStart(voiceIndex, track->adpcmInfo, track->aram, pitchHz,
+                                 spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop))
+                LogError("SoundWave '%s': its DSP-ADPCM voice could not be set.", soundWave->GetName().c_str());
+            return;
+        }
         AramVoiceStartAt(voiceIndex, track->aram, track->pcmBytes, voiceFormat, pitchHz,
                          spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop);
         return;
@@ -2615,6 +2769,16 @@ void AUD_Play(
     }
 
 #if PLATFORM_GAMECUBE
+    // DSP-ADPCM in ARAM as it is (DspAdpcm=1): the DSP decodes it as it plays.
+    if (soundWave->GetAramAddress() != 0 && soundWave->IsAdpcm() && soundWave->GetAdpcmInfo().dsp)
+    {
+        if (!AdpcmVoiceStart(voiceIndex, soundWave->GetAdpcmInfo(), soundWave->GetAramAddress(), pitchHz,
+                             spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop))
+        {
+            LogError("SoundWave '%s': its DSP-ADPCM voice could not be set.", soundWave->GetName().c_str());
+        }
+        return;
+    }
     if (soundWave->GetAramAddress() != 0)
     {
         AramVoiceStart(voiceIndex, soundWave, voiceFormat, pitchHz,
@@ -2654,6 +2818,7 @@ void AUD_Stop(uint32_t voiceIndex)
 {
 #if PLATFORM_GAMECUBE
     AramVoiceStop(voiceIndex);
+    AdpcmVoiceStop(voiceIndex);
 #endif
     ASND_StopVoice(voiceIndex);
 

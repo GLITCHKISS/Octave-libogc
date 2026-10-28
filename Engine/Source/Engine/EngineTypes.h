@@ -320,6 +320,12 @@ struct EngineConfig
     // aren't touched by it: one becomes DSP-ADPCM only marked so itself. Other platforms never see it. Config.ini:
     // GameCubeSoundCodec=1.
     int32_t mGameCubeSoundCodec = 0;
+    // GameCube: DSP-ADPCM sounds decoded by the DSP itself (its accelerator) as they play, straight from ARAM, which then
+    // holds them as they are -- 3.5x less than their PCM, and nothing decoded on the CPU: libasnd's mixer with DSP-ADPCM
+    // voices uploaded in place of the stock one. 0, the default: the stock mixer, byte for byte, and DSP-ADPCM sounds
+    // decoded on the CPU into ARAM as PCM as they load. In Dolphin the changed mixer needs DSP LLE (HLE doesn't know
+    // it). Config.ini: DspAdpcm=1.
+    bool mDspAdpcm = false;
 
     int32_t mLqMaxTextureSize = 0;
     // Steps every console texture down by (factor - 1) halvings at cook time: 2 takes 512 to 256
