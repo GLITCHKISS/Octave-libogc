@@ -10,6 +10,7 @@ class SkeletalMesh3D;
 class Widget;
 
 #include "Assets/MaterialLite.h"
+#include "Graphics/GraphicsTypes.h"
 
 #include <gccore.h>
 
@@ -56,6 +57,27 @@ uint8_t ConfigTev(uint8_t tevStage, uint32_t textureSlot, TevMode mode, bool ver
 void ApplyWidgetRotation(Mtx& mtx, Widget* widget);
 
 void* CreateMeshDisplayList(StaticMesh* staticMesh, bool useColor, uint32_t& outSize, bool compact = false);
+// The static meshes' stripper (CreateMeshDisplayList), for other lists made of a mesh's faces (the skinned ones,
+// Graphics_GX.cpp): at most kGxStripMaxFaces faces (three indices each) at a time. The same triangles, the same
+// winding (a face with no area left out); its arrays are its scratch, good until the next call.
+static const uint32_t kGxStripMaxFaces = 1024;
+struct GxStrips
+{
+    uint32_t mNumStrips;
+    const uint16_t* mStripLen;      // each strip's length in vertices
+    uint32_t mNumStripVerts;
+    const uint16_t* mStripVerts;    // the strips' vertices, one after another
+    uint32_t mNumSingles;           // vertices in mSingles: the triangles no strip took, as a plain list
+    const uint16_t* mSingles;
+};
+GxStrips GxStripFaces(const IndexType* faceIdx, uint32_t faces);
+// GPU skinning of a CPU-skinned mesh's rigid vertices (Graphics_GX.cpp): true when the component's skinned array
+// keeps its rigid vertices (one bone, weight 1) as the mesh has them, for the GPU to put through their bones, and
+// only `blended` need skinning on the CPU (`rigid`: the others, to copy in from the mesh once an array).
+bool GxSkinRigidPlan(SkeletalMesh3D* component, const uint16_t*& blended, uint32_t& numBlended,
+                     const uint16_t*& rigid, uint32_t& numRigid);
+// Out of the data cache, just these of a skinned array's vertices (`which` in order)
+void GxFlushSkinnedVertices(const Vertex* vertices, const uint16_t* which, uint32_t count);
 void GFX_SetCompactUnlitMeshes(bool compact);
 bool GFX_GetCompactUnlitMeshes();
 void GFX_SetQuantizedMeshes(bool quantized);

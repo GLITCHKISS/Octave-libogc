@@ -181,6 +181,8 @@ void SkeletalMesh3D::SetSkeletalMesh(SkeletalMesh* skeletalMesh)
     if (mSkeletalMesh.Get() != skeletalMesh)
     {
         mSkeletalMesh = skeletalMesh;
+        mSkinnedRigid = false;                                  // (the arrays are refilled whole: CpuSkinBlended)
+        mSkinnedRigidBack = false;
 
         if (skeletalMesh != nullptr)
         {
@@ -1532,6 +1534,13 @@ uint32_t SkeletalMesh3D::GetNumSkinnedVertices()
     return (uint32_t) mSkinnedVertices.size();
 }
 
+bool SkeletalMesh3D::IsSkinnedRigidOnGpu()
+{
+    if (mSkinShare != nullptr && mSkinShare == mParent.Get())
+        return mSkinShare->mSkinnedRigid;
+    return mSkinnedRigid;
+}
+
 Material* SkeletalMesh3D::GetMaterial()
 {
     Material* mat = mMaterialOverride.Get<Material>();
@@ -1861,6 +1870,14 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
             share = (mMorphWeights[m] == 0.0f);
         for (uint32_t m = 0; share && m < (uint32_t)parentSkel->mMorphWeights.size(); ++m)
             share = (parentSkel->mMorphWeights[m] == 0.0f);
+        if (share && parentSkel->mSkinnedRigid)
+        {
+            // (the parent's rigid vertices left to the GPU: only if this one's material lets it do the same)
+            const uint16_t* blended = nullptr;
+            const uint16_t* rigid = nullptr;
+            uint32_t numBlended = 0, numRigid = 0;
+            share = GxSkinRigidPlan(this, blended, numBlended, rigid, numRigid);
+        }
         if (share)
             mSkinShare = parentSkel;
         else
@@ -1922,8 +1939,14 @@ void SkeletalMesh3D::CpuSkinVertices()
         // and a GxWaitGpu here stalled the CPU on the GPU's whole last frame, every frame, at the first skinned mesh:
         // 3-6 ms in a test level, and the frame's CPU and GPU no longer overlapped.)
         mSkinnedVertices.swap(mSkinnedVerticesBack);
+        std::swap(mSkinnedRigid, mSkinnedRigidBack);
 #endif
         mSkinnedVertices.resize(mesh->GetNumVertices());
+#if API_GX && !EDITOR
+        if (CpuSkinBlended())                                   // (the rigid vertices left to the GPU)
+            return;
+        mSkinnedRigid = false;                                  // (every vertex skinned below)
+#endif
         const std::vector<VertexSkinned>& verts = mesh->GetVertices();
         const uint32_t numVerts = mesh->GetNumVertices();
         const VertexSkinned* src = verts.data();
@@ -2089,3 +2112,72 @@ void SkeletalMesh3D::CpuSkinVertices()
         GFX_UpdateSkeletalMeshCompVertexBuffer(this, mSkinnedVertices);
     }
 }
+
+#if API_GX && !EDITOR
+// GX: the vertices that follow one bone at weight 1 -- most of a character's -- are put through their bone by the GPU
+// (Graphics_GX.cpp, GxSkinLists): the array keeps them as the mesh has them, copied in once (each of the two arrays,
+// then left: nothing else writes them), and only the rest are skinned here, as CpuSkinVertices would (the plan is
+// only for a mesh with no morph targets). False when the GPU can't take them (GxSkinRigidPlan): CpuSkinVertices
+// skins every vertex. (Called from it: the array to write is mSkinnedVertices, swapped and sized.)
+bool SkeletalMesh3D::CpuSkinBlended()
+{
+    const uint16_t* blended = nullptr;
+    const uint16_t* rigid = nullptr;
+    uint32_t numBlended = 0, numRigid = 0;
+    if (!GxSkinRigidPlan(this, blended, numBlended, rigid, numRigid))
+        return false;
+
+    SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();
+    const VertexSkinned* src = mesh->GetVertices().data();
+    Vertex* dst = mSkinnedVertices.data();
+#if PLATFORM_DOLPHIN && PROFILING_ENABLED
+    gOctSkinVerts -= numRigid;                                  // (CpuSkinVertices counted them all)
+#endif
+
+    const bool fill = !mSkinnedRigid;
+    if (fill)
+    {
+        for (uint32_t k = 0; k < numRigid; ++k)
+        {
+            const VertexSkinned& s = src[rigid[k]];
+            Vertex& d = dst[rigid[k]];
+            d.mPosition = s.mPosition;
+            d.mTexcoord0 = s.mTexcoord0;
+            d.mTexcoord1 = s.mTexcoord1;
+            d.mNormal = s.mNormal;
+        }
+        mSkinnedRigid = true;
+    }
+
+    const glm::mat4* boneMats = mBoneMatrices.data();
+    const bool oneBone = (mBoneInfluenceMode == BoneInfluenceMode::One);
+    for (uint32_t k = 0; k < numBlended; ++k)
+    {
+        const VertexSkinned& srcVert = src[blended[k]];
+        Vertex& dstVert = dst[blended[k]];
+        const glm::mat4& b0 = boneMats[srcVert.mBoneIndices[0]];
+        const float w0 = oneBone ? 1.0f : srcVert.mBoneWeights[0];
+        glm::vec3 c0 = glm::vec3(b0[0]) * w0, c1 = glm::vec3(b0[1]) * w0, c2 = glm::vec3(b0[2]) * w0, c3 = glm::vec3(b0[3]) * w0;
+        for (uint32_t i = 1; i < 4 && !oneBone; ++i)
+        {
+            const float w = srcVert.mBoneWeights[i];
+            if (w == 0.0f) continue;
+            const glm::mat4& b = boneMats[srcVert.mBoneIndices[i]];
+            c0 += glm::vec3(b[0]) * w; c1 += glm::vec3(b[1]) * w; c2 += glm::vec3(b[2]) * w; c3 += glm::vec3(b[3]) * w;
+        }
+        const glm::vec3 pos = srcVert.mPosition;
+        const glm::vec3 nrm = srcVert.mNormal;
+        dstVert.mPosition = c0 * pos.x + c1 * pos.y + c2 * pos.z + c3;
+        dstVert.mTexcoord0 = srcVert.mTexcoord0;
+        dstVert.mTexcoord1 = srcVert.mTexcoord1;
+        dstVert.mNormal = c0 * nrm.x + c1 * nrm.y + c2 * nrm.z;
+    }
+
+    // out of the data cache: the whole array when the rigid vertices were copied in, else just what was skinned
+    if (fill)
+        GFX_UpdateSkeletalMeshCompVertexBuffer(this, mSkinnedVertices);
+    else
+        GxFlushSkinnedVertices(dst, blended, numBlended);
+    return true;
+}
+#endif

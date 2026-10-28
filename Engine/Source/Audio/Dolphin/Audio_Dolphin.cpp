@@ -25,7 +25,8 @@
 // error is logged where it's opened), so none of vorbisfile is linked.
 #define ov_open_callbacks(source, vf, initial, ibytes, callbacks) ((void)(vf), -1)
 #define ov_read(vf, buffer, length, bigendian, word, sgned, bitstream) ((void)(vf), 0L)
-#define ov_pcm_seek(vf, pos) ((void)(vf))
+static inline int OvNoSeek(OggVorbis_File* vf) { (void)vf; return -1; }   // (a value, for a restart's check)
+#define ov_pcm_seek(vf, pos) OvNoSeek(vf)
 #define ov_clear(vf) ((void)(vf))
 #endif
 
@@ -137,18 +138,46 @@ struct StreamVoice
     // left it, and that thread frees it once it's done (StreamStop, StreamTryRetire). Waiting for it held the main
     // thread up behind the disc ("AUDIO stop waited 25 ms" restarting the dive's wind).
     volatile bool  retiring = false;
+    // Stopped, its decoder kept open a while (StreamPark) for the same sound to start again from its start without
+    // being opened anew (StreamTakeCached): the main thread's alone. `restart`, set with OPEN_REQUESTED, tells the I/O
+    // thread it is only to be seeked back to its start (as a loop is), not opened.
+    bool           cached = false;
+    uint64_t       cachedAtUs = 0;
+    bool           restart = false;
 };
 
 // Two slots a voice, in turn: one can be left to the I/O thread to finish and free (retiring) while the voice
-// goes on with the other at once. sStreams[v] is the voice's slot now (VoiceStream, StreamFor).
-static StreamVoice sStreamSlots[AUDIO_MAX_VOICES * 2];
+// goes on with the other at once. sStreams[v] is the voice's slot now, sSpares[v] its other (VoiceStream, StreamFor).
+//
+// And a slot set aside for a stopped disc stream's decoder (sCache, StreamPark): the dive's wind, stopped as it fades
+// and started again at the next dive, was opened anew each time -- on the I/O thread, the headers parsed (every
+// codebook's tables built) and three disc reads (the start, the END for the length, back), with a playing track's
+// read-aheads waiting behind it; on the main thread, the whole decoder freed at each stop (ov_clear). Kept, it is
+// only seeked back to its start. Slots move between voices and the cache by pointer: each is one voice's (current or
+// spare) or the cache's. (The I/O thread goes by the array and the slots' states, never by these pointers.)
+static const int32_t kStreamCacheSlots = 1;                    // (one decoder kept at most: memory)
+static const int32_t kStreamSlots = AUDIO_MAX_VOICES * 2 + kStreamCacheSlots;
+static const uint64_t kStreamCacheUs = 10 * 1000 * 1000;       // kept this long after it stopped, then freed
+static StreamVoice sStreamSlots[kStreamSlots];
 static StreamVoice* sStreams[AUDIO_MAX_VOICES] = {};
+static StreamVoice* sSpares[AUDIO_MAX_VOICES] = {};
+static StreamVoice* sCache[kStreamCacheSlots] = {};
 
 static StreamVoice* VoiceStream(int32_t v)
 {
     if (sStreams[v] == nullptr)
+    {
         sStreams[v] = &sStreamSlots[v * 2];
+        sSpares[v] = &sStreamSlots[v * 2 + 1];
+    }
     return sStreams[v];
+}
+
+static StreamVoice* CacheSlot(int32_t c)
+{
+    if (sCache[c] == nullptr)
+        sCache[c] = &sStreamSlots[AUDIO_MAX_VOICES * 2 + c];
+    return sCache[c];
 }
 static size_t DiscRead(void* ptr, size_t size, size_t nmemb, void* ds);
 static int DiscSeek(void* ds, ogg_int64_t off, int whence);
@@ -183,7 +212,7 @@ extern "C" void OctSd_NoteThreadPriority(u32 prio);  // (SdGeckoDma.c: its card 
 // The read-aheads asked for (RequestReadAhead), each into its source's spare window. (The I/O thread's.)
 static void ServeReadAheads()
 {
-    for (int32_t s = 0; s < AUDIO_MAX_VOICES * 2; ++s)
+    for (int32_t s = 0; s < kStreamSlots; ++s)
     {
         DiscSource* d = &sStreamSlots[s].disc;
         if (d->aheadState != AHEAD_REQUESTED)
@@ -203,22 +232,33 @@ static void* AudioIoThread(void*)
     {
         LWP_SemWait(sAudioIoSem);
 
-        for (int32_t s = 0; s < AUDIO_MAX_VOICES * 2; ++s)
+        // A playing track's read-ahead before any start: a start holds this thread for a while (and runs only while
+        // the main thread waits), and the track's window could run out behind it -- read on the main thread then.
+        ServeReadAheads();
+
+        for (int32_t s = 0; s < kStreamSlots; ++s)
         {
             StreamVoice* sv = &sStreamSlots[s];
             if (sv->openState != OPEN_REQUESTED)
                 continue;
             if (sv->retiring)                  // (stopped before it was opened: no need to open it now)
             {
-                sv->vfOpen = false;
+                if (!sv->restart)
+                    sv->vfOpen = false;        // (a restart's decoder is open already: StreamFree clears it)
                 __asm__ volatile("" ::: "memory");
                 sv->openState = OPEN_FAILED;
                 continue;
             }
 
-            ov_callbacks dcb = { DiscRead, DiscSeek, MemClose, DiscTell };
-            bool ok = (ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) >= 0);
-            sv->vfOpen = ok;
+            bool ok;
+            if (sv->restart)                   // kept open (StreamPark): back to its start, as a loop goes back
+                ok = (ov_pcm_seek(&sv->vf, 0) == 0);
+            else
+            {
+                ov_callbacks dcb = { DiscRead, DiscSeek, MemClose, DiscTell };
+                ok = (ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) >= 0);
+                sv->vfOpen = ok;
+            }
             if (ok)
             {
                 sv->openFilled = StreamFill(sv, sv->buf[0], sv->bufSize);   // the first buffer whole
@@ -241,7 +281,7 @@ static void* AudioIoThread(void*)
         // before the main thread needs it.
         ServeReadAheads();
 
-        for (int32_t s = 0; s < AUDIO_MAX_VOICES * 2; ++s)
+        for (int32_t s = 0; s < kStreamSlots; ++s)
         {
             StreamVoice* sv = &sStreamSlots[s];
             if (sv->loopState != LOOP_REQUESTED)
@@ -254,7 +294,7 @@ static void* AudioIoThread(void*)
 
         ServeReadAheads();
 
-        for (int32_t s = 0; s < AUDIO_MAX_VOICES * 2; ++s)
+        for (int32_t s = 0; s < kStreamSlots; ++s)
             StreamTryRetire(&sStreamSlots[s]);
     }
     return nullptr;
@@ -438,8 +478,81 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
     return written;
 }
 
+// A slot nothing is in hand on, left to the I/O thread to free (StreamTryRetire): the decoder's frees off the main thread.
+static void StreamRetire(StreamVoice* sv)
+{
+    sv->cached = false;
+    __asm__ volatile("" ::: "memory");
+    sv->retiring = true;
+    LWP_SemPost(sAudioIoSem);
+}
+
+// A disc stream stopped with nothing in hand on the I/O thread: its decoder kept open in the cache (StreamTakeCached
+// starts it again), its PCM buffers and disc windows freed as before (made again at its start, so all it keeps is the
+// decoder). The voice gets the cache's slot in its place -- the one kept before that, left to the I/O thread to free.
+// False: not kept (freed as ever).
+static bool StreamPark(StreamVoice* sv)
+{
+    if (!sv->vfOpen || sv->memOwned != nullptr || sv->openState == OPEN_FAILED)
+        return false;                       // (not open, in RAM, or a restart's seek failed: its decoder's state unsure)
+    int32_t v = 0;
+    while (v < AUDIO_MAX_VOICES && sStreams[v] != sv)
+        ++v;
+    if (v == AUDIO_MAX_VOICES)
+        return false;
+
+    int32_t c = 0;                          // the cache's slot: a free one, or else the one kept longest
+    for (int32_t i = 0; i < kStreamCacheSlots; ++i)
+    {
+        if (!CacheSlot(i)->cached && !CacheSlot(i)->retiring) { c = i; break; }
+        if (CacheSlot(i)->cached && CacheSlot(c)->cached && CacheSlot(i)->cachedAtUs < CacheSlot(c)->cachedAtUs) c = i;
+    }
+    StreamVoice* out = CacheSlot(c);
+    if (out->cached)
+        StreamRetire(out);                  // (the voice's now, retiring: StreamFor goes on to its spare meanwhile)
+
+    for (int b = 0; b < 3; ++b)
+    {
+        if (sv->buf[b]) { free(sv->buf[b]); sv->buf[b] = nullptr; }
+    }
+    sv->filled = 0;
+    if (sv->disc.window) { free(sv->disc.window); sv->disc.window = nullptr; }
+    if (sv->disc.ahead) { free(sv->disc.ahead); sv->disc.ahead = nullptr; }
+    sv->disc.windowSize = 0;
+    sv->disc.aheadState = AHEAD_EMPTY;      // (EMPTY or READY here: not busy)
+    sv->openState = OPEN_NONE;              // (NONE, or DONE if stopped before its voice was set)
+    sv->loopState = LOOP_NONE;              // (NONE or DONE: it's seeked to its start anyway)
+    sv->eof = false;
+    sv->active = false;
+    sv->cached = true;
+    sv->cachedAtUs = SYS_GetTimeMicroseconds();
+
+    sCache[c] = sv;
+    sStreams[v] = out;
+    return true;
+}
+
+// The same sound kept open (StreamPark): it becomes the voice's slot, and the voice's (stopped: free, or the I/O
+// thread's to free) goes to the cache. nullptr: none kept.
+static StreamVoice* StreamTakeCached(int32_t v, SoundWave* soundWave)
+{
+    for (int32_t c = 0; c < kStreamCacheSlots; ++c)
+    {
+        StreamVoice* sv = CacheSlot(c);
+        if (!sv->cached || sv->disc.base != soundWave->GetDiscOffset() || sv->disc.size != soundWave->GetDiscSize() ||
+            sv->disc.path != soundWave->GetDiscPath())
+            continue;
+        sv->cached = false;
+        sCache[c] = VoiceStream(v);
+        sStreams[v] = sv;
+        return sv;
+    }
+    return nullptr;
+}
+
 // Stops a stream: freed here, or -- the I/O thread still working on it -- left to that thread to free when it's
-// done (retiring), and the voice goes on with its other slot (StreamFor). Never waits on the disc.
+// done (retiring), and the voice goes on with its other slot (StreamFor). Never waits on the disc. A disc stream
+// otherwise keeps its decoder a while (StreamPark).
 static void StreamStop(StreamVoice* sv)
 {
     if (!sv->active) return;
@@ -458,6 +571,8 @@ static void StreamStop(StreamVoice* sv)
             LWP_SemPost(sAudioIoSem);       // (its next pass frees it, once its work on it is done)
             return;
         }
+        if (StreamPark(sv))                 // (nothing in hand on it, and nothing new till the main thread asks)
+            return;
     }
     StreamFree(sv);
 }
@@ -495,18 +610,20 @@ static void StreamFree(StreamVoice* sv)
     sv->disc.windowSize = 0;
     sv->active = false;
     sv->eof = false;
+    sv->cached = false;
+    sv->restart = false;
     __asm__ volatile("" ::: "memory");   // (all of it freed before the slot is anyone's again)
     sv->retiring = false;
 }
 
-// The voice's slot to start a stream in: its own, or -- that one still the I/O thread's to free -- the other of its
-// two. Both retiring (restarted twice within the I/O thread's work): waits for the other, logged as before.
+// The voice's slot to start a stream in: its own, or -- that one still the I/O thread's to free -- its spare, the
+// two swapped. Both retiring (restarted twice within the I/O thread's work): waits for the other, logged as before.
 static StreamVoice* StreamFor(int32_t v)
 {
     StreamVoice* cur = VoiceStream(v);
     if (!cur->retiring)
         return cur;
-    StreamVoice* other = (cur == &sStreamSlots[v * 2]) ? &sStreamSlots[v * 2 + 1] : &sStreamSlots[v * 2];
+    StreamVoice* other = sSpares[v];
     if (other->retiring)
     {
         const uint64_t waitFromUs = SYS_GetTimeMicroseconds();
@@ -518,6 +635,7 @@ static StreamVoice* StreamFor(int32_t v)
         LogWarning("AUDIO stop waited %.1f ms (a voice restarted twice while its streams were still on the disc)",
                    (SYS_GetTimeMicroseconds() - waitFromUs) / 1000.0f);
     }
+    sSpares[v] = cur;
     sStreams[v] = other;
     return other;
 }
@@ -1007,6 +1125,14 @@ void AUD_Update()
     elapsed = glm::min(elapsed, 0.1f);
     sLastUpdateUs = nowUs;
 
+    // A stopped stream's decoder kept its while and not started again: left to the I/O thread to free (StreamPark).
+    for (int32_t c = 0; c < kStreamCacheSlots; ++c)
+    {
+        StreamVoice* kept = CacheSlot(c);
+        if (kept->cached && nowUs - kept->cachedAtUs > kStreamCacheUs)
+            StreamRetire(kept);
+    }
+
     // Keep streamed voices fed (decode next chunk on the main thread).
     for (int32_t v = 0; v < AUDIO_MAX_VOICES; ++v)
     {
@@ -1136,20 +1262,26 @@ void AUD_Play(
     if (fromDisc || (soundWave->GetStream() && soundWave->GetCompressedData() != nullptr))
     {
         StreamStop(VoiceStream(voiceIndex));   // clean any previous stream on this voice (the I/O thread's to free, if busy)
-        StreamVoice* sv = StreamFor(voiceIndex);
+        // The same sound stopped a moment ago (StreamPark): its decoder, still open, only seeked back to the start by
+        // the I/O thread -- the same audio from the same first sample, as a loop starts again.
+        StreamVoice* sv = (fromDisc && sAudioIoSem != LWP_SEM_NULL) ? StreamTakeCached(voiceIndex, soundWave) : nullptr;
+        const bool restart = (sv != nullptr);
+        if (sv == nullptr)
+            sv = StreamFor(voiceIndex);
         sv->active = true;  // so a failure below can StreamStop() what it allocated
         sv->buf[0] = sv->buf[1] = sv->buf[2] = nullptr;
         sv->memOwned = nullptr;
 
         if (fromDisc)
         {
-            LogWarning("AUDIO start %s (streamed from the disc)", soundWave->GetName().c_str());
+            LogWarning("AUDIO start %s (streamed from the disc%s)", soundWave->GetName().c_str(), restart ? ", kept open" : "");
             // The audio never came off the disc: open it where it lies. Costs one small
             // window of memory however long the track is.
             sv->disc.path = soundWave->GetDiscPath();
             sv->disc.base = soundWave->GetDiscOffset();
             sv->disc.size = soundWave->GetDiscSize();
-            sv->disc.pos = 0;
+            if (!restart)
+                sv->disc.pos = 0;   // (a restart's is where its decoder left it: vorbisfile seeks from what it knows)
             sv->disc.windowAt = 0;
             sv->disc.windowSize = 0;
             sv->disc.window = (uint8_t*)malloc(kDiscWindowBytes);
@@ -1167,10 +1299,12 @@ void AUD_Play(
                 WaitReadAhead(&sv->disc);
                 if (sv->disc.window) { free(sv->disc.window); sv->disc.window = nullptr; }
                 if (sv->disc.ahead) { free(sv->disc.ahead); sv->disc.ahead = nullptr; }
+                if (sv->vfOpen) { ov_clear(&sv->vf); sv->vfOpen = false; }   // (a restart's kept decoder)
                 sv->active = false;
                 return;
             }
-            sv->vfOpen = (sAudioIoSem == LWP_SEM_NULL);
+            if (!restart)
+                sv->vfOpen = (sAudioIoSem == LWP_SEM_NULL);
         }
         else
         {
@@ -1239,13 +1373,15 @@ void AUD_Play(
             return;
         }
 
-        if (fromDisc && !sv->vfOpen)
+        if (fromDisc && (restart || !sv->vfOpen))
         {
-            // The I/O thread opens it and decodes the first buffer; AUD_Update sets the voice then.
+            // The I/O thread opens it (or, kept open, seeks it to its start) and decodes the first buffer;
+            // AUD_Update sets the voice then.
             sv->openFormat = voiceFormat;
             sv->openPitchHz = pitchHz;
             sv->openVolL = sv->openVolR = spatial ? 0 : volumeInt;
             sv->openFilled = 0;
+            sv->restart = restart;
             __asm__ volatile("" ::: "memory");
             sv->openState = OPEN_REQUESTED;
             LWP_SemPost(sAudioIoSem);

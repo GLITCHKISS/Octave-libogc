@@ -1309,7 +1309,7 @@ void ApplyWidgetRotation(Mtx& mtx, Widget* widget)
 // functions look inside it.
 namespace
 {
-    const uint32_t kBatchFaces = 1024;
+    const uint32_t kBatchFaces = kGxStripMaxFaces;         // (GxStripFaces' limit: the same scratch)
 
     struct MeshListPart
     {
@@ -1506,6 +1506,20 @@ namespace
         if ((-y + sTanY * z) * sInvLenY > r) return true;       // bottom
         return false;
     }
+}
+
+GxStrips GxStripFaces(const IndexType* faceIdx, uint32_t faces)
+{
+    OCT_ASSERT(faces <= kBatchFaces);
+    const Stripped s = StripBatch(faceIdx, faces);
+    GxStrips out;
+    out.mNumStrips = s.mStrips;
+    out.mStripLen = sStripLen;
+    out.mNumStripVerts = s.mStripVerts;
+    out.mStripVerts = sStrips;
+    out.mNumSingles = s.mSingles;
+    out.mSingles = sSingles;
+    return out;
 }
 
 void GxSetCullFrustum(bool enabled, float tanHalfX, float tanHalfY, float nearZ, float farZ)

@@ -36,6 +36,7 @@
 #include <math.h>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
 
 #include <gccore.h>
 #include <ogc/machine/processor.h>      // _CPU_ISR_Disable / Restore
@@ -1242,10 +1243,41 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
 // cape, its sail, and once more for the projected shadow's caster. As a list the GPU reads the same bytes from
 // memory. Written byte by byte, not recorded with GX_BeginDispList: libogc's GX_Begin flushes whatever GX state is
 // pending into what it's recording, and a list made after one material's BindMaterial would set that material's
-// TEV and texgen counts again at every later call. A primitive is its command byte (GX_TRIANGLES, VTXFMT0) and a
-// 16-bit count, then its indices big-endian; the rest of the last 32 bytes GX_NOP (0). The full list (position,
-// normal, both texture coordinates) is made with the mesh's resource; the position-only one for the shadow's caster
-// the first time it's wanted. Out of memory, the draw goes on sending them itself.
+// TEV and texgen counts again at every later call. A primitive is its command byte (GX_TRIANGLESTRIP or
+// GX_TRIANGLES, VTXFMT0) and a 16-bit count, then its vertices' indices big-endian; the rest of the last 32 bytes
+// GX_NOP (0). The faces go as triangle strips (GxStripFaces, the static meshes' stripper): a list of separate
+// triangles has the GPU transform three vertices a triangle, a strip about 1.4 -- the same triangles, the same
+// winding, sent in another order. The full list (position, normal, both texture coordinates) and the position-only
+// one (the projected shadow's caster) are made with the mesh's resource. Out of memory, the draw goes on sending
+// them itself.
+//
+// GPU skinning of the rigid vertices: most of a character's vertices follow one bone at weight 1, and the GPU can
+// put each vertex through a matrix of its own -- an index in the vertex (GX_VA_PTNMTXIDX) to one of its ten
+// position/normal matrix pairs (GX_PNMTX0..9). The skinned array then keeps those vertices as the mesh has them
+// (SkeletalMesh3D::CpuSkinBlended skins only the rest), and the faces are drawn in batches of at most nine bones:
+// slot 0 the model-view (for the vertices the CPU skinned), slots 1-9 model-view x the batch's bones (and the normal
+// matrix x them: the GPU-skinned path's matrices), loaded before each batch's list. Every face is in a batch, those
+// with a CPU-skinned vertex too: a rigid vertex goes through its bone in every face it's in, so where the two kinds
+// meet the edges are the same on both sides. Not for a mesh with morph targets (a morph moves the vertices before
+// the bones do), nor under a material whose texgens read the normals as they come (a sphere map, the sharp
+// specular's lobes: GxSkinRigidPlan), nor for a mesh mostly blended.
+// OFF for now (OCT_GX_RIGID_SKIN 0): it draws right in Dolphin, but a real GameCube hangs at the first frame that
+// draws a character with it. Not yet found why; the CPU skins every vertex as before.
+#ifndef OCT_GX_RIGID_SKIN
+#define OCT_GX_RIGID_SKIN 0
+#endif
+static const uint32_t kRigidBones = 9;                  // (a batch's: slots 1-9)
+
+struct GxRigidBatch
+{
+    void* mFull = nullptr;                              // matrix index, position, normal, both texcoords a vertex
+    uint32_t mFullSize = 0;
+    void* mPos = nullptr;                               // matrix index, position (the projected shadow's caster)
+    uint32_t mPosSize = 0;
+    uint32_t mNumBones = 0;
+    uint8_t mBones[kRigidBones] = {};                   // slot 1 + i: bone mBones[i]
+};
+
 struct GxSkinLists
 {
     void* mFull = nullptr;
@@ -1254,46 +1286,97 @@ struct GxSkinLists
     uint32_t mPosSize = 0;
     bool mFullTried = false;
     bool mPosTried = false;
+    std::vector<GxRigidBatch> mRigid;                   // (none: the CPU skins every vertex)
+    std::vector<uint16_t> mBlendedVerts;                // the vertices the CPU skins, in order
+    std::vector<uint16_t> mRigidVerts;                  // the rest
 };
 static std::unordered_map<const SkeletalMesh*, GxSkinLists> sSkinLists;
-static const uint32_t kSkinFacesPerBatch = 21845;      // (GX_Begin's count is 16-bit: 65535 vertices a primitive)
 
-static void* BuildSkinList(SkeletalMesh* mesh, bool posOnly, uint32_t& outSize)
+// (as CpuSkinVertices' one-bone case)
+static inline bool IsRigidSkinVertex(const VertexSkinned& v)
+{
+    return v.mBoneWeights[0] == 1.0f && v.mBoneWeights[1] == 0.0f && v.mBoneWeights[2] == 0.0f &&
+           v.mBoneWeights[3] == 0.0f;
+}
+
+// A run of faces as strips, kGxStripMaxFaces at a time, kept to be written out
+struct GxStripSet
+{
+    std::vector<uint16_t> mLens;
+    std::vector<uint16_t> mVerts;
+    std::vector<uint16_t> mSingles;
+};
+
+static void StripSkinFaces(const IndexType* faceIdx, uint32_t numFaces, GxStripSet& out)
+{
+    out.mLens.clear();
+    out.mVerts.clear();
+    out.mSingles.clear();
+    for (uint32_t first = 0; first < numFaces; first += kGxStripMaxFaces)
+    {
+        const uint32_t faces = (numFaces - first < kGxStripMaxFaces) ? (numFaces - first) : kGxStripMaxFaces;
+        const GxStrips s = GxStripFaces(faceIdx + first * 3, faces);
+        out.mLens.insert(out.mLens.end(), s.mStripLen, s.mStripLen + s.mNumStrips);
+        out.mVerts.insert(out.mVerts.end(), s.mStripVerts, s.mStripVerts + s.mNumStripVerts);
+        out.mSingles.insert(out.mSingles.end(), s.mSingles, s.mSingles + s.mNumSingles);
+    }
+}
+
+// A strip set's list: `perVertex` 16-bit indices a vertex (4: position, normal, both texcoords; 1: position), after
+// its matrix index when there's `mtxIdx` (a byte for each of the mesh's vertices). nullptr: out of memory, or no
+// faces with any area.
+static void* WriteSkinList(const GxStripSet& s, uint32_t perVertex, const uint8_t* mtxIdx, const char* meshName,
+                           uint32_t& outSize)
 {
     outSize = 0;
-    const uint32_t numFaces = mesh->GetNumFaces();
-    const uint16_t* indices = mesh->GetIndices();
-    if (numFaces == 0 || indices == nullptr)
+    const uint32_t vertBytes = perVertex * 2 + ((mtxIdx != nullptr) ? 1 : 0);
+    const uint32_t numSingles = uint32_t(s.mSingles.size());
+    const uint32_t kPrimVerts = 65535;                  // (GX_Begin's count is 16-bit: 21845 triangles)
+    const uint32_t singlePrims = (numSingles + kPrimVerts - 1) / kPrimVerts;
+    const uint32_t bytes = uint32_t(s.mLens.size()) * 3 + uint32_t(s.mVerts.size()) * vertBytes +
+                           singlePrims * 3 + numSingles * vertBytes;
+    if (bytes == 0)
         return nullptr;
-
-    const uint32_t numBatches = (numFaces + kSkinFacesPerBatch - 1) / kSkinFacesPerBatch;
-    const uint32_t perVertex = posOnly ? 1 : 4;          // (16-bit indices a corner: its attributes)
-    const uint32_t bytes = numBatches * 3 + numFaces * 3 * perVertex * 2;
     const uint32_t size = (bytes + 31) & ~31u;
     uint8_t* list = (uint8_t*)memalign(32, size);
     if (list == nullptr)
     {
-        LogError("Mesh %s: out of memory for a %u byte skinned display list", mesh->GetName().c_str(), size);
+        LogError("Mesh %s: out of memory for a %u byte skinned display list", meshName, size);
         return nullptr;
     }
 
     uint8_t* at = list;
-    for (uint32_t firstFace = 0; firstFace < numFaces; firstFace += kSkinFacesPerBatch)
+    auto prim = [&at](uint8_t type, uint32_t count)
     {
-        const uint32_t batchFaces = (numFaces - firstFace < kSkinFacesPerBatch) ? (numFaces - firstFace) : kSkinFacesPerBatch;
-        const uint32_t count = batchFaces * 3;
-        *at++ = uint8_t(GX_TRIANGLES | (GX_VTXFMT0 & 7));
+        *at++ = uint8_t(type | (GX_VTXFMT0 & 7));
         *at++ = uint8_t(count >> 8);
         *at++ = uint8_t(count & 0xff);
-        for (uint32_t i = firstFace * 3; i < (firstFace + batchFaces) * 3; ++i)
+    };
+    auto vert = [&at, perVertex, mtxIdx](uint16_t idx)
+    {
+        if (mtxIdx != nullptr)
+            *at++ = mtxIdx[idx];
+        for (uint32_t k = 0; k < perVertex; ++k)
         {
-            const uint16_t idx = indices[i];
-            for (uint32_t k = 0; k < perVertex; ++k)
-            {
-                *at++ = uint8_t(idx >> 8);
-                *at++ = uint8_t(idx & 0xff);
-            }
+            *at++ = uint8_t(idx >> 8);
+            *at++ = uint8_t(idx & 0xff);
         }
+    };
+
+    uint32_t v = 0;
+    for (uint32_t k = 0; k < s.mLens.size(); ++k)
+    {
+        const uint32_t len = s.mLens[k];
+        prim(GX_TRIANGLESTRIP, len);
+        for (uint32_t i = 0; i < len; ++i)
+            vert(s.mVerts[v++]);
+    }
+    for (uint32_t first = 0; first < numSingles; first += kPrimVerts)
+    {
+        const uint32_t count = (numSingles - first < kPrimVerts) ? (numSingles - first) : kPrimVerts;
+        prim(GX_TRIANGLES, count);
+        for (uint32_t i = first; i < first + count; ++i)
+            vert(s.mSingles[i]);
     }
     while (at < list + size)
         *at++ = 0;                                      // (GX_NOP)
@@ -1301,6 +1384,19 @@ static void* BuildSkinList(SkeletalMesh* mesh, bool posOnly, uint32_t& outSize)
     DCFlushRange(list, size);                           // (the GPU reads it from memory, not the CPU's cache)
     outSize = size;
     return list;
+}
+
+static void* BuildSkinList(SkeletalMesh* mesh, bool posOnly, uint32_t& outSize)
+{
+    outSize = 0;
+    const uint32_t numFaces = mesh->GetNumFaces();
+    const IndexType* indices = mesh->GetIndices();
+    if (numFaces == 0 || indices == nullptr)
+        return nullptr;
+
+    GxStripSet strips;
+    StripSkinFaces(indices, numFaces, strips);
+    return WriteSkinList(strips, posOnly ? 1 : 4, nullptr, mesh->GetName().c_str(), outSize);
 }
 
 // The mesh's full skinned list, made now if it hasn't been tried (nullptr: send the indices as before)
@@ -1326,6 +1422,143 @@ static void* GetSkinList(SkeletalMesh* mesh, bool posOnly, uint32_t& outSize)
     return lists.mFull;
 }
 
+static void FreeRigidBatches(GxSkinLists& lists)
+{
+    for (GxRigidBatch& batch : lists.mRigid)
+    {
+        GxDeferFree(batch.mFull);                       // (the GPU may still be drawing the last frame from them)
+        GxDeferFree(batch.mPos);
+    }
+    lists.mRigid.clear();
+    lists.mBlendedVerts.clear();
+    lists.mRigidVerts.clear();
+}
+
+// The mesh's rigid batches (above), if it's one for them
+static void BuildRigidBatches(SkeletalMesh* mesh, GxSkinLists& lists)
+{
+    const uint32_t numVerts = mesh->GetNumVertices();
+    const uint32_t numFaces = mesh->GetNumFaces();
+    const IndexType* indices = mesh->GetIndices();
+    const VertexSkinned* verts = mesh->GetVertices().data();
+    if (mesh->GetNumMorphTargets() > 0 || numFaces == 0 || indices == nullptr || verts == nullptr)
+        return;
+
+    for (uint32_t i = 0; i < numVerts; ++i)
+        (IsRigidSkinVertex(verts[i]) ? lists.mRigidVerts : lists.mBlendedVerts).push_back(uint16_t(i));
+    if (lists.mRigidVerts.size() * 2 < numVerts)
+    {
+        FreeRigidBatches(lists);                        // (mostly blended: little to gain)
+        return;
+    }
+
+    // Each face's bones (its rigid vertices'), and the faces in order of their lowest, so a part's faces come together
+    struct FaceBones { uint8_t mBones[3]; uint32_t mNum; uint32_t mLowest; };
+    std::vector<FaceBones> faceBones(numFaces);
+    std::vector<uint32_t> order(numFaces);
+    for (uint32_t f = 0; f < numFaces; ++f)
+    {
+        FaceBones& fb = faceBones[f];
+        fb.mNum = 0;
+        fb.mLowest = 256;                               // (no rigid vertex: any batch takes it)
+        for (uint32_t c = 0; c < 3; ++c)
+        {
+            const VertexSkinned& v = verts[indices[f * 3 + c]];
+            if (!IsRigidSkinVertex(v))
+                continue;
+            const uint8_t b = v.mBoneIndices[0];
+            bool have = false;
+            for (uint32_t k = 0; k < fb.mNum; ++k)
+                have = have || (fb.mBones[k] == b);
+            if (!have)
+                fb.mBones[fb.mNum++] = b;
+            fb.mLowest = (b < fb.mLowest) ? b : fb.mLowest;
+        }
+        order[f] = f;
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&faceBones](uint32_t a, uint32_t b) { return faceBones[a].mLowest < faceBones[b].mLowest; });
+
+    // Each face into the first batch with room for its bones
+    struct Batch { uint8_t mBones[kRigidBones]; uint32_t mNum; std::vector<uint32_t> mFaces; };
+    std::vector<Batch> batches;
+    for (uint32_t f : order)
+    {
+        const FaceBones& fb = faceBones[f];
+        Batch* into = nullptr;
+        for (Batch& batch : batches)
+        {
+            uint32_t extra = 0;
+            for (uint32_t k = 0; k < fb.mNum; ++k)
+            {
+                bool have = false;
+                for (uint32_t j = 0; j < batch.mNum; ++j)
+                    have = have || (batch.mBones[j] == fb.mBones[k]);
+                extra += have ? 0 : 1;
+            }
+            if (batch.mNum + extra <= kRigidBones)
+            {
+                into = &batch;
+                break;
+            }
+        }
+        if (into == nullptr)
+        {
+            batches.push_back(Batch());
+            into = &batches.back();
+            into->mNum = 0;
+        }
+        for (uint32_t k = 0; k < fb.mNum; ++k)
+        {
+            bool have = false;
+            for (uint32_t j = 0; j < into->mNum; ++j)
+                have = have || (into->mBones[j] == fb.mBones[k]);
+            if (!have)
+                into->mBones[into->mNum++] = fb.mBones[k];
+        }
+        into->mFaces.push_back(f);
+    }
+
+    // Each batch's lists: its faces in the mesh's own order (then stripped), each vertex's matrix index its bone's
+    // slot (x 3: the matrices' row in the GPU's memory), 0 for a vertex the CPU skins
+    std::vector<uint8_t> mtxIdx(numVerts, 0);
+    std::vector<IndexType> faceIdx;
+    GxStripSet strips;
+    lists.mRigid.resize(batches.size());
+    for (uint32_t i = 0; i < batches.size(); ++i)
+    {
+        Batch& batch = batches[i];
+        std::sort(batch.mFaces.begin(), batch.mFaces.end());
+        faceIdx.clear();
+        for (uint32_t f : batch.mFaces)
+        {
+            for (uint32_t c = 0; c < 3; ++c)
+            {
+                const IndexType idx = indices[f * 3 + c];
+                faceIdx.push_back(idx);
+                const VertexSkinned& v = verts[idx];
+                uint32_t slot = 0;
+                for (uint32_t j = 0; j < batch.mNum && IsRigidSkinVertex(v); ++j)
+                    slot = (batch.mBones[j] == v.mBoneIndices[0]) ? j + 1 : slot;
+                mtxIdx[idx] = uint8_t(slot * 3);
+            }
+        }
+        StripSkinFaces(faceIdx.data(), uint32_t(batch.mFaces.size()), strips);
+
+        GxRigidBatch& out = lists.mRigid[i];
+        out.mNumBones = batch.mNum;
+        memcpy(out.mBones, batch.mBones, sizeof(out.mBones));
+        const bool any = !strips.mLens.empty() || !strips.mSingles.empty();
+        out.mFull = WriteSkinList(strips, 4, mtxIdx.data(), mesh->GetName().c_str(), out.mFullSize);
+        out.mPos = WriteSkinList(strips, 1, mtxIdx.data(), mesh->GetName().c_str(), out.mPosSize);
+        if (any && (out.mFull == nullptr || out.mPos == nullptr))
+        {
+            FreeRigidBatches(lists);                    // (out of memory: the CPU skins it all, as before)
+            return;
+        }
+    }
+}
+
 static void FreeSkinLists(const SkeletalMesh* mesh)
 {
     auto it = sSkinLists.find(mesh);
@@ -1333,17 +1566,119 @@ static void FreeSkinLists(const SkeletalMesh* mesh)
         return;
     GxDeferFree(it->second.mFull);                      // (the GPU may still be drawing the last frame from them)
     GxDeferFree(it->second.mPos);
+    FreeRigidBatches(it->second);
     sSkinLists.erase(it);
+}
+
+// The rigid batches of a component's mesh, when its skinned array (or the one it draws: a parent's) keeps the rigid
+// vertices for them this frame
+static const GxSkinLists* GetRigidLists(SkeletalMesh3D* comp, SkeletalMesh* mesh)
+{
+    if (!comp->IsSkinnedRigidOnGpu())
+        return nullptr;
+    auto it = sSkinLists.find(mesh);
+    return (it != sSkinLists.end() && !it->second.mRigid.empty()) ? &it->second : nullptr;
+}
+
+// Each batch: its bones' matrices into slots 1-9 (normalMtx: the normal matrices too, for a draw that reads normals),
+// then its list. Slot 0 -- the model-view, for the vertices the CPU skinned -- the caller's.
+static void DrawRigidBatches(const GxSkinLists& lists, SkeletalMesh3D* comp, const Mtx modelView,
+                             const Mtx* normalMtx, bool posOnly)
+{
+    for (const GxRigidBatch& batch : lists.mRigid)
+    {
+        void* list = posOnly ? batch.mPos : batch.mFull;
+        if (list == nullptr)
+            continue;                                   // (only faces with no area)
+        for (uint32_t s = 0; s < batch.mNumBones; ++s)
+        {
+            Mtx bone, fullTransform;
+            glm::mat4 boneSrc = glm::transpose(comp->GetBoneTransform(int32_t(batch.mBones[s])));
+            memcpy(bone, &boneSrc, sizeof(float) * 4 * 3);
+            c_guMtxConcat(modelView, bone, fullTransform);
+            GX_LoadPosMtxImm(fullTransform, GX_PNMTX0 + (s + 1) * 3);
+            if (normalMtx != nullptr)
+            {
+                Mtx normalTransform;
+                c_guMtxConcat(*normalMtx, bone, normalTransform);
+                GX_LoadNrmMtxImm(normalTransform, GX_PNMTX0 + (s + 1) * 3);
+            }
+        }
+        GX_CallDispList(list, posOnly ? batch.mPosSize : batch.mFullSize);
+    }
+}
+
+// Whether a material's texgens read the normals as the vertices bring them (a sphere map, the sharp specular's lobes:
+// BindMaterial): a rigid vertex left in its bind pose would be mapped by its bind-pose normal. Asked as BindMaterial
+// would, or more (a slot it would skip): then the CPU skins every vertex.
+static bool MaterialTexgenReadsNormals(MaterialLite* material)
+{
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        if (material->GetUvMap(i) == UV_MAP_ENVIRONMENT)
+            return true;
+    }
+    return material->GetSpecular() > 0.0f && material->IsSharpSpecular() &&
+           material->GetShadingModel() != ShadingModel::Unlit;
+}
+
+bool GxSkinRigidPlan(SkeletalMesh3D* component, const uint16_t*& blended, uint32_t& numBlended,
+                     const uint16_t*& rigid, uint32_t& numRigid)
+{
+#if !OCT_GX_RIGID_SKIN
+    return false;
+#endif
+    SkeletalMesh* mesh = component->GetSkeletalMesh();
+    if (mesh == nullptr || !IsCpuSkinningRequired(component))
+        return false;
+    auto it = sSkinLists.find(mesh);
+    if (it == sSkinLists.end() || it->second.mRigid.empty())
+        return false;
+
+    MaterialLite* material = Material::AsLite(component->GetMaterial());
+    if (material == nullptr)
+        material = Renderer::Get()->GetDefaultMaterial();
+    if (material == nullptr || MaterialTexgenReadsNormals(material))
+        return false;
+
+    const GxSkinLists& lists = it->second;
+    blended = lists.mBlendedVerts.data();
+    numBlended = uint32_t(lists.mBlendedVerts.size());
+    rigid = lists.mRigidVerts.data();
+    numRigid = uint32_t(lists.mRigidVerts.size());
+    return true;
+}
+
+void GxFlushSkinnedVertices(const Vertex* vertices, const uint16_t* which, uint32_t count)
+{
+    // a run of neighbours at a time (a part's vertices come together), one sync at the end
+    uint32_t i = 0;
+    while (i < count)
+    {
+        uint32_t j = i + 1;
+        while (j < count && uint32_t(which[j]) == uint32_t(which[j - 1]) + 1)
+            ++j;
+        DCFlushRangeNoSync((void*)(vertices + which[i]), (j - i) * uint32_t(sizeof(Vertex)));
+        i = j;
+    }
+    _sync();
 }
 
 void GFX_CreateSkeletalMeshResource(SkeletalMesh* skeletalMesh, uint32_t numVertices, VertexSkinned* vertices, uint32_t numIndices, IndexType* indices)
 {
-    // its skinned list now, with the loading (not a hitch the first time it's drawn) -- for a mesh skinned on the CPU
+    // its skinned lists now, with the loading (not a hitch the first time it's drawn) -- for a mesh skinned on the CPU
     FreeSkinLists(skeletalMesh);
     if (skeletalMesh->GetNumBones() > MAX_GPU_BONES && skeletalMesh->GetNumFaces() > 0)
     {
-        uint32_t size = 0;
-        GetSkinList(skeletalMesh, false, size);
+        GxSkinLists& lists = sSkinLists[skeletalMesh];
+        GxStripSet strips;
+        StripSkinFaces(skeletalMesh->GetIndices(), skeletalMesh->GetNumFaces(), strips);
+        lists.mFull = WriteSkinList(strips, 4, nullptr, skeletalMesh->GetName().c_str(), lists.mFullSize);
+        lists.mPos = WriteSkinList(strips, 1, nullptr, skeletalMesh->GetName().c_str(), lists.mPosSize);
+        lists.mFullTried = true;
+        lists.mPosTried = true;
+        if (OCT_GX_RIGID_SKIN)
+            BuildRigidBatches(skeletalMesh, lists);
     }
 }
 
@@ -1493,12 +1828,16 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
     if (mesh != nullptr)
     {
         bool cpuSkinned = IsCpuSkinningRequired(skeletalMeshComp);
+        // (its rigid vertices put through their bones by the GPU this frame: GxSkinLists)
+        const GxSkinLists* rigid = cpuSkinned ? GetRigidLists(skeletalMeshComp, mesh) : nullptr;
         if (cpuSkinned)
         {
             Vertex* vertices = skeletalMeshComp->GetSkinnedVertices();
             uint32_t numVertices = skeletalMeshComp->GetNumSkinnedVertices();
 
             GX_ClearVtxDesc();
+            if (rigid != nullptr)
+                GX_SetVtxDesc(GX_VA_PTNMTXIDX, GX_DIRECT);    // (each vertex's matrix: in the lists)
             GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
             GX_SetVtxDesc(GX_VA_NRM, GX_INDEX16);
             GX_SetVtxDesc(GX_VA_TEX0, GX_INDEX16);
@@ -1599,6 +1938,11 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
 
         if (cpuSkinned)
         {
+            if (rigid != nullptr)
+            {
+                DrawRigidBatches(*rigid, skeletalMeshComp, modelView, readsNormals ? &normalMtx : nullptr, false);
+                return;
+            }
             uint32_t listSize = 0;
             void* list = GetSkinList(mesh, false, listSize);
             if (list != nullptr)
@@ -1798,12 +2142,19 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
         return;
 
     bool cpuSkinned = IsCpuSkinningRequired(skeletalMeshComp);
+#if OCT_SKELETAL
+    const GxSkinLists* rigid = cpuSkinned ? GetRigidLists(skeletalMeshComp, mesh) : nullptr;
+#endif
     if (cpuSkinned)
     {
         Vertex* vertices = skeletalMeshComp->GetSkinnedVertices();
         uint32_t numVertices = skeletalMeshComp->GetNumSkinnedVertices();
 
         GX_ClearVtxDesc();
+#if OCT_SKELETAL
+        if (rigid != nullptr)
+            GX_SetVtxDesc(GX_VA_PTNMTXIDX, GX_DIRECT);        // (each vertex's matrix: in the lists)
+#endif
         GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
         GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
         GX_SetArray(GX_VA_POS, &vertices[0].mPosition, sizeof(Vertex));
@@ -1837,6 +2188,11 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
 #if OCT_SKELETAL
     if (cpuSkinned)
     {
+        if (rigid != nullptr)
+        {
+            DrawRigidBatches(*rigid, skeletalMeshComp, modelView, nullptr, true);
+            return;
+        }
         uint32_t listSize = 0;
         void* list = GetSkinList(mesh, true, listSize);
         if (list != nullptr)

@@ -167,6 +167,9 @@ public:
 
     Vertex* GetSkinnedVertices();
     uint32_t GetNumSkinnedVertices();
+    // (GX: the skinned vertices -- GetSkinnedVertices' -- keep the rigid ones as the mesh has them, for the GPU to put
+    //  through their bones: CpuSkinBlended)
+    bool IsSkinnedRigidOnGpu();
 
     virtual Material* GetMaterial() override;
     virtual void Render() override;
@@ -233,6 +236,7 @@ protected:
 
     void UpdateAttachedChildren(float deltaTime);
     void CpuSkinVertices();
+    bool CpuSkinBlended();
     void SimulateBoneDynamics(float deltaTime);
 
     SkeletalMeshRef mSkeletalMesh;
@@ -242,6 +246,9 @@ protected:
     // (GX: the parent whose CPU-skinned vertices this one draws instead of its own, this frame -- an inherited pose
     //  of the same mesh, no morphs: the same vertices exactly. UpdateAnimation sets it, GetSkinnedVertices reads it)
     SkeletalMesh3D* mSkinShare = nullptr;
+    // (GX: each of the two arrays keeps its rigid vertices as the mesh has them -- CpuSkinBlended -- swapped with them)
+    bool mSkinnedRigid = false;
+    bool mSkinnedRigidBack = false;
 
     ScriptableFP<AnimEventHandlerFP> mAnimEventHandler;
     std::string mDefaultAnimation;
