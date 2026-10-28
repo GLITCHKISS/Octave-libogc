@@ -124,6 +124,27 @@ floats on their own.
   Any mesh the game's code reads or rewrites a vertex at a time has to answer
   false in `GFX_SetQuantizeFilter`.
 
+**Do** size HUD art for the shape the TV shows, not the 640 px framebuffer.
+Two things change its width on the console:
+- **Anamorphic 16:9.** The 640 px picture is stretched across a 16:9 screen,
+  so art that is square in 640 x 480 comes out 4/3 too wide. Multiply by 0.75.
+- **The TV's picture.** Dolphin and TVs take a full line as about 711 samples,
+  so 640 px fill only about 90% of the width and round art looks squeezed.
+  Multiply by 1.08, the factor the user confirmed by eye on Castopia and
+  Super Mario Sparkle.
+
+For a 16:9 game that is 0.75 x 1.08 = 0.81. A 4:3 game should need only the
+1.08 (not yet tested).
+- Scale the widths and the x positions together, measured from each piece's
+  own screen edge, so the layout keeps its corners.
+- Apply the factor only when `Engine.GetPlatform() == "GameCube"`. The PC
+  editor stays at 1.0.
+- Check on a console or Dolphin screenshot that a round icon measures as wide
+  as it is tall. A guessed 1/1.1 left Super Mario Sparkle's HUD 11% too wide.
+- Art under about 40 px doesn't show the squeeze.
+- Examples: `GC_WIDE` in Super Mario Sparkle's `Scripts/HUD.lua`, and
+  `BALL_WIDE` (`make_fishbar.py`) and `kWide` (`LoadBall.cpp`) in Castopia.
+
 ---
 
 ## Memory (24 MB)
