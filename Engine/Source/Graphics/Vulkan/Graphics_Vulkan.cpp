@@ -408,7 +408,7 @@ void GFX_DrawShadowMeshComp(ShadowMesh3D* shadowMeshComp)
 // its own before the forward pass; then each receiver under a group's box drawn again inside the forward pass with that
 // texture laid straight down onto it (texture coordinates from its world position through the group's camera,
 // projShadow.mViewProj), multiplying what is there: where two groups' shadows meet, both darken it. (One box for all,
-// over the first caster, left any other far from it without a shadow.) GX still draws the first group's alone.
+// over the first caster, left any other far from it without a shadow.) GX draws the same groups.
 static const uint32_t kProjShadowRes = 128;
 static const uint32_t kMaxProjShadows = 6;
 // The shadow only on what's no higher than its group's first caster's feet and this: laid straight down, it landed
@@ -453,15 +453,37 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
     if (casters.empty() || world == nullptr || world->GetActiveCamera() == nullptr)
         return;
 
-    // the groups: each caster into the first group whose box its own box fits in (a small one walked up to a big one
-    // joins it; never the other way, cut off by the small one's box), else a group of its own over it
+    // the groups: a caster worn by another caster -- a cape, a parachute, anything under it in the scene -- goes with
+    // the one it's on, the group's box grown to hold it (one silhouette, one grey: a second group over a parachute
+    // wider than its wearer's box darkened the floor twice where they met); the others each into the first group whose
+    // box their own box fits in (a small one walked up to a big one joins it; never the other way, cut off by the small
+    // one's box), else a group of its own over it
+    auto wornBy = [&casters](SkeletalMesh3D* caster) -> SkeletalMesh3D*
+    {
+        SkeletalMesh3D* top = nullptr;
+        for (Node* n = caster->GetParent(); n != nullptr; n = n->GetParent())
+        {
+            for (SkeletalMesh3D* c : casters)
+                top = (c == n) ? c : top;
+        }
+        return top;
+    };
+    auto boxOf = [](SkeletalMesh3D* caster, glm::vec3& p, float& radius, float& half)
+    {
+        p = caster->GetWorldPosition();
+        Bounds b = caster->GetBounds();
+        radius = (caster->GetBoundsRadiusOverride() > 0.0f) ? caster->GetBoundsRadiusOverride() : b.mRadius;
+        half = glm::max(0.25f, radius * 0.5f);
+    };
+
     uint32_t numGroups = 0;
     for (SkeletalMesh3D* caster : casters)
     {
-        glm::vec3 p = caster->GetWorldPosition();
-        Bounds b = caster->GetBounds();
-        float radius = (caster->GetBoundsRadiusOverride() > 0.0f) ? caster->GetBoundsRadiusOverride() : b.mRadius;
-        float half = glm::max(0.25f, radius * 0.5f);
+        if (wornBy(caster) != nullptr)
+            continue;                               // (with its wearer's group, below)
+        glm::vec3 p;
+        float radius, half;
+        boxOf(caster, p, radius, half);
         ProjShadow* group = nullptr;
         for (uint32_t g = 0; g < numGroups; ++g)
         {
@@ -483,16 +505,51 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
             group->mHalf = half;
             group->mCenter = p;
             group->mTop = p.y + radius;
-
-            glm::mat4 view = glm::lookAt(p + glm::vec3(0.0f, 20.0f, 0.0f), p, glm::vec3(0.0f, 0.0f, -1.0f));
-            glm::mat4 proj = glm::ortho(-group->mHalf, group->mHalf, -group->mHalf, group->mHalf, 0.1f, 200.0f);
-            proj[1][1] *= -1.0f;
-            group->mViewProj = proj * view;
-            struct { glm::mat4 mViewProj; glm::vec4 mCut; } block = { group->mViewProj, glm::vec4(p.y + kProjShadowAboveFeet, 0.0f, 0.0f, 0.0f) };
-            group->mBlock = WriteUniformBlock(&block, sizeof(block));   // (the caster's shader reads only the matrix)
         }
 
         group->mCasters.push_back(caster);
+    }
+
+    // the worn ones: into their wearer's group, its box grown round them (across: its middle moved, its height -- the
+    // wearer's feet, the shadow's cut -- kept)
+    for (SkeletalMesh3D* caster : casters)
+    {
+        SkeletalMesh3D* wearer = wornBy(caster);
+        if (wearer == nullptr)
+            continue;
+        ProjShadow* group = nullptr;
+        for (uint32_t g = 0; g < numGroups && group == nullptr; ++g)
+        {
+            for (SkeletalMesh3D* c : sProjShadows[g].mCasters)
+                group = (c == wearer) ? &sProjShadows[g] : group;
+        }
+        if (group == nullptr)
+            continue;                               // (its wearer had no room for a shadow: nor does it)
+        glm::vec3 p;
+        float radius, half;
+        boxOf(caster, p, radius, half);
+        const float x0 = glm::min(group->mCenter.x - group->mHalf, p.x - half);
+        const float x1 = glm::max(group->mCenter.x + group->mHalf, p.x + half);
+        const float z0 = glm::min(group->mCenter.z - group->mHalf, p.z - half);
+        const float z1 = glm::max(group->mCenter.z + group->mHalf, p.z + half);
+        group->mCenter.x = 0.5f * (x0 + x1);
+        group->mCenter.z = 0.5f * (z0 + z1);
+        group->mHalf = 0.5f * glm::max(x1 - x0, z1 - z0);
+        group->mTop = glm::max(group->mTop, p.y + radius);
+        group->mCasters.push_back(caster);
+    }
+
+    // each group's camera, over the middle of its box
+    for (uint32_t g = 0; g < numGroups; ++g)
+    {
+        ProjShadow& ps = sProjShadows[g];
+        const glm::vec3 c = ps.mCenter;
+        glm::mat4 view = glm::lookAt(c + glm::vec3(0.0f, 20.0f, 0.0f), c, glm::vec3(0.0f, 0.0f, -1.0f));
+        glm::mat4 proj = glm::ortho(-ps.mHalf, ps.mHalf, -ps.mHalf, ps.mHalf, 0.1f, 200.0f);
+        proj[1][1] *= -1.0f;
+        ps.mViewProj = proj * view;
+        struct { glm::mat4 mViewProj; glm::vec4 mCut; } block = { ps.mViewProj, glm::vec4(c.y + kProjShadowAboveFeet, 0.0f, 0.0f, 0.0f) };
+        ps.mBlock = WriteUniformBlock(&block, sizeof(block));   // (the caster's shader reads only the matrix)
     }
 
     VkCommandBuffer cb = GetCommandBuffer();

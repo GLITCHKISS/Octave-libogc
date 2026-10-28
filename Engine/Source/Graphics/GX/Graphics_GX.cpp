@@ -1673,6 +1673,7 @@ static void DrawRigidBatches(const std::vector<GxRigidBatch>& batches, SkeletalM
         }
         GX_CallDispList(list, batch.mFullSize);
     }
+    GX_SetCurrentMtx(GX_PNMTX0);                        // (the draws after send no index: the model-view slot)
 }
 
 // A material's texgens that read the normals as the vertices bring them (BindMaterial): a rigid vertex left in its
@@ -2380,17 +2381,39 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
         GX_InitTexObjLOD(&sProjShadowStepObj, GX_NEAR, GX_NEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
     }
 
-    // The groups (the Vulkan renderer's rule and order): each caster into the first group whose box its own box fits
-    // in (a small one walked up to a big one joins it; never the other way, cut off by the small one's box), else a
-    // group of its own -- its camera over it (the others in it ride with it), looking straight down, its view half the
-    // size of the caster's bounds each way (the bounds hold it in every pose). Past six, a caster in none: no shadow.
+    // The groups (the Vulkan renderer's rule): a caster worn by another caster -- a cape, a parachute, anything under
+    // it in the scene -- goes with the one it's on, the group's box grown to hold it (one silhouette, one grey: a
+    // second group over a parachute wider than its wearer's box darkened the floor twice where they met). The others
+    // each into the first group whose box their own box fits in (a small one walked up to a big one joins it; never
+    // the other way, cut off by the small one's box), else a group of its own -- its camera over it, looking straight
+    // down, its view half the size of the caster's bounds each way (the bounds hold it in every pose). Past six, a
+    // caster in none: no shadow.
+    auto wornBy = [&casters](SkeletalMesh3D* caster) -> SkeletalMesh3D*
+    {
+        SkeletalMesh3D* top = nullptr;
+        for (Node* n = caster->GetParent(); n != nullptr; n = n->GetParent())
+        {
+            for (SkeletalMesh3D* c : casters)
+                top = (c == n) ? c : top;
+        }
+        return top;
+    };
+    auto boxOf = [](SkeletalMesh3D* caster, glm::vec3& p, float& radius, float& half)
+    {
+        p = caster->GetWorldPosition();
+        Bounds b = caster->GetBounds();
+        radius = (caster->GetBoundsRadiusOverride() > 0.0f) ? caster->GetBoundsRadiusOverride() : b.mRadius;
+        half = glm::max(0.25f, radius * 0.5f);
+    };
+
     uint32_t numGroups = 0;
     for (SkeletalMesh3D* caster : casters)
     {
-        glm::vec3 p = caster->GetWorldPosition();
-        Bounds b = caster->GetBounds();
-        float radius = (caster->GetBoundsRadiusOverride() > 0.0f) ? caster->GetBoundsRadiusOverride() : b.mRadius;
-        float half = glm::max(0.25f, radius * 0.5f);
+        if (wornBy(caster) != nullptr)
+            continue;                               // (with its wearer's group, below)
+        glm::vec3 p;
+        float radius, half;
+        boxOf(caster, p, radius, half);
         GxProjShadow* group = nullptr;
         for (uint32_t g = 0; g < numGroups; ++g)
         {
@@ -2416,6 +2439,8 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
                 ps.mTex = memalign(32, size);
                 if (ps.mTex == nullptr)
                     continue;                       // (no room: this caster without a shadow, the slot tried again)
+                DCFlushRange(ps.mTex, size);        // (memory the CPU used before: no dirty line of it written back
+                                                    //  over the GPU's copy later)
                 GX_InitTexObj(&ps.mTexObj, ps.mTex, kProjShadowRes, kProjShadowRes, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
                 GX_InitTexObjLOD(&ps.mTexObj, GX_LINEAR, GX_LINEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
             }
@@ -2424,21 +2449,53 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
             group->mHalf = half;
             group->mCenter = p;
             group->mTop = p.y + radius;
-
-            guVector eye = { p.x, p.y + 20.0f, p.z };
-            guVector up = { 0.0f, 0.0f, -1.0f };
-            guVector look = { p.x, p.y, p.z };
-            guLookAt(group->mView, &eye, &up, &look);
         }
 
         group->mCasters.push_back(caster);
+    }
+
+    // the worn ones: into their wearer's group, its box grown round them (across: its middle moved, its height -- the
+    // wearer's feet, the shadow's cut -- kept)
+    for (SkeletalMesh3D* caster : casters)
+    {
+        SkeletalMesh3D* wearer = wornBy(caster);
+        if (wearer == nullptr)
+            continue;
+        GxProjShadow* group = nullptr;
+        for (uint32_t g = 0; g < numGroups && group == nullptr; ++g)
+        {
+            for (SkeletalMesh3D* c : sProjShadows[g].mCasters)
+                group = (c == wearer) ? &sProjShadows[g] : group;
+        }
+        if (group == nullptr)
+            continue;                               // (its wearer had no room for a shadow: nor does it)
+        glm::vec3 p;
+        float radius, half;
+        boxOf(caster, p, radius, half);
+        const float x0 = glm::min(group->mCenter.x - group->mHalf, p.x - half);
+        const float x1 = glm::max(group->mCenter.x + group->mHalf, p.x + half);
+        const float z0 = glm::min(group->mCenter.z - group->mHalf, p.z - half);
+        const float z1 = glm::max(group->mCenter.z + group->mHalf, p.z + half);
+        group->mCenter.x = 0.5f * (x0 + x1);
+        group->mCenter.z = 0.5f * (z0 + z1);
+        group->mHalf = 0.5f * glm::max(x1 - x0, z1 - z0);
+        group->mTop = glm::max(group->mTop, p.y + radius);
+        group->mCasters.push_back(caster);
+    }
+
+    // each group's camera, over the middle of its box
+    for (uint32_t g = 0; g < numGroups; ++g)
+    {
+        GxProjShadow& ps = sProjShadows[g];
+        guVector eye = { ps.mCenter.x, ps.mCenter.y + 20.0f, ps.mCenter.z };
+        guVector up = { 0.0f, 0.0f, -1.0f };
+        guVector look = { ps.mCenter.x, ps.mCenter.y, ps.mCenter.z };
+        guLookAt(ps.mView, &eye, &up, &look);
     }
     if (numGroups == 0)
         return;
 
     // The corner of the EFB (the frame's first draws: the last frame's display copy cleared it all).
-    GX_SetViewport(0, 0, kProjShadowRes, kProjShadowRes, 0, 1);
-
     GxResetIndirect();
     GX_SetNumTexGens(0);
     GX_SetNumTevStages(1);
@@ -2465,35 +2522,45 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
     GXRModeObj* rmode = &GetEngineState()->mSystem.mGxRmode;
     GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 
+    // Each group its own square of the EFB's corner, side by side (four a row): all of them white first, in one quad,
+    // then each group's casters into its own, then each copied into its texture. (One square drawn and copied a
+    // group at a time drew the second group's white quad straight after the first's casters -- their per-vertex
+    // matrix indices -- and on a real GameCube that quad came out nowhere: the second texture all the copy's black
+    // clear. Dolphin drew it.)
+    const uint32_t kCols = 4;
+    const uint32_t cols = (numGroups < kCols) ? numGroups : kCols;
+    const uint32_t rows = (numGroups + kCols - 1) / kCols;
     Mtx44 proj;
     Mtx ident;
     guMtxIdentity(ident);
+
+    // all the squares white (no shadow), their borders kept white (clamped, nothing smears off an edge)
+    GX_SetCurrentMtx(GX_PNMTX0);
+    GX_SetViewport(0, 0, kProjShadowRes * cols, kProjShadowRes * rows, 0, 1);
+    GX_SetScissor(0, 0, kProjShadowRes * cols, kProjShadowRes * rows);
+    guOrtho(proj, 1.0f, -1.0f, -1.0f, 1.0f, 0.0f, 2.0f);
+    GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
+    GX_LoadPosMtxImm(ident, GX_PNMTX0);
+    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    GX_SetChanMatColor(GX_COLOR0A0, { 255, 255, 255, 255 });
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+    GX_Position3f32(-1.0f, -1.0f, -1.0f);
+    GX_Position3f32(1.0f, -1.0f, -1.0f);
+    GX_Position3f32(1.0f, 1.0f, -1.0f);
+    GX_Position3f32(-1.0f, 1.0f, -1.0f);
+    GX_End();
+
+    // each group's casters into its square, from its own camera
+    GX_SetChanMatColor(GX_COLOR0A0, grey);
     for (uint32_t gi = 0; gi < numGroups; ++gi)
     {
         GxProjShadow& ps = sProjShadows[gi];
-
-        // The corner white first (no shadow) -- over what the last group's copy cleared it to -- its border kept
-        // white (clamped, nothing smears off its edge). The casters' draws before set their own vertex format and
-        // matrices: the quad's set again each time.
-        GX_SetScissor(0, 0, kProjShadowRes, kProjShadowRes);
-        guOrtho(proj, 1.0f, -1.0f, -1.0f, 1.0f, 0.0f, 2.0f);
-        GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
-        GX_LoadPosMtxImm(ident, GX_PNMTX0);
-        GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
-        GX_ClearVtxDesc();
-        GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-        GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-        GX_SetChanMatColor(GX_COLOR0A0, { 255, 255, 255, 255 });
-        GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position3f32(-1.0f, -1.0f, -1.0f);
-        GX_Position3f32(1.0f, -1.0f, -1.0f);
-        GX_Position3f32(1.0f, 1.0f, -1.0f);
-        GX_Position3f32(-1.0f, 1.0f, -1.0f);
-        GX_End();
-
-        // its casters, from its own camera
-        GX_SetChanMatColor(GX_COLOR0A0, grey);
-        GX_SetScissor(2, 2, kProjShadowRes - 4, kProjShadowRes - 4);
+        const uint32_t x = (gi % kCols) * kProjShadowRes, y = (gi / kCols) * kProjShadowRes;
+        GX_SetViewport(float(x), float(y), kProjShadowRes, kProjShadowRes, 0, 1);
+        GX_SetScissor(x + 2, y + 2, kProjShadowRes - 4, kProjShadowRes - 4);
         guOrtho(proj, ps.mHalf, -ps.mHalf, -ps.mHalf, ps.mHalf, 0.1f, 200.0f);
         GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
         GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
@@ -2501,10 +2568,15 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
         {
             ProjShadowDrawCaster(caster, ps.mView);
         }
+    }
+    GX_SetCurrentMtx(GX_PNMTX0);
 
-        // Into its texture, the corner cleared again (the copy's clear: the frame's own clear colour and depth) --
-        // for the next group, or for the frame after the last. The GPU runs the copy before the next group's quad.
-        GX_SetTexCopySrc(0, 0, kProjShadowRes, kProjShadowRes);
+    // each square into its texture, cleared again as it's copied (the copy's clear: the frame's own clear colour and
+    // depth, for the frame drawn over it)
+    for (uint32_t gi = 0; gi < numGroups; ++gi)
+    {
+        GxProjShadow& ps = sProjShadows[gi];
+        GX_SetTexCopySrc((gi % kCols) * kProjShadowRes, (gi / kCols) * kProjShadowRes, kProjShadowRes, kProjShadowRes);
         // R8: the red channel copied as it is. An I8 copy goes through the video luma conversion (white comes out
         // 235, black 16), and every receiver under the box was darkened by 235/255 where there was no shadow.
         GX_SetTexCopyDst(kProjShadowRes, kProjShadowRes, GX_CTF_R8, GX_FALSE);

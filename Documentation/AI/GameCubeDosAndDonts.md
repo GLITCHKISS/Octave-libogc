@@ -54,6 +54,19 @@ even with accurate cache emulation. The same lists with the normal and texture
 coordinates added drew fine. **Do** send the full vertex when it carries a
 matrix index; with no texgens and no lighting the extra attributes go unread.
 
+**Don't** draw an EFB copy's background (a white quad, say) straight after
+draws that carried a per-vertex matrix index. With several projected-shadow
+textures drawn and copied one after another, every one after the first came
+out solid black on the console: the quad that should have whitened it went
+nowhere. Dolphin drew it right. **Do** draw all the backgrounds first (each
+copy its own square of the EFB), then the indexed draws, then the copies, and
+`GX_SetCurrentMtx(GX_PNMTX0)` after indexed draws.
+
+**Do** `DCFlushRange` a buffer the GPU will write (an EFB copy's texture)
+when you allocate it. Memory the CPU used before can still have dirty cache
+lines, and their write-back lands over the GPU's copy. Dolphin doesn't
+emulate the cache, so it never shows this.
+
 **Don't** `free()` anything the GPU reads (textures, vertex arrays, display
 lists) straight away. Octave lets the GPU draw one frame while the CPU works on
 the next, so the GPU can still be reading it. **Do** hand it to `GxDeferFree`.
