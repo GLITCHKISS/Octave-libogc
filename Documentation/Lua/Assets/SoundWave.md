@@ -6,6 +6,28 @@ Inheritance:
 * [Asset](Asset.md)
 
 ---
+### GameCube Codec (editor property)
+How the GameCube cook writes the sound. Other platforms, the editor's own playback and the source asset always keep
+the sound's PCM (or Vorbis): the property does nothing there.
+
+| Value | GameCube cook |
+|---|---|
+| Project Default (the default) | as Config.ini's `GameCubeSoundCodec` says, for sounds that aren't Stream; a Stream sound stays as it was |
+| PCM | PCM (or Vorbis, with Compress), as before the property |
+| DSP-ADPCM | DSP-ADPCM, Stream sounds too |
+
+- DSP-ADPCM is 3.5x smaller than 16-bit PCM on the disc (1.75x than 8-bit) and lossy: about 40-45 dB SNR on most sounds,
+  less on bright noisy ones (hiss, glitter, water). The cook log gives each sound's size and SNR:
+  `AUDIO cook <name>: DSP-ADPCM, <ch> ch, <KB> (PCM <KB>), SNR <dB>`. Listen on the console before shipping.
+- On the console it's decoded on the CPU into the 16-bit PCM it plays as: a sound effect into ARAM as it loads; a
+  Stream sound as `AUD_CopyTrackToAram` copies it, or as it plays from the disc before that. It then plays (and loops)
+  as any sound does. Compress is ignored for a DSP-ADPCM sound on the GameCube.
+- Config.ini `GameCubeSoundCodec=0` (the default) or `1`, also in the editor's Optimization menu: the codec for the sounds
+  left at Project Default.
+- By script: `Tools/octkit.py`'s `set_sound_gc_codec(path, 'adpcm')` sets it in a source `.oct`: the byte after Max
+  Instances, at 38 + the name's length (asset version 20; an older asset gains the byte).
+
+---
 ### GetVolumeMultiplier
 Get the volume multiplier.
 

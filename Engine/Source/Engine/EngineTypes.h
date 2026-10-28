@@ -314,6 +314,12 @@ struct EngineConfig
     // vertex formats (StaticMesh::SaveStream) -- under half the bytes to read, and read straight
     // into the form they are drawn from. Opt in per project (Config.ini CookQuantizedMeshes=1).
     bool mCookQuantizedMeshes = false;
+    // Packaging for GameCube: the codec of every sound whose own GameCube Codec is Project Default (SoundWave). 0, the
+    // default: PCM, as ever. 1: DSP-ADPCM -- 3.5x smaller on the disc and in memory as it loads, decoded on the console
+    // into ARAM as it loads; lossy (about 40-45 dB SNR, noisy bright sounds less: the cook logs each). Stream sounds
+    // aren't touched by it: one becomes DSP-ADPCM only marked so itself. Other platforms never see it. Config.ini:
+    // GameCubeSoundCodec=1.
+    int32_t mGameCubeSoundCodec = 0;
 
     int32_t mLqMaxTextureSize = 0;
     // Steps every console texture down by (factor - 1) halvings at cook time: 2 takes 512 to 256

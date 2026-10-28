@@ -344,6 +344,15 @@ the disc: from an SD card, decoding 0.5 MB of Vorbis into ARAM took 2.3 s on
 hardware, and copying the same tracks cooked as PCM (7.8 MB) took 2.9 s: the
 SD read costs more than the decode.
 
+**Do** mark big sound effects and long tracks DSP-ADPCM (SoundWave's
+GameCube Codec, or Config.ini `GameCubeSoundCodec=1` for every sound left at
+Project Default that isn't Stream) when the disc, the load or memory is
+tight: 3.5x smaller than 16-bit PCM, decoded on the CPU into ARAM as it loads
+(a Stream sound as `AUD_CopyTrackToAram` copies it, or as it plays), 20-40x
+cheaper than Vorbis. It's lossy: check the cook log's SNR, and listen on the
+console to bright, noisy sounds (under ~35 dB). Only the GameCube cook writes
+it; the editor and the PC keep the source.
+
 **Don't** hand libasnd a buffer whose size isn't a multiple of 32 bytes, nor
 a short odd piece at a loop's end: the loop seam hitched. Fill a looping
 voice's buffers whole, the track's end then its start in the same buffer.

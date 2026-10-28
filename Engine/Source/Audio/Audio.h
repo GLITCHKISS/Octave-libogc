@@ -50,6 +50,10 @@ void AUD_WaitForTracks(uint32_t timeoutMs);
 // A disc-streamed sound's copy in ARAM freed as the sound goes, any voice playing from it stopped. True if one could
 // have been.
 bool AUD_ReleaseTrack(SoundWave* soundWave);
+// A DSP-ADPCM sound (a GameCube cook) loaded into memory: decoded on the CPU into ARAM as the 16-bit PCM it plays as, a
+// piece at a time (its PCM is never whole in main memory), then played as any ARAM sound. No ARAM, or no room: decoded
+// into main memory instead. `data` is its channels' nibble data (SoundWave::GetAdpcmInfo's layout). False: no memory.
+bool AUD_StoreAdpcm(SoundWave* soundWave, const uint8_t* data, uint32_t size);
 #endif
 
 // Streaming PCM voices: push audio that is produced at runtime (e.g. a video's

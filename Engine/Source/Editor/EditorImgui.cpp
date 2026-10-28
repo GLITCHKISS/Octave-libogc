@@ -4235,6 +4235,12 @@ static void DrawViewportPanel()
 
             ImGui::Checkbox("Mip Maps", &sLqMips);
 
+            // Config.ini GameCubeSoundCodec: the GameCube cook's codec for sounds left at Project Default.
+            static int32_t sGcSoundCodec = GetEngineConfig()->mGameCubeSoundCodec;
+            ImGui::Separator();
+            ImGui::Combo("Sounds (GameCube)", &sGcSoundCodec, "PCM\0DSP-ADPCM\0");
+            ImGui::TextDisabled("For sounds at Project Default (not Stream). DSP-ADPCM: 3.5x smaller, lossy.");
+
             ImGui::Separator();
             if (ImGui::Button("Apply"))
             {
@@ -4247,6 +4253,7 @@ static void DrawViewportPanel()
                 GetMutableEngineConfig()->mLqMaxTextureSize = sLqMaxSize;
                 GetMutableEngineConfig()->mLqTextureFormat = sLqFormatIdx - 1;
                 GetMutableEngineConfig()->mLqEnableMipMaps = sLqMips;
+                GetMutableEngineConfig()->mGameCubeSoundCodec = (sGcSoundCodec == 1) ? 1 : 0;
                 WriteEngineConfig();
             }
             ImGui::EndMenu();

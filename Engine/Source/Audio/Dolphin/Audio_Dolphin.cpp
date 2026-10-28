@@ -4,6 +4,7 @@
 #include "Audio/AudioConstants.h"
 
 #include "Assets/SoundWave.h"
+#include "Audio/DspAdpcm.h"
 #include "Log.h"
 #include "Profiler.h"
 #include "Maths.h"
@@ -34,6 +35,85 @@ static inline int OvNoSeek(OggVorbis_File* vf) { (void)vf; return -1; }   // (a 
 #endif
 
 static int32_t sSampleRates[AUDIO_MAX_VOICES] = {};
+
+#if PLATFORM_GAMECUBE
+// ---------------------------------------------------------------------------
+// DSP-ADPCM decoded on the CPU (GameCube: a sound cooked so, SoundWave's GameCube Codec)
+//
+// Into the 16-bit little-endian PCM the other sounds play as: a sound effect's into ARAM as it loads (AUD_StoreAdpcm), a
+// Stream sound's as it's copied to ARAM (TrackDecode) or as it plays from the disc (StreamFill). From there it plays as
+// any of them does. About 40 ns a sample on the Gekko: 20-40 times cheaper than Vorbis.
+// ---------------------------------------------------------------------------
+
+// A piece decoded at a time: a Stream sound's block (SOUND_ADPCM_INTERLEAVE bytes a channel, 256 frames), and as much of
+// a sound effect's. Its PCM: 3584 samples a channel, 14 KB stereo -- a multiple of 32 bytes, so each piece but the last
+// goes to ARAM 32-byte aligned.
+static const uint32_t kAdpcmPieceBytes = SOUND_ADPCM_INTERLEAVE;
+static const uint32_t kAdpcmPiecePcmBytes = (kAdpcmPieceBytes / DspAdpcm::kBytesPerFrame) * DspAdpcm::kSamplesPerFrame * 2 * 2;
+
+struct AdpcmDecoder
+{
+    uint32_t channels = 0;
+    uint32_t samples = 0;           // a channel's
+    uint32_t sample = 0;            // a channel's decoded so far
+    int16_t  coefs[2][16] = {};
+    int16_t  yn1[2] = {};
+    int16_t  yn2[2] = {};
+};
+
+// From its first sample (a loop goes back to it the same way: the cook's loop starts at sample 0, its history 0).
+static void AdpcmStart(AdpcmDecoder& d, const SoundAdpcmInfo& a)
+{
+    d.channels = a.channels;
+    d.samples = a.samples;
+    d.sample = 0;
+    memcpy(d.coefs, a.coefs, sizeof(d.coefs));
+    memcpy(d.yn1, a.yn1, sizeof(d.yn1));
+    memcpy(d.yn2, a.yn2, sizeof(d.yn2));
+}
+
+// Up to `frames` 8-byte frames of each channel (src[c]) decoded into dst, the channels interleaved, little-endian 16-bit;
+// no further than the sound's end. Returns the bytes written. The DSP's arithmetic (DspAdpcm::DecodeSample) in 32 bits:
+// the cook's coefficients (|c1| < 4096, |c2| < 2048) keep its sums in range, so it's the same, sample for sample.
+static uint32_t AdpcmDecodeFrames(AdpcmDecoder& d, const uint8_t* const src[2], uint32_t frames, uint8_t* dst)
+{
+    const uint32_t step = d.channels * 2;
+    uint8_t* out = dst;
+    for (uint32_t f = 0; f < frames && d.sample < d.samples; ++f)
+    {
+        const uint32_t n = glm::min<uint32_t>(DspAdpcm::kSamplesPerFrame, d.samples - d.sample);
+        for (uint32_t c = 0; c < d.channels; ++c)
+        {
+            const uint8_t* fr = src[c] + f * DspAdpcm::kBytesPerFrame;
+            const uint32_t ps = fr[0];
+            const int16_t* k = &d.coefs[c][((ps >> 4) & 7) * 2];
+            const int32_t c1 = k[0];
+            const int32_t c2 = k[1];
+            const int32_t scale = 1 << (ps & 15);
+            int32_t yn1 = d.yn1[c];
+            int32_t yn2 = d.yn2[c];
+            uint8_t* o = out + c * 2;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                const uint32_t b = fr[1 + (i >> 1)];
+                const int32_t nib = int32_t((((i & 1) ? b : (b >> 4)) & 15) ^ 8) - 8;
+                int32_t v = scale * nib + ((0x400 + c1 * yn1 + c2 * yn2) >> 11);
+                v = (v > 32767) ? 32767 : ((v < -32768) ? -32768 : v);
+                yn2 = yn1;
+                yn1 = v;
+                o[0] = uint8_t(v);
+                o[1] = uint8_t(v >> 8);
+                o += step;
+            }
+            d.yn1[c] = int16_t(yn1);
+            d.yn2[c] = int16_t(yn2);
+        }
+        d.sample += n;
+        out += n * step;
+    }
+    return uint32_t(out - dst);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Streaming (decode-on-demand) voices
@@ -165,6 +245,20 @@ struct StreamVoice
     // A disc stream that is PCM already (SoundWave::GetDiscPcm, cooked uncompressed): copied from the disc window as it
     // is, no vf at all (vfOpen stays false: never opened, cleared or parked), its loop's start its first byte.
     bool           raw = false;
+    // A disc stream that is DSP-ADPCM (SoundWave::GetDiscAdpcm; GameCube): decoded here as it plays, a block of each
+    // channel read from the disc window at a time; no vf either (as `raw`: never parked), its loop's start its first block.
+    bool           adpcm = false;
+#if PLATFORM_GAMECUBE
+    AdpcmDecoder   adpcmDec;
+    SoundAdpcmInfo adpcmInfo;
+    uint8_t*       adpcmBlock = nullptr;    // a block of each channel as read from the disc (channels * interleave bytes)
+    uint32_t       adpcmBlockAt = 0;        // the next block's place in a channel's data
+    uint32_t       adpcmBlockLen = 0;       // a channel's bytes in the block read
+    uint32_t       adpcmBlockFrame = 0;     // its next frame to decode
+    uint8_t        adpcmPend[DspAdpcm::kSamplesPerFrame * 4];   // a frame decoded, not all of it handed out yet
+    uint32_t       adpcmPendAt = 0;
+    uint32_t       adpcmPendLen = 0;
+#endif
     // Opened by the I/O thread (OPEN_*): while REQUESTED only it touches vf, the disc source and
     // buf[0]; DONE hands them back with the first buffer decoded (openFilled bytes), and the voice
     // is set as AUD_Play asked (the open* fields).
@@ -293,6 +387,46 @@ static void StreamRawRewind(StreamVoice* sv)
         sv->disc.pos = 0;                      // (the byte read only for the window: read again from it)
 }
 
+#if PLATFORM_GAMECUBE
+// A DSP-ADPCM stream's next block of each channel read from the disc, from its place in the file (so a failed read is
+// read again from there). False: a read failed (DiscRead logged it), or there's no more.
+static bool StreamAdpcmReadBlock(StreamVoice* sv)
+{
+    const SoundAdpcmInfo& a = sv->adpcmInfo;
+    if (sv->adpcmBlockAt >= a.channelBytes)
+        return false;
+    const uint32_t len = glm::min(a.interleave, a.channelBytes - sv->adpcmBlockAt);
+    const uint32_t want = len * a.channels;
+    sv->disc.pos = sv->adpcmBlockAt * a.channels;   // (the channels' blocks in turn)
+    if (DiscRead(sv->adpcmBlock, 1, want, &sv->disc) != want)
+        return false;
+    sv->adpcmBlockAt += len;
+    sv->adpcmBlockLen = len;
+    sv->adpcmBlockFrame = 0;
+    return true;
+}
+
+// Back to its start, as it begins and at its loop: its history as at its start, nothing read.
+static void StreamAdpcmReset(StreamVoice* sv)
+{
+    AdpcmStart(sv->adpcmDec, sv->adpcmInfo);
+    sv->adpcmBlockAt = 0;
+    sv->adpcmBlockLen = 0;
+    sv->adpcmBlockFrame = 0;
+    sv->adpcmPendAt = 0;
+    sv->adpcmPendLen = 0;
+    sv->disc.pos = 0;
+}
+
+// The same, and its first block read here too (as a PCM stream's first window), so the thread decoding it next has it.
+// (Failed: read again by StreamFill.)
+static void StreamAdpcmRewind(StreamVoice* sv)
+{
+    StreamAdpcmReset(sv);
+    StreamAdpcmReadBlock(sv);
+}
+#endif
+
 static void* AudioIoThread(void*)
 {
 #if PLATFORM_GAMECUBE
@@ -321,7 +455,7 @@ static void* AudioIoThread(void*)
             }
 
             bool ok;
-            if (sv->raw)                       // PCM: nothing to open (its start read below, into the first buffers)
+            if (sv->raw || sv->adpcm)          // PCM, DSP-ADPCM: nothing to open (its start read below, into the first buffers)
                 ok = true;
             else if (sv->restart)              // kept open (StreamPark): back to its start, as a loop goes back
                 ok = (ov_pcm_seek(&sv->vf, 0) == 0);
@@ -362,6 +496,10 @@ static void* AudioIoThread(void*)
                 ov_pcm_seek(&sv->vf, 0);       // (its reads through DiscRead, here: none on the main thread)
             else if (sv->raw)
                 StreamRawRewind(sv);
+#if PLATFORM_GAMECUBE
+            else if (sv->adpcm)
+                StreamAdpcmRewind(sv);
+#endif
             __asm__ volatile("" ::: "memory");
             sv->loopState = LOOP_DONE;
         }
@@ -513,6 +651,57 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
 {
     uint32_t written = 0;
     int32_t errors = 0;
+
+#if PLATFORM_GAMECUBE
+    if (sv->adpcm)
+    {
+        // DSP-ADPCM as it plays: a frame at a time decoded from the block read off the disc (a few KB a channel). At its
+        // end, a loop goes back to its start -- asked of the I/O thread as a Vorbis loop's seek is (StreamDeferLoop), or
+        // done here.
+        while (written < want)
+        {
+            if (sv->adpcmPendAt < sv->adpcmPendLen)
+            {
+                const uint32_t n = glm::min(want - written, sv->adpcmPendLen - sv->adpcmPendAt);
+                memcpy(dst + written, sv->adpcmPend + sv->adpcmPendAt, n);
+                sv->adpcmPendAt += n;
+                written += n;
+                continue;
+            }
+            if (errors > 32)
+            {
+                LogError("Audio stream: disc reads kept failing; stream ended.");
+                sv->eof = true;
+                break;
+            }
+            if (sv->adpcmDec.sample >= sv->adpcmDec.samples)
+            {
+                if (!sv->loop)
+                {
+                    sv->eof = true;
+                    break;
+                }
+                if (StreamDeferLoop(sv))
+                    break;
+                StreamAdpcmRewind(sv);
+                ++errors;                      // (a loop with nothing in it counts as an error too)
+                continue;
+            }
+            if (sv->adpcmBlockFrame * DspAdpcm::kBytesPerFrame >= sv->adpcmBlockLen)
+            {
+                if (!StreamAdpcmReadBlock(sv))
+                    ++errors;                  // (a read failed: DiscRead logged it)
+                continue;
+            }
+            const uint32_t at = sv->adpcmBlockFrame * DspAdpcm::kBytesPerFrame;
+            const uint8_t* src[2] = { sv->adpcmBlock + at, sv->adpcmBlock + sv->adpcmBlockLen + at };
+            sv->adpcmPendLen = AdpcmDecodeFrames(sv->adpcmDec, src, 1, sv->adpcmPend);
+            sv->adpcmPendAt = 0;
+            ++sv->adpcmBlockFrame;
+        }
+        return written;
+    }
+#endif
 
     if (sv->raw)
     {
@@ -918,6 +1107,9 @@ static void StreamFree(StreamVoice* sv)
     if (sv->memOwned) { free(sv->memOwned); sv->memOwned = nullptr; }
     if (sv->disc.window) { free(sv->disc.window); sv->disc.window = nullptr; }
     if (sv->disc.ahead) { free(sv->disc.ahead); sv->disc.ahead = nullptr; }
+#if PLATFORM_GAMECUBE
+    if (sv->adpcmBlock) { free(sv->adpcmBlock); sv->adpcmBlock = nullptr; }
+#endif
     sv->disc.windowSize = 0;
     sv->active = false;
     sv->eof = false;
@@ -1404,6 +1596,69 @@ static void AramStoreWave(SoundWave* soundWave)
     soundWave->MoveWaveDataToAram(at);
 }
 
+// A DSP-ADPCM sound loaded into memory (SoundWave::LoadDspAdpcm) decoded into ARAM a piece at a time, through a 14 KB
+// buffer: its PCM is never whole in main memory, and from then on it is an ARAM sound as any other (AramVoiceStart, its
+// loops filled whole). No ARAM, or no room: decoded into main memory, a sound in main memory as any other. Called on
+// whichever thread loaded the sound.
+bool AUD_StoreAdpcm(SoundWave* soundWave, const uint8_t* data, uint32_t size)
+{
+    const SoundAdpcmInfo& a = soundWave->GetAdpcmInfo();
+    const uint32_t pcmBytes = a.samples * a.channels * 2;
+    if (pcmBytes == 0 || size < a.channels * a.channelBytes)
+        return false;
+    const uint32_t piece = (a.layout == 1) ? a.interleave : kAdpcmPieceBytes;   // a channel's bytes a piece
+
+    uint32_t at = sAramReady ? AramAlloc(pcmBytes) : 0;
+    uint8_t* bounce = (at != 0) ? (uint8_t*)memalign(32, kAdpcmPiecePcmBytes) : nullptr;
+    if (at != 0 && bounce == nullptr)
+    {
+        AUD_FreeAram(at);
+        at = 0;
+    }
+    uint8_t* pcm = nullptr;
+    if (at == 0)
+    {
+        pcm = AUD_AllocWaveBuffer(pcmBytes);
+        if (pcm == nullptr)
+        {
+            LogError("SoundWave '%s': could not allocate %u bytes of decoded audio (no ARAM for it either).",
+                     soundWave->GetName().c_str(), pcmBytes);
+            return false;
+        }
+        OctLog("ARAM full: '%s' (DSP-ADPCM, %u bytes as PCM) decoded into main memory", soundWave->GetName().c_str(), pcmBytes);
+    }
+
+    const uint64_t fromUs = SYS_GetTimeMicroseconds();
+    AdpcmDecoder dec;
+    AdpcmStart(dec, a);
+    uint32_t written = 0;
+    for (uint32_t off = 0; off < a.channelBytes && dec.sample < dec.samples; off += piece)
+    {
+        const uint32_t len = glm::min(piece, a.channelBytes - off);
+        const uint8_t* src[2];
+        for (uint32_t c = 0; c < 2; ++c)
+        {
+            const uint32_t ch = (c < a.channels) ? c : 0;
+            src[c] = (a.layout == 1) ? data + off * a.channels + ch * len : data + ch * a.channelBytes + off;
+        }
+        uint8_t* dst = (at != 0) ? bounce : pcm + written;
+        const uint32_t n = AdpcmDecodeFrames(dec, src, len / DspAdpcm::kBytesPerFrame, dst);
+        if (at != 0 && n > 0)
+            AramDma(AR_MRAMTOARAM, bounce, at + written, n);   // (rounded up to 32: the block has room for it)
+        written += n;
+    }
+    if (bounce != nullptr)
+        free(bounce);
+
+    if (at != 0)
+        soundWave->MoveWaveDataToAram(at);
+    else
+        soundWave->SetPcmData(pcm, pcmBytes, soundWave->GetNumSamples(), 16, a.channels, soundWave->GetSampleRate());
+    OctLog("AUDIO %s: DSP-ADPCM decoded, %u KB of PCM %s, %u ms", soundWave->GetName().c_str(), written / 1024,
+           at != 0 ? "in ARAM" : "in main memory", unsigned((SYS_GetTimeMicroseconds() - fromUs) / 1000));
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Streamed tracks copied to ARAM (GameCube; the sounds a game asks for: AUD_CopyTrackToAram)
 //
@@ -1434,6 +1689,8 @@ struct AramTrack
     int32_t          channels = 2;
     int32_t          bytesPerSample = 2;
     bool             raw = false;           // PCM on the disc (SoundWave::GetDiscPcm): copied as it is, not decoded
+    bool             adpcm = false;         // DSP-ADPCM on the disc (SoundWave::GetDiscAdpcm): decoded on the CPU as it's
+    SoundAdpcmInfo   adpcmInfo;             //  copied (cheap: no Vorbis)
     uint32_t         aram = 0;              // its ARAM block (0: none)
     uint32_t         pcmBytes = 0;          // the PCM in it, once READY
     // FREE -> PENDING (TrackRegister) -> DECODING (the track thread's) -> READY or SKIPPED (still streamed); back to
@@ -1491,6 +1748,9 @@ static void TrackRegister(SoundWave* wave)
         slot->channels = (int32_t)wave->GetNumChannels();
         slot->bytesPerSample = int32_t(bits / 8);
         slot->raw = wave->GetDiscPcm();
+        slot->adpcm = wave->GetDiscAdpcm();
+        if (slot->adpcm)
+            slot->adpcmInfo = wave->GetAdpcmInfo();
         slot->aram = 0;
         slot->pcmBytes = 0;
         slot->released = false;
@@ -1526,13 +1786,26 @@ static void TrackDecode(AramTrack* t)
     sTrackDisc.ahead = nullptr;               // (no read-ahead: it reads here, in its own time)
     sTrackDisc.aheadState = AHEAD_EMPTY;
     uint8_t* stage = (uint8_t*)memalign(32, kTrackChunkBytes);
+    static_assert(kAdpcmPiecePcmBytes <= kTrackChunkBytes, "A DSP-ADPCM block's PCM fits the stage");
+    const SoundAdpcmInfo& adpcm = t->adpcmInfo;
+    uint8_t* adpcmBlock = t->adpcm ? (uint8_t*)malloc(adpcm.channels * adpcm.interleave) : nullptr;
 
     const char* why = nullptr;
     bool opened = false;
     uint32_t pcm = 0;
     uint32_t freeBytes = 0;
-    if (sTrackDisc.window == nullptr || stage == nullptr)
+    if (sTrackDisc.window == nullptr || stage == nullptr || (t->adpcm && adpcmBlock == nullptr))
         why = "no memory to decode it";
+    else if (t->adpcm)
+    {
+        pcm = adpcm.samples * adpcm.channels * 2;   // (16-bit, as it decodes)
+        uint32_t total = 0, sounds = 0;
+        AUD_GetAramStats(total, freeBytes, sounds);
+        if (pcm == 0 || adpcm.interleave == 0 || adpcm.interleave > kAdpcmPieceBytes)
+            why = "no audio in it";
+        else if (freeBytes < pcm + kTrackAramReserve || (t->aram = AramAlloc(pcm)) == 0)
+            why = "no room";
+    }
     else if (t->raw)
     {
         pcm = t->size - t->size % frameBytes;   // (PCM already: its size is all there is to know)
@@ -1590,6 +1863,43 @@ static void TrackDecode(AramTrack* t)
     if (t->raw)
         eof = true;
 
+    // DSP-ADPCM: a block of each channel read at a time (the channels' blocks in turn on the disc), decoded into `stage`
+    // and copied to the block. Every block but the last is whole, so each copy starts 32-byte aligned.
+    if (t->adpcm && why == nullptr)
+    {
+        AdpcmDecoder dec;
+        AdpcmStart(dec, adpcm);
+        uint32_t at = 0;                        // a channel's data read so far
+        while (written < pcm)
+        {
+            if (t->released)
+            {
+                why = "stopped";
+                break;
+            }
+            const uint32_t len = (at < adpcm.channelBytes) ? glm::min(adpcm.interleave, adpcm.channelBytes - at) : 0;
+            if (len == 0)
+            {
+                why = "short of its samples";
+                break;
+            }
+            if (DiscRead(adpcmBlock, 1, len * adpcm.channels, &sTrackDisc) != len * adpcm.channels)
+            {
+                why = "a disc read failed";
+                break;
+            }
+            const uint8_t* src[2] = { adpcmBlock, adpcmBlock + len };
+            const uint32_t n = AdpcmDecodeFrames(dec, src, len / DspAdpcm::kBytesPerFrame, stage);
+            AramDma(AR_MRAMTOARAM, stage, t->aram + written, n);   // (rounded up to 32: the block has room for it)
+            written += n;
+            at += len;
+            if (!sTrackRush)
+                usleep(1000);                // (a rest each block, as below)
+        }
+    }
+    if (t->adpcm)
+        eof = true;
+
     while (why == nullptr && !eof)
     {
         if (t->released)
@@ -1632,6 +1942,7 @@ static void TrackDecode(AramTrack* t)
     if (opened) ov_clear(&sTrackVf);
     if (sTrackDisc.window) { free(sTrackDisc.window); sTrackDisc.window = nullptr; }
     if (stage) free(stage);
+    if (adpcmBlock) free(adpcmBlock);
     sTrackDisc.windowSize = 0;
 
     const uint32_t ms = uint32_t((SYS_GetTimeMicroseconds() - fromUs) / 1000);
@@ -1660,7 +1971,8 @@ static void TrackDecode(AramTrack* t)
     LWP_MutexUnlock(sTrackMutex);
 
     if (why == nullptr)
-        LogWarning("AUDIO %s in ARAM: %u KB, %u ms%s", name, written / 1024, ms, t->raw ? " (PCM, copied)" : "");
+        LogWarning("AUDIO %s in ARAM: %u KB, %u ms%s", name, written / 1024, ms,
+                   t->raw ? " (PCM, copied)" : (t->adpcm ? " (DSP-ADPCM, decoded)" : ""));
     else if (strcmp(why, "no room") == 0)
         LogWarning("AUDIO %s not in ARAM: %u KB, %u KB free (it streams)", name, pcm / 1024, freeBytes / 1024);
     else
@@ -2148,6 +2460,16 @@ void AUD_Play(
         sv->buf[0] = sv->buf[1] = sv->buf[2] = nullptr;
         sv->memOwned = nullptr;
         sv->raw = fromDisc && soundWave->GetDiscPcm();   // (never parked, so never a restart)
+        sv->adpcm = false;
+#if PLATFORM_GAMECUBE
+        sv->adpcm = fromDisc && soundWave->GetDiscAdpcm();   // (nor this)
+        if (sv->adpcm)
+        {
+            sv->adpcmInfo = soundWave->GetAdpcmInfo();
+            sv->adpcmBlock = (uint8_t*)malloc(sv->adpcmInfo.channels * sv->adpcmInfo.interleave);
+            StreamAdpcmReset(sv);
+        }
+#endif
 
         if (fromDisc)
         {
@@ -2174,19 +2496,26 @@ void AUD_Play(
             // Opened by the I/O thread when there is one (asked below, once the buffers are made);
             // here only without one.
             ov_callbacks dcb = { DiscRead, DiscSeek, MemClose, DiscTell };
-            if (sv->disc.window == nullptr ||
-                (sAudioIoSem == LWP_SEM_NULL && !sv->raw && ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) < 0))
+            bool noBlock = false;   // (a DSP-ADPCM stream's block buffer: none, no memory)
+#if PLATFORM_GAMECUBE
+            noBlock = sv->adpcm && sv->adpcmBlock == nullptr;
+#endif
+            if (sv->disc.window == nullptr || noBlock ||
+                (sAudioIoSem == LWP_SEM_NULL && !sv->raw && !sv->adpcm && ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) < 0))
             {
                 LogError("SoundWave '%s': failed to open Vorbis stream on disc.", soundWave->GetName().c_str());
                 WaitReadAhead(&sv->disc);
                 if (sv->disc.window) { free(sv->disc.window); sv->disc.window = nullptr; }
                 if (sv->disc.ahead) { free(sv->disc.ahead); sv->disc.ahead = nullptr; }
+#if PLATFORM_GAMECUBE
+                if (sv->adpcmBlock) { free(sv->adpcmBlock); sv->adpcmBlock = nullptr; }
+#endif
                 if (sv->vfOpen) { ov_clear(&sv->vf); sv->vfOpen = false; }   // (a restart's kept decoder)
                 sv->active = false;
                 return;
             }
             if (!restart)
-                sv->vfOpen = (sAudioIoSem == LWP_SEM_NULL && !sv->raw);
+                sv->vfOpen = (sAudioIoSem == LWP_SEM_NULL && !sv->raw && !sv->adpcm);
         }
         else
         {

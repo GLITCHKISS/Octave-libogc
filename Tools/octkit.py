@@ -123,6 +123,31 @@ def write_music(path, name, source, uuid=None, rate=32000, channels=2, quality=4
     _write(path, d)
 
 
+GC_CODECS = {'default': 0, 'pcm': 1, 'adpcm': 2}   # SoundWave's GameCube Codec (GcSoundCodec)
+
+
+def set_sound_gc_codec(path, codec):
+    """A SoundWave asset's GameCube Codec set in place: 'default' (Config.ini's GameCubeSoundCodec), 'pcm' or 'adpcm'
+    (DSP-ADPCM). Only the GameCube cook acts on it. Its byte follows Max Instances: at 38 + the name's length (the
+    header's 21 bytes, the name's u32 length and bytes, volume, pitch, class, compress, compress internal, stream, max
+    instances). An asset saved before it (version 15-19, as write_sound writes) gains the byte and version 20, as the
+    editor's next save would write it."""
+    value = GC_CODECS[codec] if isinstance(codec, str) else int(codec)
+    if value not in GC_CODECS.values():
+        raise ValueError(f'{path}: GameCube codec {codec!r}')
+    d = bytearray(Path(path).read_bytes())
+    magic, version, type_id = struct.unpack_from('<III', d, 0)
+    if magic != ASSET_MAGIC or type_id != TYPE_SOUNDWAVE or version < 15:
+        raise ValueError(f'{path}: not a SoundWave asset of version 15 or later')
+    at = 25 + struct.unpack_from('<I', d, 21)[0] + 13
+    if version >= 20:
+        d[at] = value
+    else:
+        d[at:at] = bytes([value])
+        struct.pack_into('<I', d, 4, 20)
+    _write(path, bytes(d))
+
+
 def _ref(uuid, name):
     raw = (name or '').encode('ascii')
     return struct.pack('<BQI', 1, uuid or 0, len(raw)) + raw          # (a null reference: uuid 0, no name)

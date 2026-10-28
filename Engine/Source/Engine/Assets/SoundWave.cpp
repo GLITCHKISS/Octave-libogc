@@ -6,11 +6,23 @@
 #include "AudioManager.h"
 
 #include "Audio/Audio.h"
+#include "Audio/DspAdpcm.h"
 #include "System/System.h"
 #include "Engine.h"
 
+#include <cmath>
+#include <vector>
+
 FORCE_LINK_DEF(SoundWave);
 DEFINE_ASSET(SoundWave);
+
+static const char* sGcCodecStrings[] =
+{
+    "Project Default",
+    "PCM",
+    "DSP-ADPCM",
+};
+static_assert(int32_t(GcSoundCodec::Count) == 3, "Need to update string conversion table");
 
 // This is causing very loud sound corruption on 3DS, need to
 // debug this if we are going to turn it back on.
@@ -59,6 +71,7 @@ int32_t SoundWave::GetFileReadLimit(const char* path)
     // starts.
     mDiscSize = 0;
     mDiscPcm = false;
+    mDiscAdpcm = false;
 
     Stream head;
     if (!head.ReadFile(path, true, 1024))
@@ -72,10 +85,11 @@ int32_t SoundWave::GetFileReadLimit(const char* path)
     std::string name;
     head.ReadString(name);
 
-    // volume, pitch, class, compress, compress internal, stream, (max instances,) six format words,
-    // compressed, size
+    // volume, pitch, class, compress, compress internal, stream, (max instances,) (GameCube codec,) six format words,
+    // payload (compressed or not, before ASSET_VERSION_SOUND_GC_CODEC), size
     const bool maxInstances = (header.mVersion >= ASSET_VERSION_SOUND_MAX_INSTANCES);
-    const uint32_t need = 4 + 4 + 1 + 3 + (maxInstances ? 1 : 0) + 6 * 4 + 1 + 4;
+    const bool gcCodec = (header.mVersion >= ASSET_VERSION_SOUND_GC_CODEC);
+    const uint32_t need = 4 + 4 + 1 + 3 + (maxInstances ? 1 : 0) + (gcCodec ? 1 : 0) + 6 * 4 + 1 + 4;
     if (header.mVersion < ASSET_VERSION_SOUND_STREAM || head.GetPos() + need > head.GetSize())
     {
         return 0;
@@ -91,11 +105,52 @@ int32_t SoundWave::GetFileReadLimit(const char* path)
     {
         head.ReadUint8();
     }
-    for (uint32_t i = 0; i < 6; ++i)
+    if (gcCodec)
+    {
+        head.ReadUint8();
+    }
+    const uint32_t channels = head.ReadUint32();
+    for (uint32_t i = 1; i < 6; ++i)
     {
         head.ReadUint32();
     }
-    bool compressed = head.ReadBool();
+    const uint8_t payload = gcCodec ? head.ReadUint8() : uint8_t(head.ReadBool() ? SOUND_PAYLOAD_VORBIS : SOUND_PAYLOAD_PCM);
+    bool compressed = (payload == SOUND_PAYLOAD_VORBIS);
+
+#if PLATFORM_GAMECUBE
+    if (payload == SOUND_PAYLOAD_DSP_ADPCM)
+    {
+        // DSP-ADPCM (GameCube Codec): a Stream sound's nibble data is left on the disc, decoded as it plays or as it's
+        // copied to ARAM; the headers before it load (LoadDspAdpcm). Its blocks are as the cook lays out a Stream
+        // sound's (SOUND_ADPCM_INTERLEAVE): anything else is loaded whole and decoded into ARAM, as a sound effect is.
+        if (!streamed || head.GetPos() + 4 + 16 > head.GetSize())
+        {
+            return 0;
+        }
+        head.ReadUint32();                                  // (the payload's size)
+        const uint32_t blockAt = head.GetPos();
+        const uint32_t adpcmChannels = head.ReadUint8();
+        const uint32_t layout = head.ReadUint8();
+        head.ReadUint16();
+        const uint32_t interleave = head.ReadUint32();
+        const uint32_t channelBytes = head.ReadUint32();
+        if (adpcmChannels < 1 || adpcmChannels > 2 || adpcmChannels != channels || layout != 1 ||
+            interleave != SOUND_ADPCM_INTERLEAVE || channelBytes == 0 || (channelBytes & 31) != 0)
+        {
+            return 0;
+        }
+        mDiscSize = adpcmChannels * channelBytes;
+        mDiscOffset = blockAt + ((16 + DspAdpcm::kHeaderSize * adpcmChannels + 31) & ~31u);
+        mDiscPath = path;
+        mDiscAdpcm = true;
+        return int32_t(mDiscOffset);
+    }
+#endif
+    (void)channels;
+    if (payload > SOUND_PAYLOAD_VORBIS)
+    {
+        return 0;   // (loaded whole: LoadStream says what it can't play)
+    }
 
     // (PCM left on the disc only with AudioDecodeThread=1, as the rest of the ARAM tracks: without it, an uncompressed
     //  Stream sound is loaded whole, as ever)
@@ -133,6 +188,14 @@ void SoundWave::LoadStream(Stream& stream, Platform platform)
     {
         mMaxInstances = stream.ReadUint8();
     }
+    if (stream.GetAssetVersion() >= ASSET_VERSION_SOUND_GC_CODEC)
+    {
+        mGcCodec = stream.ReadUint8();
+        if (mGcCodec >= int32_t(GcSoundCodec::Count))
+        {
+            mGcCodec = int32_t(GcSoundCodec::ProjectDefault);
+        }
+    }
 
     // Waveform Format
     mNumChannels = stream.ReadUint32();
@@ -142,7 +205,19 @@ void SoundWave::LoadStream(Stream& stream, Platform platform)
     mBlockAlign = stream.ReadUint32();
     mByteRate = stream.ReadUint32();
 
-    bool compressed = stream.ReadBool();
+    const uint8_t payload = (stream.GetAssetVersion() >= ASSET_VERSION_SOUND_GC_CODEC) ?
+        stream.ReadUint8() : uint8_t(stream.ReadBool() ? SOUND_PAYLOAD_VORBIS : SOUND_PAYLOAD_PCM);
+    if (payload == SOUND_PAYLOAD_DSP_ADPCM)
+    {
+        LoadDspAdpcm(stream);
+        return;
+    }
+    if (payload > SOUND_PAYLOAD_DSP_ADPCM)
+    {
+        LogError("SoundWave '%s': unknown audio (%u); no sound.", GetName().c_str(), uint32_t(payload));
+        return;
+    }
+    bool compressed = (payload == SOUND_PAYLOAD_VORBIS);
 
     if (compressed)
     {
@@ -242,6 +317,16 @@ void SoundWave::SaveStream(Stream& stream, Platform platform)
     stream.WriteBool(mCompressInternal);
     stream.WriteBool(mStream);
     stream.WriteUint8(mMaxInstances);
+    stream.WriteUint8(uint8_t(mGcCodec));
+
+#if EDITOR
+    // GameCube Codec: DSP-ADPCM is the GameCube cook's alone. Every other platform, and the source asset (Platform::Count),
+    // as ever below -- as is a sound it can't be made of (logged).
+    if (platform == Platform::GameCube && CooksAsDspAdpcm() && SaveDspAdpcm(stream))
+    {
+        return;
+    }
+#endif
 
     uint32_t numChannels = mNumChannels;
     uint32_t bitsPerSample = mBitsPerSample;
@@ -366,7 +451,7 @@ void SoundWave::SaveStream(Stream& stream, Platform platform)
         compress = (mCompress && mCompressInternal);
     }
 
-    stream.WriteBool(compress);
+    stream.WriteUint8(compress ? SOUND_PAYLOAD_VORBIS : SOUND_PAYLOAD_PCM);   // (the bool it was: the same byte)
 
     if (compress)
     {
@@ -410,6 +495,224 @@ void SoundWave::SaveStream(Stream& stream, Platform platform)
         lqWaveData = nullptr;
     }
 }
+
+// A GameCube cook's DSP-ADPCM (SaveDspAdpcm), after its payload byte: the block's headers read, then its data decoded
+// into ARAM (AUD_StoreAdpcm) -- or, a Stream sound's left on the disc by GetFileReadLimit, left there: decoded as it
+// plays, or as it's copied to ARAM (Audio_Dolphin). Only the GameCube reads one: no other build loads a GameCube cook.
+void SoundWave::LoadDspAdpcm(Stream& stream)
+{
+    const uint32_t payloadSize = stream.ReadUint32();
+#if PLATFORM_GAMECUBE && !EDITOR
+    const uint32_t blockAt = stream.GetPos();
+    SoundAdpcmInfo info;
+    const char* why = nullptr;
+    uint32_t headers = 0;
+    if (blockAt + 16 > stream.GetSize())
+    {
+        why = "cut short";
+    }
+    else
+    {
+        info.channels = stream.ReadUint8();
+        info.layout = stream.ReadUint8();
+        stream.ReadUint16();
+        info.interleave = stream.ReadUint32();
+        info.channelBytes = stream.ReadUint32();
+        stream.ReadUint32();                                // (the loop's start: 0, the whole sound loops)
+        headers = (16 + DspAdpcm::kHeaderSize * info.channels + 31) & ~31u;
+        if (info.channels < 1 || info.channels > 2 || info.channels != mNumChannels)
+            why = "its channels";
+        else if (info.layout > 1 || (info.layout == 1 && (info.interleave < 32 || info.interleave > SOUND_ADPCM_INTERLEAVE ||
+                                                          (info.interleave & 31) != 0)))
+            why = "its layout";
+        else if ((info.channelBytes & 31) != 0 || payloadSize < headers + info.channels * info.channelBytes)
+            why = "its size";
+        else if (blockAt + headers > stream.GetSize())
+            why = "cut short";
+    }
+    for (uint32_t c = 0; c < info.channels && why == nullptr; ++c)
+    {
+        uint8_t hdr[DspAdpcm::kHeaderSize];
+        stream.ReadBytes(hdr, DspAdpcm::kHeaderSize);
+        DspAdpcm::Channel ch;
+        if (!DspAdpcm::ReadHeader(hdr, ch) || ch.numSamples == 0 || (c > 0 && ch.numSamples != info.samples) ||
+            DspAdpcm::DataBytes(ch.numSamples) > info.channelBytes)
+        {
+            why = "its headers";
+            break;
+        }
+        info.samples = ch.numSamples;
+        memcpy(info.coefs[c], ch.coefs, sizeof(ch.coefs));
+        info.yn1[c] = ch.yn1;
+        info.yn2[c] = ch.yn2;
+    }
+    if (why != nullptr)
+    {
+        LogError("SoundWave '%s': DSP-ADPCM unreadable (%s); no sound.", GetName().c_str(), why);
+        return;
+    }
+    mAdpcm = info;
+
+    if (mStream && mDiscAdpcm && mDiscSize > 0)
+    {
+        // Left on the disc (GetFileReadLimit stopped the load at its data): nothing more here to read.
+        AUD_ProcessWaveBuffer(this);
+        return;
+    }
+
+    // In memory: a sound effect, or a Stream sound with no file to go back to (an embedded build). Its PCM (as
+    // GetWaveDataSize gives it) goes to ARAM, decoded a piece at a time.
+    const uint32_t dataAt = blockAt + headers;
+    const uint32_t dataBytes = info.channels * info.channelBytes;
+    if (dataAt + dataBytes > stream.GetSize())
+    {
+        LogError("SoundWave '%s': DSP-ADPCM cut short; no sound.", GetName().c_str());
+        mAdpcm = SoundAdpcmInfo();
+        return;
+    }
+    mWaveDataSize = info.samples * info.channels * 2;
+    if (!AUD_StoreAdpcm(this, (const uint8_t*)stream.GetData() + dataAt, dataBytes))
+    {
+        mWaveDataSize = 0;
+    }
+    stream.SetPos(dataAt + dataBytes);
+#else
+    (void)payloadSize;
+    LogError("SoundWave '%s': DSP-ADPCM is a GameCube cook's; it doesn't play here.", GetName().c_str());
+#endif
+}
+
+#if EDITOR
+bool SoundWave::CooksAsDspAdpcm() const
+{
+    switch (GcSoundCodec(mGcCodec))
+    {
+    case GcSoundCodec::DspAdpcm:
+        return true;
+    case GcSoundCodec::Pcm:
+        return false;
+    default:
+        // Project Default: Config.ini's, for sounds that aren't Stream (a Stream sound's footprint and load path change
+        // with it -- about 3x its Vorbis on the disc -- so it's marked one by one).
+        return !mStream && GetEngineConfig()->mGameCubeSoundCodec == 1;
+    }
+}
+
+// The GameCube cook's DSP-ADPCM (GameCube Codec). Each channel is encoded on its own (DspAdpcm: Nintendo's method),
+// loop-ready from its first sample, so the same bytes play once or loop (a sound loops or not as it's played, not as
+// it's cooked; a loop from sample 0 decodes the same every time round). Written after the properties, in place of the
+// format words and the PCM:
+//   the format words: channels, 16 (what it decodes to), rate, samples (all channels', as ever), 2 * channels, byte rate
+//   u8 payload (SOUND_PAYLOAD_DSP_ADPCM), u32 the bytes after this word
+//   u8 channels, u8 layout (0: the channels one after the other; 1, a Stream sound's: blocks of `interleave` bytes a
+//   channel in turn), u16 0, u32 interleave (0 for layout 0), u32 a channel's data bytes (whole 8-byte frames, padded to
+//   32), u32 the loop's start (0)
+//   a channel's standard 0x60-byte DSP header each (big-endian: DspAdpcm::WriteHeader); zeros to 32 bytes from the u8
+//   channels on
+//   the data
+// False: it can't be made of this sound -- logged, and nothing written: it's cooked as PCM.
+bool SoundWave::SaveDspAdpcm(Stream& stream)
+{
+    const uint32_t channels = mNumChannels;
+    const uint32_t samples = (channels == 1 || channels == 2) ? mNumSamples / channels : 0;   // a channel's
+    const uint32_t bytesPerSample = mBitsPerSample / 8;
+    const char* why = nullptr;
+    if (channels != 1 && channels != 2)
+        why = "not mono or stereo";
+    else if (mBitsPerSample != 8 && mBitsPerSample != 16)
+        why = "not 8 or 16-bit";
+    else if (mWaveData == nullptr || samples == 0)
+        why = "no audio";
+    else if (mWaveDataSize < samples * channels * bytesPerSample)
+        why = "short of its samples";
+    if (why != nullptr)
+    {
+        LogWarning("AUDIO cook %s: not DSP-ADPCM (%s): PCM", GetName().c_str(), why);
+        return false;
+    }
+
+    // 16-bit, the channels interleaved: as it is (little-endian), or from 8-bit unsigned.
+    std::vector<int16_t> pcm(size_t(samples) * channels);
+    for (size_t i = 0; i < pcm.size(); ++i)
+    {
+        if (bytesPerSample == 2)
+            pcm[i] = int16_t(uint16_t(mWaveData[i * 2]) | (uint16_t(mWaveData[i * 2 + 1]) << 8));
+        else
+            pcm[i] = int16_t((int32_t(mWaveData[i]) - 128) * 256);
+    }
+
+    const uint32_t channelBytes = DspAdpcm::DataBytesAram(samples);
+    const uint32_t layout = mStream ? 1 : 0;
+    const uint32_t interleave = mStream ? SOUND_ADPCM_INTERLEAVE : 0;
+    const uint32_t headers = (16 + DspAdpcm::kHeaderSize * channels + 31) & ~31u;
+    const uint32_t dataBytes = channels * channelBytes;
+
+    DspAdpcm::Channel enc[2];
+    double signal = 0.0;
+    double noise = 0.0;
+    for (uint32_t c = 0; c < channels; ++c)
+    {
+        std::vector<int16_t> decoded;   // (what the console will play)
+        DspAdpcm::Encode(pcm.data() + c, samples, channels, mSampleRate, true, 0, samples - 1, enc[c], &decoded);
+        for (uint32_t s = 0; s < samples; ++s)
+        {
+            const double x = pcm[size_t(s) * channels + c];
+            const double e = x - decoded[s];
+            signal += x * x;
+            noise += e * e;
+        }
+        enc[c].data.resize(channelBytes, 0);
+    }
+
+    stream.WriteUint32(channels);
+    stream.WriteUint32(16);
+    stream.WriteUint32(mSampleRate);
+    stream.WriteUint32(mNumSamples);
+    stream.WriteUint32(2 * channels);
+    stream.WriteUint32(mSampleRate * 2 * channels);
+
+    stream.WriteUint8(SOUND_PAYLOAD_DSP_ADPCM);
+    stream.WriteUint32(headers + dataBytes);
+
+    stream.WriteUint8(uint8_t(channels));
+    stream.WriteUint8(uint8_t(layout));
+    stream.WriteUint16(0);
+    stream.WriteUint32(interleave);
+    stream.WriteUint32(channelBytes);
+    stream.WriteUint32(0);
+    for (uint32_t c = 0; c < channels; ++c)
+    {
+        uint8_t hdr[DspAdpcm::kHeaderSize];
+        DspAdpcm::WriteHeader(enc[c], hdr);
+        stream.WriteBytes(hdr, DspAdpcm::kHeaderSize);
+    }
+    for (uint32_t i = 16 + DspAdpcm::kHeaderSize * channels; i < headers; ++i)
+    {
+        stream.WriteUint8(0);
+    }
+    if (layout == 0)
+    {
+        for (uint32_t c = 0; c < channels; ++c)
+            stream.WriteBytes(enc[c].data.data(), channelBytes);
+    }
+    else
+    {
+        for (uint32_t at = 0; at < channelBytes; at += interleave)
+        {
+            const uint32_t len = glm::min<uint32_t>(interleave, channelBytes - at);
+            for (uint32_t c = 0; c < channels; ++c)
+                stream.WriteBytes(enc[c].data.data() + at, len);
+        }
+    }
+
+    const double snr = (noise > 0.0 && signal > 0.0) ? 10.0 * log10(signal / noise) : 99.0;
+    LogDebug("AUDIO cook %s: DSP-ADPCM, %u ch, %u KB (PCM %u KB), SNR %.1f dB%s%s%s", GetName().c_str(), channels,
+             (headers + dataBytes + 1023) / 1024, (mWaveDataSize + 1023) / 1024, snr, mStream ? ", Stream (blocks)" : "",
+             mCompress ? "; Compress ignored on GameCube" : "",
+             (mCompress && mCompressInternal) ? "; from its Vorbis (Compress Internal): lossy twice" : "");
+    return true;
+}
+#endif
 
 void SoundWave::Create()
 {
@@ -537,6 +840,10 @@ void SoundWave::GatherProperties(std::vector<Property>& outProps)
     outProps.push_back(Property(DatumType::Bool, "Compress Internal", this, &mCompressInternal, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Bool, "Stream", this, &mStream, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Byte, "Max Instances", this, &mMaxInstances, 1, HandlePropChange));
+    // GameCube builds only (the GameCube cook): DSP-ADPCM is 3.5x smaller, decoded on the console; lossy, so listen on
+    // the console first. Project Default: Config.ini's GameCubeSoundCodec (for sounds that aren't Stream).
+    outProps.push_back(Property(DatumType::Integer, "GameCube Codec", this, &mGcCodec, 1, HandlePropChange, NULL_DATUM,
+                                int32_t(GcSoundCodec::Count), sGcCodecStrings));
 }
 
 glm::vec4 SoundWave::GetTypeColor()
