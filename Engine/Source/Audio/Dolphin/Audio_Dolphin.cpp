@@ -1358,7 +1358,7 @@ static void AramStoreWave(SoundWave* soundWave)
 }
 
 // ---------------------------------------------------------------------------
-// Streamed tracks copied to ARAM (GameCube; Config.ini AudioDecodeThread=1)
+// Streamed tracks copied to ARAM (GameCube; the sounds a game asks for: AUD_CopyTrackToAram)
 //
 // (A track cooked uncompressed -- Stream on, Compress off -- is PCM on the disc already: copied to ARAM as it is, with
 // no Vorbis on the console at all. What follows is for one cooked as Vorbis.)
@@ -1647,10 +1647,40 @@ static void* AudioTrackThread(void*)
     return nullptr;
 }
 
+// A disc-streamed sound copied into ARAM (AramTrack) and played from there once whole -- the game's choice, a sound at a
+// time: what isn't asked for streams as ever (long music that would take too much ARAM, say). The track thread (far
+// below the main thread; 128 KB, as the I/O thread: it opens and decodes, and reads the disc) made the first time.
+// Then AUD_WaitForTracks on a loading screen, or the copy's made in the background. False: not a disc stream it can
+// copy (or no ARAM).
+bool AUD_CopyTrackToAram(SoundWave* soundWave)
+{
+    if (soundWave == nullptr || !sAramReady || !soundWave->GetStream() || soundWave->GetDiscSize() == 0)
+        return false;
+    if (sTrackSem == LWP_SEM_NULL)
+    {
+        if (sTrackMutex == LWP_MUTEX_NULL && LWP_MutexInit(&sTrackMutex, false) != 0)
+            return false;
+        if (LWP_SemInit(&sTrackSem, 0, 64) != 0)
+        {
+            sTrackSem = LWP_SEM_NULL;
+            return false;
+        }
+        if (LWP_CreateThread(&sAudioTrackThread, AudioTrackThread, nullptr, nullptr, 128 * 1024, kTrackPriority) != 0)
+        {
+            LWP_SemDestroy(sTrackSem);
+            sTrackSem = LWP_SEM_NULL;
+            sAudioTrackThread = LWP_THREAD_NULL;
+            return false;
+        }
+    }
+    TrackRegister(soundWave);
+    return true;
+}
+
 // The tracks registered so far made now, while the game loads: the main thread sleeps till none is waiting or being
 // made (or timeoutMs), so the track thread -- below everything -- has the CPU, without its rests. Loading takes that
-// much longer (a few seconds for a few MB of Vorbis); a track then never streams in play. Nothing without
-// AudioDecodeThread=1.
+// much longer (a few seconds for a few MB of Vorbis); a track then never streams in play. Nothing without a
+// track asked for (AUD_CopyTrackToAram).
 void AUD_WaitForTracks(uint32_t timeoutMs)
 {
     if (sTrackSem == LWP_SEM_NULL)
@@ -1797,23 +1827,7 @@ void AUD_Initialize()
         sAudioDecodeThread = LWP_THREAD_NULL;
     }
 
-#if PLATFORM_GAMECUBE
-    // The track thread (AudioTrackThread): streamed tracks copied to ARAM, with the decode thread (AudioDecodeThread=1).
-    // 128 KB, as the I/O thread: it opens and decodes, and reads the disc (libfat). Without it, tracks only stream.
-    if (GetEngineConfig()->mAudioDecodeThread && sAramReady && LWP_MutexInit(&sTrackMutex, false) == 0)
-    {
-        if (LWP_SemInit(&sTrackSem, 0, 64) != 0)
-        {
-            sTrackSem = LWP_SEM_NULL;
-        }
-        else if (LWP_CreateThread(&sAudioTrackThread, AudioTrackThread, nullptr, nullptr, 128 * 1024, kTrackPriority) != 0)
-        {
-            LWP_SemDestroy(sTrackSem);
-            sTrackSem = LWP_SEM_NULL;
-            sAudioTrackThread = LWP_THREAD_NULL;
-        }
-    }
-#endif
+    // (the track thread: made by the first AUD_CopyTrackToAram -- a game that copies no track has none)
 }
 
 void AUD_Shutdown()
@@ -2350,8 +2364,8 @@ void AUD_FreeWaveBuffer(void* buffer)
 void AUD_ProcessWaveBuffer(SoundWave* soundWave)
 {
 #if PLATFORM_GAMECUBE
-    AramStoreWave(soundWave);     // a sound effect's PCM moves to ARAM
-    TrackRegister(soundWave);     // a disc stream's copy made in ARAM, in the background (AramTrack)
+    AramStoreWave(soundWave);     // a sound effect's PCM moves to ARAM (a disc stream's only when asked:
+                                  //  AUD_CopyTrackToAram)
 #else
     (void)soundWave;
 #endif
