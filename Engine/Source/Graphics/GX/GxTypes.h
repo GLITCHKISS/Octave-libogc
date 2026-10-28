@@ -16,6 +16,7 @@ struct LightingState
     uint8_t mLightMask = 0;
     uint8_t mDiffuseFunc = GX_DF_CLAMP;
     uint8_t mAttenuationFunc = GX_AF_SPOT;
+    uint8_t mSpecularMask = 0;   // (not 0: COLOR1 is the material's specular, lit by this light alone)
 
     LightingState()
     {
@@ -41,7 +42,8 @@ struct LightingState
             mMaterialSrc == other.mMaterialSrc &&
             mLightMask == other.mLightMask &&
             mDiffuseFunc == other.mDiffuseFunc &&
-            mAttenuationFunc == other.mAttenuationFunc;
+            mAttenuationFunc == other.mAttenuationFunc &&
+            mSpecularMask == other.mSpecularMask;
     }
 
     bool operator!=(const LightingState& other) const
@@ -60,6 +62,13 @@ struct GxContext
     uint8_t mSceneLightMask = 0;
     uint8_t mSceneNumLights = 0;
     LightData mLightData[MAX_LIGHTS_PER_DRAW];
+
+    // The first directional light, for specular: its direction in view space and its colour.
+    bool mHasSpecLight = false;
+    glm::vec3 mSpecDirVS = glm::vec3(0.0f, 0.0f, -1.0f);
+    GXColor mSpecColor = { 0, 0, 0, 255 };
+    glm::vec3 mSpecHalfVS = glm::vec3(0.0f, 0.0f, 1.0f);   // (its half vector with the view, in view space)
+    bool mSpecTexBound = false;                             // (the bound material samples the lobe texture)
 
     // Fog
     bool mApplyFog = true;

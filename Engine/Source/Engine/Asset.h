@@ -37,7 +37,8 @@ class AssetDir;
 #define ASSET_VERSION_SKELETAL_MORPHS 16
 #define ASSET_VERSION_ALPHA_BAND_CUSTOM_MIPS 17   // (MaterialLite's alpha band; Texture's mip bias, its own mips)
 #define ASSET_VERSION_FRESNEL_ALPHA 18            // (MaterialLite's Fresnel as its opacity)
-#define ASSET_VERSION_CURRENT 18
+#define ASSET_VERSION_SHARP_SPECULAR 19           // (MaterialLite's per-pixel specular on the GameCube)
+#define ASSET_VERSION_CURRENT 19
 // ----------------------------------------------------
 
 #define DECLARE_ASSET(Base, Parent) DECLARE_FACTORY(Base, Asset); DECLARE_OBJECT(Base, Parent);

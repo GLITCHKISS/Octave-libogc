@@ -195,6 +195,11 @@ void MaterialLite::LoadStream(Stream& stream, Platform platform)
     {
         mLiteParams.mFresnelAlpha = stream.ReadBool();
     }
+
+    if (mVersion >= ASSET_VERSION_SHARP_SPECULAR)
+    {
+        mLiteParams.mSharpSpecular = stream.ReadBool();
+    }
 }
 
 void MaterialLite::SaveStream(Stream& stream, Platform platform)
@@ -239,6 +244,7 @@ void MaterialLite::SaveStream(Stream& stream, Platform platform)
     stream.WriteFloat(mLiteParams.mAlphaKeepAbove);
     stream.WriteBool(mLiteParams.mMipBiasFollowsHeight);
     stream.WriteBool(mLiteParams.mFresnelAlpha);
+    stream.WriteBool(mLiteParams.mSharpSpecular);
 }
 
 void MaterialLite::Create()
@@ -313,6 +319,7 @@ void MaterialLite::GatherProperties(std::vector<Property>& outProps)
     outProps.push_back(Property(DatumType::Bool, "Disable Depth Test", this, &mLiteParams.mDisableDepthTest, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Bool, "Fresnel", this, &mLiteParams.mFresnelEnabled, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Bool, "Fresnel Alpha", this, &mLiteParams.mFresnelAlpha, 1, HandlePropChange));
+    outProps.push_back(Property(DatumType::Bool, "Sharp Specular", this, &mLiteParams.mSharpSpecular, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Color, "Fresnel Color", this, &mLiteParams.mFresnelColor, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Float, "Fresnel Power", this, &mLiteParams.mFresnelPower, 1, HandlePropChange));
     outProps.push_back(Property(DatumType::Float, "Specular", this, &mLiteParams.mSpecular, 1, HandlePropChange));

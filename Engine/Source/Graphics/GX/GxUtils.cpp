@@ -39,6 +39,7 @@ void SetupLights()
 
     gGxContext.mSceneLightMask = 0;
     gGxContext.mSceneNumLights = 0;
+    gGxContext.mHasSpecLight = false;
 
     // Light0 is reserved for directional light, in the future we might allow multiple dir lights.
     for (uint32_t i = 0; i < lightArray.size() && i < MAX_LIGHTS_PER_DRAW; ++i)
@@ -73,6 +74,15 @@ void SetupLights()
         else
         {
             GX_InitLightDistAttn(&gxLight, lightData.mRadius, 0.25f, GX_DA_MEDIUM);
+        }
+
+        if (lightData.mType == LightType::Directional && !gGxContext.mHasSpecLight)
+        {
+            glm::vec4 dirVS = cameraComp->GetViewMatrix() * glm::vec4(lightData.mDirection, 0.0f);
+            gGxContext.mSpecDirVS = glm::normalize(glm::vec3(dirVS));
+            gGxContext.mSpecColor = gxLightColor;
+            gGxContext.mSpecHalfVS = glm::normalize(-gGxContext.mSpecDirVS + glm::vec3(0.0f, 0.0f, 1.0f));
+            gGxContext.mHasSpecLight = true;
         }
 
         GX_LoadLightObj(&gxLight, GX_LIGHT0 << gGxContext.mSceneNumLights);
@@ -124,7 +134,7 @@ void SetupLightingChannels()
     {
         // If we are using vertex color modulation, then we use the first channel for that
         // since the vertex color can't go as input in the COLOR1A1 unless you have two vertex color attributes.
-        GX_SetNumChans(curState.mColorChannel ? 2 : 1);
+        GX_SetNumChans((curState.mColorChannel || curState.mSpecularMask != 0) ? 2 : 1);
 
         if (curState.mColorChannel)
         {
@@ -136,6 +146,13 @@ void SetupLightingChannels()
                 0,
                 GX_DF_NONE,
                 GX_AF_NONE);
+        }
+        else if (curState.mSpecularMask != 0)
+        {
+            // The specular: the material's specular colour (the register) lit by the specular light
+            // alone, attenuated by the angle to its half vector (GX_AF_SPEC); no ambient.
+            GX_SetChanCtrl(GX_COLOR1, GX_ENABLE, GX_SRC_REG, GX_SRC_REG, curState.mSpecularMask, GX_DF_NONE, GX_AF_SPEC);
+            GX_SetChanCtrl(GX_ALPHA1, false, GX_SRC_REG, GX_SRC_REG, 0, GX_DF_NONE, GX_AF_NONE);
         }
         else
         {
@@ -202,6 +219,7 @@ void PrepareUiRendering()
 
     gGxContext.mLighting.mColorChannel = false;
     gGxContext.mLighting.mEnabled = false;
+    gGxContext.mLighting.mSpecularMask = 0;
     gGxContext.mLighting.mMaterialSrc = GX_SRC_VTX;
 }
 
@@ -219,9 +237,72 @@ bool IsCpuSkinningRequired(SkeletalMesh3D* component)
 }
 #endif
 
+// Sharp specular: the PC renderer's Phong lobe, pow(max(V.R, 0), shininess), as a function of the angle t between
+// the normal and the light's half vector (V.R = cos 2t), baked into a texture -- its middle the half vector, its
+// edge t = 45 degrees, where the lobe is 0 -- placed by the view-space normal (LoadSpecTexMtx). One a shininess.
+static const float kSpecTexScale = 0.5f / 0.78539816f;   // (texture units a radian of t)
+struct SpecLobeTex { void* mData = nullptr; GXTexObj mObj; };
+static SpecLobeTex sSpecLobes[16];
+static int32_t sSpecLobeKeys[16];
+static uint32_t sNumSpecLobes = 0;
+
+static GXTexObj* GetSpecLobeTex(float shininess)
+{
+    const int32_t key = int32_t(shininess * 4.0f + 0.5f);
+    for (uint32_t i = 0; i < sNumSpecLobes; ++i)
+        if (sSpecLobeKeys[i] == key)
+            return &sSpecLobes[i].mObj;
+    if (sNumSpecLobes >= 16)
+        return nullptr;
+
+    const uint32_t size = 128;   // I8: tiles of 8 x 4
+    uint8_t* data = (uint8_t*)memalign(32, size * size);
+    if (data == nullptr)
+        return nullptr;
+    uint8_t* out = data;
+    for (uint32_t ty = 0; ty < size; ty += 4)
+        for (uint32_t tx = 0; tx < size; tx += 8)
+            for (uint32_t y = 0; y < 4; ++y)
+                for (uint32_t x = 0; x < 8; ++x)
+                {
+                    const float u = (float(tx + x) + 0.5f) / size - 0.5f;
+                    const float v = (float(ty + y) + 0.5f) / size - 0.5f;
+                    const float t = sqrtf(u * u + v * v) / kSpecTexScale;
+                    const float c = cosf(2.0f * t);
+                    const float lobe = (t < 0.78539816f && c > 0.0f) ? powf(c, shininess) : 0.0f;
+                    *out++ = uint8_t(glm::clamp(lobe, 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+    DCFlushRange(data, size * size);
+
+    SpecLobeTex& lobeTex = sSpecLobes[sNumSpecLobes];
+    lobeTex.mData = data;
+    GX_InitTexObj(&lobeTex.mObj, data, size, size, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GX_InitTexObjFilterMode(&lobeTex.mObj, GX_LINEAR, GX_LINEAR);
+    sSpecLobeKeys[sNumSpecLobes] = key;
+    sNumSpecLobes++;
+    return &lobeTex.mObj;
+}
+
+// The lobe texture's coordinates from the normal: (n_view - h) * scale + 0.5, h the half vector.
+static void LoadSpecTexMtx(const Mtx normalMtx, float k)
+{
+    const glm::vec3& h = gGxContext.mSpecHalfVS;
+    Mtx m;
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        m[0][c] = kSpecTexScale * k * normalMtx[0][c];
+        m[1][c] = kSpecTexScale * k * normalMtx[1][c];
+        m[2][c] = 0.0f;
+    }
+    m[0][3] = 0.5f - kSpecTexScale * h.x;
+    m[1][3] = 0.5f - kSpecTexScale * h.y;
+    m[2][3] = 1.0f;
+    GX_LoadTexMtxImm(m, GX_TEXMTX5, GX_TG_MTX3x4);
+}
+
 void LoadEnvTexMtx(const Mtx normalMtx)
 {
-    if (!gGxContext.mEnvMapBound)
+    if (!gGxContext.mEnvMapBound && !gGxContext.mSpecTexBound)
     {
         return;
     }
@@ -237,6 +318,15 @@ void LoadEnvTexMtx(const Mtx normalMtx)
         normalMtx[0][2] * (normalMtx[1][0] * normalMtx[2][1] - normalMtx[1][1] * normalMtx[2][0]);
     const float absDet = fabsf(det);
     const float k = (absDet > 1e-12f) ? 1.0f / cbrtf(absDet) : 1.0f;
+
+    if (gGxContext.mSpecTexBound)
+    {
+        LoadSpecTexMtx(normalMtx, k);
+    }
+    if (!gGxContext.mEnvMapBound)
+    {
+        return;
+    }
 
     // u = n_view.x * 0.5 + 0.5, v = -n_view.y * 0.5 + 0.5 (see UV_MAP_ENVIRONMENT); q = 1, as a
     // 3x4 texgen divides by its third row.
@@ -462,6 +552,11 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
     }
 
     glm::vec4 materialColor = color;
+    // A colour alpha over 1 (up to 2) doubles the alpha the material makes, as the PC renderer's
+    // mColor does: the channel holds half of it and the TEV stage below scales its alpha by 2.
+    const bool alphaX2 = (color.a > 1.0f);
+    if (alphaX2)
+        materialColor.a *= 0.5f;
     materialColor = glm::clamp(materialColor, 0.0f, 1.0f);
     float opacityScale = !(useVertexColor || unlit) ? gGxContext.mInvColorScale : 1.0f;
 
@@ -492,8 +587,60 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
     GX_SetTevColorIn(tevStage, GX_CC_ZERO, GX_CC_CPREV, (unlit && useBakedLighting) ? GX_CC_ZERO : GX_CC_RASC, GX_CC_ZERO);
     GX_SetTevAlphaIn(tevStage, GX_CA_ZERO, GX_CA_APREV, GX_CA_RASA, GX_CA_ZERO);
     GX_SetTevColorOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, doubleColorScale ? gGxContext.mColorScaleEnum : GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-    GX_SetTevAlphaOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, doubleColorScale ? gGxContext.mColorScaleEnum : GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    GX_SetTevAlphaOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, alphaX2 ? GX_CS_SCALE_2 : (doubleColorScale ? gGxContext.mColorScaleEnum : GX_CS_SCALE_1), GX_TRUE, GX_TEVPREV);
     tevStage++;
+
+    // Specular, as the PC renderer's: the sun's highlight, its size the material's shininess, tinted by
+    // its colour and scaled by its specular -- a second lighting channel (COLOR1) on a specular light
+    // object, added. Not with vertex colours (they hold COLOR0, the lighting COLOR1) or without normals.
+    gGxContext.mLighting.mSpecularMask = 0;
+    gGxContext.mSpecTexBound = false;
+    const float specular = material->GetSpecular();
+    GXTexObj* lobeTex = (specular > 0.0f && material->IsSharpSpecular() && !unlit && hasNormals &&
+                         gGxContext.mHasSpecLight && texIdx < 8) ? GetSpecLobeTex(material->GetShininess()) : nullptr;
+    if (lobeTex != nullptr)
+    {
+        // per pixel: the lobe texture, its coordinates from the normal (GX_TEXMTX5, LoadEnvTexMtx), times
+        // specular x the material's colour x the light's, added
+        GX_SetTexCoordGen(GX_TEXCOORD0 + texIdx, GX_TG_MTX3x4, GX_TG_NRM, GX_TEXMTX5);
+        GX_LoadTexObj(lobeTex, GX_TEXMAP0 + texIdx);
+        GX_SetNumTexGens(texIdx + 1);
+
+        const GXColor& lc = gGxContext.mSpecColor;
+        glm::vec3 k = glm::clamp(glm::vec3(color) * specular * glm::vec3(lc.r, lc.g, lc.b) / 255.0f, 0.0f, 1.0f);
+        GX_SetTevKColor(GX_KCOLOR3, { uint8_t(k.r * 255.0f), uint8_t(k.g * 255.0f), uint8_t(k.b * 255.0f), 255 });
+        GX_SetTevKColorSel(tevStage, GX_TEV_KCSEL_K3);
+        GX_SetTevOrder(tevStage, GX_TEXCOORD0 + texIdx, GX_TEXMAP0 + texIdx, GX_COLORNULL);
+        GX_SetTevColorIn(tevStage, GX_CC_ZERO, GX_CC_TEXC, GX_CC_KONST, GX_CC_CPREV);
+        GX_SetTevAlphaIn(tevStage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+        GX_SetTevColorOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+        GX_SetTevAlphaOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+        tevStage++;
+        gGxContext.mSpecTexBound = true;
+    }
+    else if (specular > 0.0f && !unlit && !useVertexColor && hasNormals && gGxContext.mHasSpecLight &&
+        gGxContext.mSceneNumLights < MAX_LIGHTS_PER_DRAW)
+    {
+        const uint8_t specLight = uint8_t(GX_LIGHT0 << gGxContext.mSceneNumLights);   // (the slot after the scene's)
+        GXLightObj specObj;
+        GX_InitSpecularDir(&specObj, gGxContext.mSpecDirVS.x, gGxContext.mSpecDirVS.y, gGxContext.mSpecDirVS.z);
+        GX_InitLightShininess(&specObj, glm::max(material->GetShininess(), 1.0f));
+        GX_InitLightColor(&specObj, gGxContext.mSpecColor);
+        GX_LoadLightObj(&specObj, specLight);
+
+        glm::vec3 specColor = glm::clamp(glm::vec3(color) * specular * gGxContext.mInvColorScale, 0.0f, 1.0f);
+        GX_SetChanMatColor(GX_COLOR1A1, { uint8_t(specColor.r * 255.0f), uint8_t(specColor.g * 255.0f),
+                                          uint8_t(specColor.b * 255.0f), 255 });
+        GX_SetChanAmbColor(GX_COLOR1A1, { 0, 0, 0, 0 });
+
+        GX_SetTevOrder(tevStage, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR1A1);
+        GX_SetTevColorIn(tevStage, GX_CC_ZERO, GX_CC_RASC, GX_CC_ONE, GX_CC_CPREV);
+        GX_SetTevAlphaIn(tevStage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+        GX_SetTevColorOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+        GX_SetTevAlphaOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+        tevStage++;
+        gGxContext.mLighting.mSpecularMask = specLight;
+    }
 
     // Vertex color modulation
     if (useVertexColor)

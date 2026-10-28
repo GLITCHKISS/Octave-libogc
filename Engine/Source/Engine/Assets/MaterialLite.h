@@ -35,6 +35,10 @@ struct MaterialLiteParams
     // Its Fresnel term as its opacity, not added colour: see-through face on, solid edge on (as water: the flatter
     // it's seen, the less of what's under it shows).
     bool mFresnelAlpha = false;
+    // On the GameCube, its specular per pixel: the PC renderer's Phong lobe for its shininess, baked into a
+    // small texture placed by the surface normal, instead of GX's per-vertex specular channel (which on a
+    // low-poly mesh smears the highlight over whole triangles). The PC renderer is per pixel already.
+    bool mSharpSpecular = false;
     float mShininess = 32.0f;
     int32_t mSortPriority = 0;
     uint32_t mNumTextures = 1;
@@ -119,6 +123,7 @@ public:
     bool HasAlphaBand() const { return mLiteParams.mAlphaKeepBelow < 1.0f; }
     bool MipBiasFollowsHeight() const { return mLiteParams.mMipBiasFollowsHeight; }
     bool IsFresnelAlpha() const { return mLiteParams.mFresnelAlpha; }
+    bool IsSharpSpecular() const { return mLiteParams.mSharpSpecular; }
 
     float GetShininess() const;
     void SetShininess(float shininess);

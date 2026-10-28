@@ -444,6 +444,84 @@ void CookTexture(
                    texture->GetName().c_str(), texWidth, texHeight);
     }
 
+    // A texture with mip levels of its own (hand-drawn, as GameCube games' water has) is written
+    // here as an IA8 TPL with those levels, and its mip bias in the TPL header: gxtexconv would make
+    // its own levels from the base. Only IA8 at its full size: a white texture whose alpha is the
+    // picture, which is what such textures are. The bias is the texture's, made for a picture 548
+    // lines high (as the PC renderer reckons it), moved to the console's 480.
+    const std::vector<uint8_t>& customMips = texture->GetCustomMips();
+    if ((platform == Platform::GameCube || platform == Platform::Wii) &&
+        !customMips.empty() &&
+        texture->GetFormat() == PixelFormat::IA8 &&
+        texture->IsMipmapped() && consoleEnableMips &&
+        uint32_t(texWidth) == texture->GetWidth() && uint32_t(texHeight) == texture->GetHeight() &&
+        (texWidth % 4) == 0 && (texHeight % 4) == 0)
+    {
+        const uint32_t numLevels = texture->GetMipLevels();
+        std::vector<const uint8_t*> levelPixels;
+        levelPixels.push_back(pixels.data());
+        size_t offset = 0;
+        for (uint32_t level = 1; level < numLevels; ++level)
+        {
+            size_t size = size_t(glm::max(texWidth >> level, 1)) * glm::max(texHeight >> level, 1) * 4;
+            if (offset + size > customMips.size() || (texWidth >> level) < 4 || (texHeight >> level) < 4)
+                break;
+            levelPixels.push_back(customMips.data() + offset);
+            offset += size;
+        }
+
+        const uint32_t kHeaderSize = 64;
+        size_t dataSize = 0;
+        for (size_t l = 0; l < levelPixels.size(); ++l)
+            dataSize += size_t(texWidth >> l) * (texHeight >> l) * 2;
+
+        std::vector<uint8_t> tpl(kHeaderSize + dataSize, 0);
+        auto be32 = [&tpl](uint32_t at, uint32_t v) { tpl[at] = v >> 24; tpl[at + 1] = v >> 16; tpl[at + 2] = v >> 8; tpl[at + 3] = v; };
+        auto be16 = [&tpl](uint32_t at, uint16_t v) { tpl[at] = v >> 8; tpl[at + 1] = v & 0xFF; };
+        be32(0x00, 0x0020AF30);                  // magic
+        be32(0x04, 1);                           // one texture
+        be32(0x08, 0x0C);                        // image table
+        be32(0x0C, 0x14);                        // texture header
+        be16(0x14, uint16_t(texHeight));
+        be16(0x16, uint16_t(texWidth));
+        be32(0x18, 3);                           // GX_TF_IA8
+        be32(0x1C, kHeaderSize);                 // pixels
+        be32(0x20, 1);                           // wrap s, t: repeat (set again from the asset at load)
+        be32(0x24, 1);
+        be32(0x28, 5);                           // GX_LIN_MIP_LIN
+        be32(0x2C, 1);                           // GX_LINEAR
+        float bias = glm::clamp(texture->GetLodBias() + log2f(480.0f / 548.0f), -4.0f, 3.99f);
+        uint32_t biasBits;
+        memcpy(&biasBits, &bias, 4);
+        be32(0x30, biasBits);                    // lod bias
+        tpl[0x34] = 0;                           // edge lod
+        tpl[0x35] = 0;                           // min lod
+        tpl[0x36] = uint8_t(levelPixels.size() - 1);   // max lod
+
+        // IA8: 4x4 tiles, each texel two bytes, its alpha then its intensity
+        uint8_t* out = tpl.data() + kHeaderSize;
+        for (size_t l = 0; l < levelPixels.size(); ++l)
+        {
+            const uint32_t w = texWidth >> l, h = texHeight >> l;
+            const uint8_t* src = levelPixels[l];
+            for (uint32_t ty = 0; ty < h; ty += 4)
+                for (uint32_t tx = 0; tx < w; tx += 4)
+                    for (uint32_t y = 0; y < 4; ++y)
+                        for (uint32_t x = 0; x < 4; ++x)
+                        {
+                            const uint8_t* p = src + ((ty + y) * w + (tx + x)) * 4;
+                            *out++ = p[3];
+                            *out++ = p[0];
+                        }
+        }
+
+        outData = tpl;
+        outWidth = texWidth;
+        outHeight = texHeight;
+        outNumMips = uint32_t(levelPixels.size());
+        return;
+    }
+
     // A converted texture is kept in Intermediate/CookCache under a hash of its pixels and the
     // converter's command line, and reused while both are unchanged: the converter can take
     // minutes on a big texture, and most textures are the same from one package to the next.
@@ -904,8 +982,11 @@ void Texture::SaveStream(Stream& stream, Platform platform)
     stream.WriteUint8(mLowQualityDownsampleFactor);
 
     stream.WriteFloat(mLodBias);
-    stream.WriteUint32(uint32_t(mCustomMips.size()));
-    if (mCustomMips.size() > 0)
+    // (a cooked texture has its own mips in its cooked data -- the console's 24 MB has no room for a
+    // second, RGBA copy it never reads)
+    const bool keepCustomMips = !UseCookedTextures(platform);
+    stream.WriteUint32(keepCustomMips ? uint32_t(mCustomMips.size()) : 0u);
+    if (keepCustomMips && mCustomMips.size() > 0)
         stream.WriteBytes(mCustomMips.data(), uint32_t(mCustomMips.size()));
 
     if (UseCookedTextures(platform))
