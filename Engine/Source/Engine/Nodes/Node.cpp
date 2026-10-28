@@ -15,6 +15,7 @@
 
 #include "Nodes/3D/Node3d.h"
 #include "Nodes/3D/StaticMesh3d.h"
+#include "Nodes/3D/ShadowMesh3d.h"
 #include "Nodes/3D/SkeletalMesh3d.h"
 #include "Nodes/3D/PointLight3d.h"
 #include "Nodes/3D/DirectionalLight3d.h"
@@ -507,9 +508,11 @@ void Node::PrepareTick(std::vector<NodePtrWeak>& outTickNodes, bool game, bool r
 
     if (IsTickEnabled() && IsActive() && !IsDestroyed())
     {
+        const bool tick = NeedsTick();   // (its children gathered whatever: only itself left off)
+
         if (recurse)
         {
-            if (!mLateTick)
+            if (!mLateTick && tick)
             {
                 outTickNodes.push_back(mSelf);
             }
@@ -519,16 +522,37 @@ void Node::PrepareTick(std::vector<NodePtrWeak>& outTickNodes, bool game, bool r
                 mChildren[i]->PrepareTick(outTickNodes, game, recurse);
             }
 
-            if (mLateTick)
+            if (mLateTick && tick)
             {
                 outTickNodes.push_back(mSelf);
             }
         }
-        else
+        else if (tick)
         {
             outTickNodes.push_back(mSelf);
         }
     }
+}
+
+// Whether ticking this node does anything. A node with a script does (Script::Tick), and so does every type that
+// overrides Tick or TickCommon -- but a plain Node or Node3D, and a StaticMesh3D or ShadowMesh3D without physics
+// (Primitive3D::Tick only syncs a simulated body to its node), would only stamp mLastTickedFrame, which only World's
+// tick loop reads, to tick nothing twice. Left off the tick list: a scene of ~660 nodes on the GameCube, most of them
+// those (glints, puffs, wakes, drops, the level's meshes), had each pushed, dereferenced and ticked down a virtual
+// chain for nothing every frame. By exact type -- a game's own subclass may override Tick. A node that comes to need
+// it mid-frame (a script set, physics on) is put on the list then (SetScriptFile, Primitive3D::EnablePhysics), as it
+// would have ticked that frame before.
+bool Node::NeedsTick() const
+{
+    if (mScript != nullptr)
+        return true;
+
+    const TypeId type = GetType();
+    if (type == Node::GetStaticType() || type == Node3D::GetStaticType())
+        return false;
+    if (type == StaticMesh3D::GetStaticType() || type == ShadowMesh3D::GetStaticType())
+        return static_cast<const Primitive3D*>(this)->IsPhysicsEnabled();
+    return true;
 }
 
 void Node::Tick(float deltaTime)
@@ -1791,6 +1815,12 @@ void Node::SetScriptFile(const std::string& fileName)
     if (fileName != "" && mScript == nullptr)
     {
         mScript = new Script(this);
+
+        // (without a script it may have been left off this frame's tick list: NeedsTick -- on it now, as before)
+        if (GetWorld() != nullptr)
+        {
+            GetWorld()->AddNewlyRegisteredNode(this);
+        }
     }
 
     if (mScript != nullptr &&

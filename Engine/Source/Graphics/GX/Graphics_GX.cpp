@@ -35,6 +35,7 @@
 #include <malloc.h>
 #include <math.h>
 #include <vector>
+#include <unordered_map>
 
 #include <gccore.h>
 #include <ogc/machine/processor.h>      // _CPU_ISR_Disable / Restore
@@ -221,6 +222,12 @@ namespace
 
 uint32_t OctRetraceCount();     // System_Dolphin.cpp
 
+// The viewport and scissor as GFX_SetViewport / GFX_SetScissor last set them (the scene's, for the forward pass):
+// the projected shadow receivers' pass narrows the scissor to where the shadow can fall and puts it back after
+static int32_t sCurViewport[4] = { 0, 0, 0, 0 };
+static int32_t sCurScissor[4] = { 0, 0, 0, 0 };
+static bool sCurViewKnown = false;
+
 void GxWaitGpu()
 {
     // Everything queued so far, this frame's commands included. A frame in flight STAYS in flight:
@@ -312,6 +319,7 @@ void GFX_Shutdown()
 void GFX_BeginFrame()
 {
     SystemState* systemState = &GetEngineState()->mSystem;
+    GxInvalidateTexMtxCache();          // (BindMaterial's UV matrices loaded fresh each frame: GxUtils.cpp)
 
     if (sFrameInFlight)
     {
@@ -340,6 +348,11 @@ void GFX_BeginFrame()
 #if PROFILING_ENABLED
     GpMetricsArm();
 #endif
+
+    // The GPU's vertex cache cleared once for the frame, ahead of all its draws: the CPU-skinned arrays are rewritten
+    // in place each frame (two in turn) and keyed by address there; nothing rewrites one again within the frame, so
+    // their draws no longer each clear it (meshes rewritten mid-frame keep their own clears)
+    GX_InvVtxCache();
 
     gGxContext.mWorld = Renderer::Get()->GetCurrentWorld();
 
@@ -380,6 +393,52 @@ void GFX_BeginFrame()
     }
 }
 
+#if LUA_ENABLED
+// Lua's garbage collector stepped in the frame's idle time -- while the CPU would only wait for the retrace that shows
+// the last frame -- so less of its work falls in the middle of a frame (on the GameCube, scripts' garbage caught
+// up with in 60-80 ms steps). Small steps, each only while the video beam is far enough from the end of its field
+// (the retrace) that one can't delay the copy; and, whatever the idle time, a heap grown past twice its size after
+// the last full cycle steps on a few anyway. The automatic collector's pause is raised at the state's creation
+// (Engine.cpp) so it rarely starts a cycle itself mid-frame.
+static int sGcBaseKB = 0;                  // (the heap just after the last full cycle)
+static const float kGcIdleMarginUs = 2000.0f;
+static const uint32_t kGcIdleMaxSteps = 64;
+
+static void LuaGcIdle(bool idle)
+{
+    lua_State* L = GetLua();
+    if (L == nullptr)
+        return;
+    if (idle)
+    {
+        const bool pal = (VIDEO_GetCurrentTvMode() == VI_PAL);
+        const float lines = pal ? 312.5f : 262.5f;              // (a field's lines)
+        const float usPerLine = (pal ? 20000.0f : 16683.0f) / lines;
+        for (uint32_t n = 0; n < kGcIdleMaxSteps; ++n)
+        {
+            if (OctRetraceCount() != sFlipRetrace)
+                break;                                     // (the retrace came: no more idle)
+            const float leftUs = (lines - float(VIDEO_GetCurrentLine())) * usPerLine;
+            if (leftUs < kGcIdleMarginUs)
+                break;
+            if (lua_gc(L, LUA_GCSTEP, 0))
+                sGcBaseKB = lua_gc(L, LUA_GCCOUNT, 0);       // (a cycle finished: the live heap)
+        }
+    }
+    if (sGcBaseKB > 0 && lua_gc(L, LUA_GCCOUNT, 0) > 2 * sGcBaseKB)
+    {
+        for (uint32_t n = 0; n < 4; ++n)
+        {
+            if (lua_gc(L, LUA_GCSTEP, 0))
+            {
+                sGcBaseKB = lua_gc(L, LUA_GCCOUNT, 0);
+                break;
+            }
+        }
+    }
+}
+#endif
+
 void GFX_EndFrame()
 {
     glm::vec4 clearColor = Renderer::Get()->GetClearColor();
@@ -400,6 +459,12 @@ void GFX_EndFrame()
     // This frame is copied into the framebuffer the last one replaced on screen: wait until it
     // really has (a retrace since it was handed over), or the copy would tear what is showing.
     // This is also what holds the game to one frame a retrace at most.
+#if LUA_ENABLED
+    {
+        SCOPED_FRAME_STAT("GcIdle");
+        LuaGcIdle(sFlipPending);
+    }
+#endif
     if (sFlipPending)
     {
         SCOPED_FRAME_STAT("RetraceWait");
@@ -461,11 +526,14 @@ void GFX_SetPipelineState(PipelineConfig config)
 void GFX_SetViewport(int32_t x, int32_t y, int32_t width, int32_t height, bool handlePrerotation)
 {
     GX_SetViewport((float) x, float(y), (float) width, float(height), 0, 1);
+    sCurViewport[0] = x; sCurViewport[1] = y; sCurViewport[2] = width; sCurViewport[3] = height;
 }
 
 void GFX_SetScissor(int32_t x, int32_t y, int32_t width, int32_t height, bool handlePrerotation)
 {
     GX_SetScissor(x, y, width, height);
+    sCurScissor[0] = x; sCurScissor[1] = y; sCurScissor[2] = width; sCurScissor[3] = height;
+    sCurViewKnown = (width > 0 && height > 0 && sCurViewport[2] > 0 && sCurViewport[3] > 0);
 }
 
 glm::mat4 GFX_MakePerspectiveMatrix(float fovyDegrees, float aspectRatio, float zNear, float zFar)
@@ -1168,16 +1236,130 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
 
 // SkeletalMesh
 #if OCT_SKELETAL
+// A CPU-skinned mesh's triangles as display lists: its index stream never changes (only the skinned vertices the
+// indices point into do, through GX_SetArray), yet every draw sent it again a 16-bit write at a time -- four indices
+// a corner, ~50,000 writes for a 2,500-vertex character, again for each copy of it (a Starman's afterimages), its
+// cape, its sail, and once more for the projected shadow's caster. As a list the GPU reads the same bytes from
+// memory. Written byte by byte, not recorded with GX_BeginDispList: libogc's GX_Begin flushes whatever GX state is
+// pending into what it's recording, and a list made after one material's BindMaterial would set that material's
+// TEV and texgen counts again at every later call. A primitive is its command byte (GX_TRIANGLES, VTXFMT0) and a
+// 16-bit count, then its indices big-endian; the rest of the last 32 bytes GX_NOP (0). The full list (position,
+// normal, both texture coordinates) is made with the mesh's resource; the position-only one for the shadow's caster
+// the first time it's wanted. Out of memory, the draw goes on sending them itself.
+struct GxSkinLists
+{
+    void* mFull = nullptr;
+    uint32_t mFullSize = 0;
+    void* mPos = nullptr;
+    uint32_t mPosSize = 0;
+    bool mFullTried = false;
+    bool mPosTried = false;
+};
+static std::unordered_map<const SkeletalMesh*, GxSkinLists> sSkinLists;
+static const uint32_t kSkinFacesPerBatch = 21845;      // (GX_Begin's count is 16-bit: 65535 vertices a primitive)
+
+static void* BuildSkinList(SkeletalMesh* mesh, bool posOnly, uint32_t& outSize)
+{
+    outSize = 0;
+    const uint32_t numFaces = mesh->GetNumFaces();
+    const uint16_t* indices = mesh->GetIndices();
+    if (numFaces == 0 || indices == nullptr)
+        return nullptr;
+
+    const uint32_t numBatches = (numFaces + kSkinFacesPerBatch - 1) / kSkinFacesPerBatch;
+    const uint32_t perVertex = posOnly ? 1 : 4;          // (16-bit indices a corner: its attributes)
+    const uint32_t bytes = numBatches * 3 + numFaces * 3 * perVertex * 2;
+    const uint32_t size = (bytes + 31) & ~31u;
+    uint8_t* list = (uint8_t*)memalign(32, size);
+    if (list == nullptr)
+    {
+        LogError("Mesh %s: out of memory for a %u byte skinned display list", mesh->GetName().c_str(), size);
+        return nullptr;
+    }
+
+    uint8_t* at = list;
+    for (uint32_t firstFace = 0; firstFace < numFaces; firstFace += kSkinFacesPerBatch)
+    {
+        const uint32_t batchFaces = (numFaces - firstFace < kSkinFacesPerBatch) ? (numFaces - firstFace) : kSkinFacesPerBatch;
+        const uint32_t count = batchFaces * 3;
+        *at++ = uint8_t(GX_TRIANGLES | (GX_VTXFMT0 & 7));
+        *at++ = uint8_t(count >> 8);
+        *at++ = uint8_t(count & 0xff);
+        for (uint32_t i = firstFace * 3; i < (firstFace + batchFaces) * 3; ++i)
+        {
+            const uint16_t idx = indices[i];
+            for (uint32_t k = 0; k < perVertex; ++k)
+            {
+                *at++ = uint8_t(idx >> 8);
+                *at++ = uint8_t(idx & 0xff);
+            }
+        }
+    }
+    while (at < list + size)
+        *at++ = 0;                                      // (GX_NOP)
+
+    DCFlushRange(list, size);                           // (the GPU reads it from memory, not the CPU's cache)
+    outSize = size;
+    return list;
+}
+
+// The mesh's full skinned list, made now if it hasn't been tried (nullptr: send the indices as before)
+static void* GetSkinList(SkeletalMesh* mesh, bool posOnly, uint32_t& outSize)
+{
+    GxSkinLists& lists = sSkinLists[mesh];
+    if (posOnly)
+    {
+        if (!lists.mPosTried)
+        {
+            lists.mPos = BuildSkinList(mesh, true, lists.mPosSize);
+            lists.mPosTried = true;
+        }
+        outSize = lists.mPosSize;
+        return lists.mPos;
+    }
+    if (!lists.mFullTried)
+    {
+        lists.mFull = BuildSkinList(mesh, false, lists.mFullSize);
+        lists.mFullTried = true;
+    }
+    outSize = lists.mFullSize;
+    return lists.mFull;
+}
+
+static void FreeSkinLists(const SkeletalMesh* mesh)
+{
+    auto it = sSkinLists.find(mesh);
+    if (it == sSkinLists.end())
+        return;
+    GxDeferFree(it->second.mFull);                      // (the GPU may still be drawing the last frame from them)
+    GxDeferFree(it->second.mPos);
+    sSkinLists.erase(it);
+}
+
 void GFX_CreateSkeletalMeshResource(SkeletalMesh* skeletalMesh, uint32_t numVertices, VertexSkinned* vertices, uint32_t numIndices, IndexType* indices)
 {
-
+    // its skinned list now, with the loading (not a hitch the first time it's drawn) -- for a mesh skinned on the CPU
+    FreeSkinLists(skeletalMesh);
+    if (skeletalMesh->GetNumBones() > MAX_GPU_BONES && skeletalMesh->GetNumFaces() > 0)
+    {
+        uint32_t size = 0;
+        GetSkinList(skeletalMesh, false, size);
+    }
 }
 
 void GFX_DestroySkeletalMeshResource(SkeletalMesh* skeletalMesh)
 {
-
+    FreeSkinLists(skeletalMesh);
 }
 #endif
+
+// Whether the draw just bound (BindMaterial) reads its vertices' normals: lit, or a texgen from them (a sphere map,
+// the sharp specular's lobes). Unlit with neither -- most effects: glints, puffs, wakes, afterimages -- the normal
+// matrix (an inverse, a transpose, a load into the GPU) went unread; the GPU's lighting is off and no texgen asks.
+static inline bool GxDrawReadsNormals(MaterialLite* material)
+{
+    return material->GetShadingModel() != ShadingModel::Unlit || gGxContext.mEnvMapBound || gGxContext.mSpecTexBound;
+}
 
 // StaticMeshComp
 void GFX_CreateStaticMeshCompResource(StaticMesh3D* staticMeshComp)
@@ -1238,12 +1420,15 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverri
 
         GX_LoadPosMtxImm(modelView, GX_PNMTX0);
 
-        Mtx modelViewInv;
         gGxContext.mObjectViewPos = glm::vec3(modelView[0][3], modelView[1][3], modelView[2][3]);
-        guMtxInverse(modelView, modelViewInv);
-        guMtxTranspose(modelViewInv, modelView);
-        GX_LoadNrmMtxImm(modelView, GX_PNMTX0);
-        LoadEnvTexMtx(modelView);
+        if (GxDrawReadsNormals(material))
+        {
+            Mtx modelViewInv;
+            guMtxInverse(modelView, modelViewInv);
+            guMtxTranspose(modelViewInv, modelView);
+            GX_LoadNrmMtxImm(modelView, GX_PNMTX0);
+            LoadEnvTexMtx(modelView);
+        }
 
         SetupLightMask(material->GetShadingModel(), staticMeshComp->GetLightingChannels(), hasBakedLighting);
         SetupLightingChannels();
@@ -1294,7 +1479,11 @@ void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp
 
 void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<Vertex>& skinnedVertices)
 {
-
+    // The CPU-skinned vertices out of the data cache, once, as they're written (CpuSkinVertices, and the array's
+    // first fill): the draws that read them -- the mesh, its shadow caster, children drawing its skin (the Starman's
+    // ghosts) -- no longer each flush the whole array again (~108 KB for a character, up to 7 times a frame)
+    if (!skinnedVertices.empty())
+        DCFlushRange((void*)skinnedVertices.data(), uint32_t(skinnedVertices.size() * sizeof(Vertex)));
 }
 
 void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
@@ -1324,9 +1513,9 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
             GX_SetArray(GX_VA_NRM, &vertices[0].mNormal, sizeof(Vertex));
             GX_SetArray(GX_VA_TEX0, &vertices[0].mTexcoord0, sizeof(Vertex));
             GX_SetArray(GX_VA_TEX1, &vertices[0].mTexcoord1, sizeof(Vertex));
-
-            DCFlushRange(vertices, numVertices * sizeof(Vertex));
-            GX_InvVtxCache();
+            // (flushed when skinned: GFX_UpdateSkeletalMeshCompVertexBuffer; the vertex cache cleared at the
+            //  frame's start, GFX_BeginFrame -- nothing rewrites a skinned array between)
+            (void)numVertices;
         }
         else
         {
@@ -1357,18 +1546,25 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
         Mtx modelViewInv;
         Mtx normalMtx;
         gGxContext.mObjectViewPos = glm::vec3(modelView[0][3], modelView[1][3], modelView[2][3]);
-        guMtxInverse(modelView, modelViewInv);
-        guMtxTranspose(modelViewInv, normalMtx);
+        const bool readsNormals = !cpuSkinned || GxDrawReadsNormals(material);
+        if (readsNormals)
+        {
+            guMtxInverse(modelView, modelViewInv);
+            guMtxTranspose(modelViewInv, normalMtx);
 
-        // GPU skinning: the texgen reads the bind-pose normal, so a sphere map follows the
-        // component's rotation but not its bones'.
-        LoadEnvTexMtx(normalMtx);
+            // GPU skinning: the texgen reads the bind-pose normal, so a sphere map follows the
+            // component's rotation but not its bones'.
+            LoadEnvTexMtx(normalMtx);
+        }
 
         if (cpuSkinned)
         {
             // Only need to set up a single position/normal matrix pair
             GX_LoadPosMtxImm(modelView, GX_PNMTX0);
-            GX_LoadNrmMtxImm(normalMtx, GX_PNMTX0);
+            if (readsNormals)
+            {
+                GX_LoadNrmMtxImm(normalMtx, GX_PNMTX0);
+            }
         }
         else
         {
@@ -1400,6 +1596,17 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
         const uint32_t numBatches = (numFaces + kMaxFacesPerBatch - 1) / kMaxFacesPerBatch;
 
         const uint16_t* indices = mesh->GetIndices();
+
+        if (cpuSkinned)
+        {
+            uint32_t listSize = 0;
+            void* list = GetSkinList(mesh, false, listSize);
+            if (list != nullptr)
+            {
+                GX_CallDispList(list, listSize);
+                return;
+            }
+        }
 
         for (uint32_t batch = 0; batch < numBatches; ++batch)
         {
@@ -1600,8 +1807,7 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
         GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
         GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
         GX_SetArray(GX_VA_POS, &vertices[0].mPosition, sizeof(Vertex));
-        DCFlushRange(vertices, numVertices * sizeof(Vertex));
-        GX_InvVtxCache();
+        (void)numVertices;              // (flushed when skinned; the vertex cache cleared at the frame's start)
     }
     else
     {
@@ -1627,6 +1833,19 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
             GX_LoadPosMtxImm(fullTransform, GX_PNMTX0 + i * 3);
         }
     }
+
+#if OCT_SKELETAL
+    if (cpuSkinned)
+    {
+        uint32_t listSize = 0;
+        void* list = GetSkinList(mesh, true, listSize);
+        if (list != nullptr)
+        {
+            GX_CallDispList(list, listSize);
+            return;
+        }
+    }
+#endif
 
     const uint32_t numFaces = mesh->GetNumFaces();
     const uint32_t kMaxFacesPerBatch = 21845;
@@ -1782,6 +2001,48 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
     sProjShadowValid = true;
 }
 
+// The screen rectangle the projected shadow can fall in, the receivers' pass scissored to it: the shadow texture
+// covers its group's box across (the caster's middle, half each way) and lays it straight down, so a receiver pixel
+// outside that column -- or above the cut, or below the lowest receiver drawn -- is multiplied by white anyway. The
+// column's eight corners projected by the camera (as the GPU does: its view, then the projection as GX has it, rows),
+// rounded out and kept within the scene's scissor. -1: nothing of it on screen; 0: not scissored (a corner behind
+// the camera, or no viewport known); 1: scissored. Before, the receivers' whole visible area was drawn again.
+static int ProjShadowScissor(Camera3D* camera, float yLo, float yHi)
+{
+    if (!sCurViewKnown)
+        return 0;
+    const glm::mat4 view = camera->GetViewMatrix();
+    const glm::mat4 projG = camera->GetProjectionMatrix();
+    float p[4][4];
+    memcpy(p, &projG, sizeof(p));               // (GFX_BeginFrame loads these bytes as GX's Mtx44: rows)
+    const float h = sProjShadowHalf;
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (uint32_t i = 0; i < 8; ++i)
+    {
+        const glm::vec4 w(sProjShadowCenter.x + ((i & 1) ? h : -h), (i & 2) ? yHi : yLo,
+                          sProjShadowCenter.z + ((i & 4) ? h : -h), 1.0f);
+        const glm::vec4 v = view * w;
+        const float cx = p[0][0] * v.x + p[0][1] * v.y + p[0][2] * v.z + p[0][3];
+        const float cy = p[1][0] * v.x + p[1][1] * v.y + p[1][2] * v.z + p[1][3];
+        const float cw = p[3][0] * v.x + p[3][1] * v.y + p[3][2] * v.z + p[3][3];
+        if (cw < 1e-4f)
+            return 0;                               // (behind the camera: the whole scissor)
+        const float sx = float(sCurViewport[0]) + (cx / cw * 0.5f + 0.5f) * float(sCurViewport[2]);
+        const float sy = float(sCurViewport[1]) + (0.5f - cy / cw * 0.5f) * float(sCurViewport[3]);
+        x0 = glm::min(x0, sx); x1 = glm::max(x1, sx);
+        y0 = glm::min(y0, sy); y1 = glm::max(y1, sy);
+    }
+    // rounded out (a pixel or two either side), then within the scene's scissor
+    const float sx0 = float(sCurScissor[0]), sy0 = float(sCurScissor[1]);
+    const float sx1 = sx0 + float(sCurScissor[2]), sy1 = sy0 + float(sCurScissor[3]);
+    x0 = glm::max(floorf(x0) - 2.0f, sx0); y0 = glm::max(floorf(y0) - 2.0f, sy0);
+    x1 = glm::min(ceilf(x1) + 2.0f, sx1); y1 = glm::min(ceilf(y1) + 2.0f, sy1);
+    if (x1 <= x0 || y1 <= y0)
+        return -1;
+    GX_SetScissor(uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0));
+    return 1;
+}
+
 void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receivers)
 {
     Camera3D* camera = gGxContext.mWorld ? gGxContext.mWorld->GetActiveCamera() : nullptr;
@@ -1832,8 +2093,28 @@ void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receiver
     gGxContext.mApplyFog = false;
 
     const float reach = sProjShadowHalf * 1.42f;               // (the box's corner)
+
+    // the column the shadow can fall in, down to the lowest receiver it reaches: the pass scissored to it
+    float yLow = cut;
+    bool anyReceiver = false;
     for (StaticMesh3D* comp : receivers)
     {
+        if (comp->GetStaticMesh() == nullptr)
+            continue;
+        Bounds b = comp->GetBounds();
+        float dx = b.mCenter.x - sProjShadowCenter.x, dz = b.mCenter.z - sProjShadowCenter.z;
+        float r = b.mRadius + reach;
+        if (dx * dx + dz * dz > r * r || b.mCenter.y - b.mRadius > sProjShadowTop)
+            continue;
+        yLow = glm::min(yLow, b.mCenter.y - b.mRadius);
+        anyReceiver = true;
+    }
+    const int scissor = anyReceiver ? ProjShadowScissor(camera, yLow - 0.05f, cut + 0.05f) : -1;
+
+    for (StaticMesh3D* comp : receivers)
+    {
+        if (scissor < 0)
+            break;                                  // (none, or none of it on screen)
         StaticMesh* mesh = comp->GetStaticMesh();
         if (mesh == nullptr)
             continue;
@@ -1890,6 +2171,9 @@ void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receiver
             CallMeshDisplayList(res->mDisplayList, res->mDisplayListSize);
         }
     }
+
+    if (scissor > 0)                            // (the scene's scissor back)
+        GX_SetScissor(sCurScissor[0], sCurScissor[1], sCurScissor[2], sCurScissor[3]);
 
     // The draws after this bind their materials again (blend, depth, texgens, TEV); fog comes back with the first
     // material that wants it (BindMaterial, mApplyFog).

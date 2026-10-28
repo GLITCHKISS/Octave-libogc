@@ -12,18 +12,23 @@
 
 #if LUA_ENABLED
 
+// Every field and method a script reads off a node comes through here (self.x, self:Foo, node:SetPosition...),
+// hundreds to thousands of times a frame. Only the node wrapper's metatable has this __index, so arg 1 is a node
+// wrapper and isn't checked again (luaL_checkudata looked its metatable up in the registry by name each time), and
+// the key is looked up as the Lua string it already is, not re-hashed from a C string: on the GameCube these were
+// about a millisecond a frame of the scripts' time.
 int NodeWrapperIndex(lua_State* L)
 {
-    luaL_checkudata(L, 1, NODE_WRAPPER_TABLE_NAME);
     // TODO: Do we want to support integer keys??
-    const char* key = CHECK_STRING(L, 2);
+    CHECK_STRING(L, 2);                     // (a number key made its string, anything else an error -- as before)
 
     lua_getuservalue(L, 1);
     int uvIdx = lua_gettop(L);
     OCT_ASSERT(lua_istable(L, uvIdx));
 
-    // First, check the uservalue to see if the key is found in that
-    lua_getfield(L, uvIdx, key);
+    // First, check the uservalue to see if the key is found in that (a plain table, no metatable: raw)
+    lua_pushvalue(L, 2);
+    lua_rawget(L, uvIdx);
 
     if (lua_isnil(L, -1))
     {
@@ -31,9 +36,10 @@ int NodeWrapperIndex(lua_State* L)
         lua_getfield(L, uvIdx, OCT_CLASS_TABLE_KEY);
         int classTableIdx = lua_gettop(L);
         OCT_ASSERT(lua_istable(L, classTableIdx));
-        
+
         // This will propagate up the class inheritance chain via __index metamethod.
-        lua_getfield(L, classTableIdx, key);
+        lua_pushvalue(L, 2);
+        lua_gettable(L, classTableIdx);
         return 1;
     }
     else
@@ -45,7 +51,7 @@ int NodeWrapperIndex(lua_State* L)
 
 int NodeWrapperNewIndex(lua_State* L)
 {
-    luaL_checkudata(L, 1, NODE_WRAPPER_TABLE_NAME);
+    // (only the node wrapper's metatable has this __newindex: arg 1 is a node wrapper, not checked again)
 
     // Add the key/value to the Node userdata's associated uservalue
     lua_getuservalue(L, 1);

@@ -88,7 +88,8 @@ struct MorphTarget
 {
     std::string mName;
     std::vector<glm::vec3> mPositions;          // each vertex's move (one per vertex)
-    std::vector<glm::vec3> mNormals;            // each normal's change (one per vertex, or none)
+    std::vector<glm::vec3> mNormals;            // each normal's change (one per vertex, or none: all zero, dropped
+                                                //  at load -- SkeletalMesh::LoadStream)
 };
 
 class SkeletalMesh : public Asset

@@ -590,6 +590,9 @@ bool Initialize()
                 LogError("Lua panic: %s", lua_tostring(L, -1));
                 return 0;
             });
+            // The automatic collector starts a cycle only once the heap has grown to 3x its live size (Lua's
+            // default: 2x): the frame's idle time steps it instead (GFX_EndFrame, Graphics_GX.cpp)
+            lua_gc(sEngineState.mLua, LUA_GCSETPAUSE, 300);
         }
 #else
         sEngineState.mLua = luaL_newstate();

@@ -445,6 +445,33 @@ void GxResetIndirect()
     gGxContext.mIndirectTevMask = 0;
 }
 
+// The UV matrices (GX_TEXMTX0 for UV 0, GX_TEXMTX1 for UV 1) as BindMaterial last loaded them: most materials have
+// the same offset and scale (often none), and each draw built and loaded both again. Only BindMaterial loads these two
+// in the engine; the cache is cleared each frame (GFX_BeginFrame) and by GxInvalidateTexMtxCache, for code of a
+// game's own that loads them itself.
+static float sUvMtxKey[2][4];
+static bool sUvMtxValid[2] = { false, false };
+
+void GxInvalidateTexMtxCache()
+{
+    sUvMtxValid[0] = sUvMtxValid[1] = false;
+}
+
+static void LoadUvMtx(uint32_t slot, const glm::vec2& offset, const glm::vec2& scale)
+{
+    const float key[4] = { offset.x, offset.y, scale.x, scale.y };
+    if (sUvMtxValid[slot] && memcmp(key, sUvMtxKey[slot], sizeof(key)) == 0)
+    {
+        return;
+    }
+    Mtx m;
+    guMtxTrans(m, offset.x, offset.y, 0.0f);
+    guMtxScaleApply(m, m, scale.x, scale.y, 1.0f);
+    GX_LoadTexMtxImm(m, GX_TEXMTX0 + slot * 3, GX_TG_MTX3x4);
+    memcpy(sUvMtxKey[slot], key, sizeof(key));
+    sUvMtxValid[slot] = true;
+}
+
 void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLighting, bool hasNormals)
 {
     // If we are using vertex color modulation, then we need to use the first channel
@@ -458,20 +485,9 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
     float opacity = material->GetOpacity();
     bool depthless = material->IsDepthTestDisabled();
 
-    // Setup TexCoord matrices
-    glm::vec2 uvOffset0 = material->GetUvOffset(0);
-    glm::vec2 uvScale0 = material->GetUvScale(0);
-    Mtx texMatrix0;
-    guMtxTrans(texMatrix0, uvOffset0.x, uvOffset0.y, 0.0f);
-    guMtxScaleApply(texMatrix0, texMatrix0, uvScale0.x, uvScale0.y, 1.0f);
-    GX_LoadTexMtxImm(texMatrix0, GX_TEXMTX0, GX_TG_MTX3x4);
-
-    glm::vec2 uvOffset1 = material->GetUvOffset(1);
-    glm::vec2 uvScale1 = material->GetUvScale(1);
-    Mtx texMatrix1;
-    guMtxTrans(texMatrix1, uvOffset1.x, uvOffset1.y, 0.0f);
-    guMtxScaleApply(texMatrix1, texMatrix1, uvScale1.x, uvScale1.y, 1.0f);
-    GX_LoadTexMtxImm(texMatrix1, GX_TEXMTX1, GX_TG_MTX3x4);
+    // Setup TexCoord matrices (each only when it differs from what's loaded)
+    LoadUvMtx(0, material->GetUvOffset(0), material->GetUvScale(0));
+    LoadUvMtx(1, material->GetUvOffset(1), material->GetUvScale(1));
 
     uint32_t tevStage = 0;
     bool vertexColorBlend = (vertexColorMode == VertexColorMode::TextureBlend);

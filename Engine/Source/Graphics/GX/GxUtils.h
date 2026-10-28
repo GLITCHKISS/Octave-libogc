@@ -105,4 +105,8 @@ void GxWaitGpu();
 void GxDeferFree(void* block);
 void GxCountDraw(uint32_t verts, uint32_t tris);
 
+// BindMaterial skips loading GX_TEXMTX0/1 when they already hold its UV offset and scale: code that loads either
+// itself calls this after (the engine clears it each frame too).
+void GxInvalidateTexMtxCache();
+
 #endif

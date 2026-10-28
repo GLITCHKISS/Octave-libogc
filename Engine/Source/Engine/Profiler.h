@@ -11,9 +11,12 @@
 #define STAT_NAME_BUFFER_LENGTH (STAT_NAME_LENGTH + 1)
 
 #if PLATFORM_DOLPHIN && PROFILING_ENABLED
-// Script time and Lua memory for the console perf log's LUA lines (Profiler.cpp). Nest them.
+// Script time and Lua memory for the console perf log's LUA lines (Profiler.cpp). Nest them. Nothing unless the log
+// is on (OctPerfLogging): every script's Tick goes through them, every frame.
 void OctLuaPerfBegin(const char* name);
 void OctLuaPerfEnd();
+// Whether the console perf log is being written (Config.ini's Logging=1: the Gecko or SD log builds)
+bool OctPerfLogging();
 #endif
 
 // The console perf log's windows (PERF, GPU, CULL: an average every 5 s) started over from now -- for a game comparing

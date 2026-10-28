@@ -82,6 +82,18 @@ static const uint32_t kDiscWindowBytes = 16 * 1024;
 // Now AUD_Play only asks; AUD_Update starts the voice once the thread has it open and a buffer full.
 enum { OPEN_NONE = 0, OPEN_REQUESTED, OPEN_DONE, OPEN_FAILED };
 
+// A looping disc stream's way back to its start, done by the I/O thread as well. ov_pcm_seek reads pages at
+// scattered places in the file (each a disc read through DiscRead): on the main thread that was a 23-45 ms frame
+// at every loop of a streamed track (AudRead in the console perf log -- the dive's wind, the shell's water, the
+// Starman's theme). Now the main thread asks and stops decoding; AUD_Update goes on once it's back at the start.
+enum { LOOP_NONE = 0, LOOP_REQUESTED, LOOP_DONE };
+
+// Compressed bytes left in the current window under which the main thread stops decoding for the frame while the
+// I/O thread is still reading the next one -- rather than reading it itself, a disc read on the main thread (the
+// I/O thread runs below the main thread, so it reads while the main thread waits on vsync). A voice about to run
+// dry still decodes at once.
+static const uint32_t kDiscAheadMargin = 4 * 1024;
+
 static sem_t sAudioIoSem = LWP_SEM_NULL;
 static lwp_t sAudioIoThread = LWP_THREAD_NULL;
 static void RequestReadAhead(DiscSource* d);
@@ -118,20 +130,69 @@ struct StreamVoice
     int32_t        openPitchHz = 0;
     int32_t        openVolL = 0;
     int32_t        openVolR = 0;
+    // Back to the start of a loop by the I/O thread (LOOP_*): while REQUESTED only it touches vf and the disc
+    // source; DONE hands them back.
+    volatile int32_t loopState = LOOP_NONE;
+    // Stopped while the I/O thread still worked on it (opening, reading ahead, seeking a loop's start): the voice
+    // left it, and that thread frees it once it's done (StreamStop, StreamTryRetire). Waiting for it held the main
+    // thread up behind the disc ("AUDIO stop waited 25 ms" restarting the dive's wind).
+    volatile bool  retiring = false;
 };
 
-static StreamVoice sStreams[AUDIO_MAX_VOICES];
+// Two slots a voice, in turn: one can be left to the I/O thread to finish and free (retiring) while the voice
+// goes on with the other at once. sStreams[v] is the voice's slot now (VoiceStream, StreamFor).
+static StreamVoice sStreamSlots[AUDIO_MAX_VOICES * 2];
+static StreamVoice* sStreams[AUDIO_MAX_VOICES] = {};
+
+static StreamVoice* VoiceStream(int32_t v)
+{
+    if (sStreams[v] == nullptr)
+        sStreams[v] = &sStreamSlots[v * 2];
+    return sStreams[v];
+}
 static size_t DiscRead(void* ptr, size_t size, size_t nmemb, void* ds);
 static int DiscSeek(void* ds, ogg_int64_t off, int whence);
 static long DiscTell(void* ds);
 static int MemClose(void* ds);
 static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want);
+static void StreamFree(StreamVoice* sv);
+
+// Whether the I/O thread has work in hand on this slot. (Interrupts off around it where it decides who frees it.)
+static bool StreamIoBusy(const StreamVoice* sv)
+{
+    return sv->openState == OPEN_REQUESTED || sv->disc.aheadState == AHEAD_REQUESTED || sv->loopState == LOOP_REQUESTED;
+}
+
+// The I/O thread, done with a slot its voice has left: freed here, once nothing is left in hand on it. It stays
+// `retiring` till StreamFree has finished (cleared last), so the main thread can't take it back half freed.
+static void StreamTryRetire(StreamVoice* sv)
+{
+    const u32 level = IRQ_Disable();
+    const bool take = sv->retiring && !StreamIoBusy(sv);
+    IRQ_Restore(level);
+    if (take)
+        StreamFree(sv);
+}
 
 // Serves read-ahead requests. Below the main thread's priority (see AUD_Initialize), so it runs
 // while the main thread waits on the GPU and vsync, not in the middle of its work.
 #if PLATFORM_GAMECUBE
 extern "C" void OctSd_NoteThreadPriority(u32 prio);  // (SdGeckoDma.c: its card reads above the main thread)
 #endif
+
+// The read-aheads asked for (RequestReadAhead), each into its source's spare window. (The I/O thread's.)
+static void ServeReadAheads()
+{
+    for (int32_t s = 0; s < AUDIO_MAX_VOICES * 2; ++s)
+    {
+        DiscSource* d = &sStreamSlots[s].disc;
+        if (d->aheadState != AHEAD_REQUESTED)
+            continue;
+
+        const bool ok = SYS_ReadFileRange(d->path.c_str(), true, d->base + d->aheadAt, d->aheadSize, (char*)d->ahead);
+        d->aheadState = ok ? AHEAD_READY : AHEAD_EMPTY;   // failed: the main thread reads it itself
+    }
+}
 
 static void* AudioIoThread(void*)
 {
@@ -142,11 +203,18 @@ static void* AudioIoThread(void*)
     {
         LWP_SemWait(sAudioIoSem);
 
-        for (int32_t v = 0; v < AUDIO_MAX_VOICES; ++v)
+        for (int32_t s = 0; s < AUDIO_MAX_VOICES * 2; ++s)
         {
-            StreamVoice* sv = &sStreams[v];
+            StreamVoice* sv = &sStreamSlots[s];
             if (sv->openState != OPEN_REQUESTED)
                 continue;
+            if (sv->retiring)                  // (stopped before it was opened: no need to open it now)
+            {
+                sv->vfOpen = false;
+                __asm__ volatile("" ::: "memory");
+                sv->openState = OPEN_FAILED;
+                continue;
+            }
 
             ov_callbacks dcb = { DiscRead, DiscSeek, MemClose, DiscTell };
             bool ok = (ov_open_callbacks(&sv->disc, &sv->vf, NULL, 0, dcb) >= 0);
@@ -168,15 +236,26 @@ static void* AudioIoThread(void*)
             sv->openState = ok ? OPEN_DONE : OPEN_FAILED;
         }
 
-        for (int32_t v = 0; v < AUDIO_MAX_VOICES; ++v)
-        {
-            DiscSource* d = &sStreams[v].disc;
-            if (d->aheadState != AHEAD_REQUESTED)
-                continue;
+        // Read-aheads first: a loop's seek below then finds them done (one asked for near the file's end is of no
+        // more use, and is dropped by DiscRead), and asks for the window after the start -- read in the second pass,
+        // before the main thread needs it.
+        ServeReadAheads();
 
-            const bool ok = SYS_ReadFileRange(d->path.c_str(), true, d->base + d->aheadAt, d->aheadSize, (char*)d->ahead);
-            d->aheadState = ok ? AHEAD_READY : AHEAD_EMPTY;   // failed: the main thread reads it itself
+        for (int32_t s = 0; s < AUDIO_MAX_VOICES * 2; ++s)
+        {
+            StreamVoice* sv = &sStreamSlots[s];
+            if (sv->loopState != LOOP_REQUESTED)
+                continue;
+            if (sv->vfOpen)
+                ov_pcm_seek(&sv->vf, 0);       // (its reads through DiscRead, here: none on the main thread)
+            __asm__ volatile("" ::: "memory");
+            sv->loopState = LOOP_DONE;
         }
+
+        ServeReadAheads();
+
+        for (int32_t s = 0; s < AUDIO_MAX_VOICES * 2; ++s)
+            StreamTryRetire(&sStreamSlots[s]);
     }
     return nullptr;
 }
@@ -301,7 +380,20 @@ static void WaitReadAhead(DiscSource* d)
         usleep(500);
 }
 
-// Decode up to `want` bytes into dst. Returns bytes written (0 = ended).
+// At a looping stream's end: on the main thread, a disc stream's way back to the start is the I/O thread's
+// (LOOP_REQUESTED) -- true, and StreamFill stops there. Anywhere else (in RAM, the I/O thread itself, no I/O
+// thread) it seeks there and then.
+static bool StreamDeferLoop(StreamVoice* sv)
+{
+    if (sv->disc.window == nullptr || sAudioIoSem == LWP_SEM_NULL || LWP_GetSelf() == sAudioIoThread)
+        return false;
+    __asm__ volatile("" ::: "memory");
+    sv->loopState = LOOP_REQUESTED;
+    LWP_SemPost(sAudioIoSem);
+    return true;
+}
+
+// Decode up to `want` bytes into dst. Returns bytes written (0 = ended, or a loop's start asked of the I/O thread).
 static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
 {
     uint32_t written = 0;
@@ -325,7 +417,7 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
         {
             // ASND wants little-endian 16-bit -> decode straight into dst.
             ret = ov_read(&sv->vf, (char*)(dst + written), (int)remain, 0, 2, 1, NULL);
-            if (ret == 0) { if (sv->loop) { ov_pcm_seek(&sv->vf, 0); ++errors; continue; } sv->eof = true; break; }   // a loop that cannot restart counts as an error too
+            if (ret == 0) { if (sv->loop) { if (StreamDeferLoop(sv)) break; ov_pcm_seek(&sv->vf, 0); ++errors; continue; } sv->eof = true; break; }   // a loop that cannot restart counts as an error too
             if (ret < 0) { ++errors; continue; }
             written += (uint32_t)ret;
         }
@@ -336,7 +428,7 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
             long cap = (long)sizeof(tmp);
             if (cap > (long)(remain * 2)) cap = (long)(remain * 2);
             ret = ov_read(&sv->vf, (char*)tmp, (int)cap, 1, 2, 1, NULL);
-            if (ret == 0) { if (sv->loop) { ov_pcm_seek(&sv->vf, 0); ++errors; continue; } sv->eof = true; break; }   // a loop that cannot restart counts as an error too
+            if (ret == 0) { if (sv->loop) { if (StreamDeferLoop(sv)) break; ov_pcm_seek(&sv->vf, 0); ++errors; continue; } sv->eof = true; break; }   // a loop that cannot restart counts as an error too
             if (ret < 0) { ++errors; continue; }
             int n = (int)(ret / 2);
             for (int i = 0; i < n; ++i)
@@ -346,14 +438,42 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
     return written;
 }
 
+// Stops a stream: freed here, or -- the I/O thread still working on it -- left to that thread to free when it's
+// done (retiring), and the voice goes on with its other slot (StreamFor). Never waits on the disc.
 static void StreamStop(StreamVoice* sv)
 {
     if (!sv->active) return;
+    if (sAudioIoSem != LWP_SEM_NULL)
+    {
+        const u32 level = IRQ_Disable();    // (the I/O thread's states can't change in between: one CPU)
+        const bool busy = StreamIoBusy(sv);
+        if (busy)
+        {
+            sv->retiring = true;
+            sv->active = false;
+        }
+        IRQ_Restore(level);
+        if (busy)
+        {
+            LWP_SemPost(sAudioIoSem);       // (its next pass frees it, once its work on it is done)
+            return;
+        }
+    }
+    StreamFree(sv);
+}
+
+// Frees a stream's decoder, buffers and disc windows. Nothing of it is the I/O thread's by now (StreamStop, or
+// that thread itself retiring it); the waits below are for safety only and come to nothing.
+static void StreamFree(StreamVoice* sv)
+{
     const uint64_t waitFromUs = SYS_GetTimeMicroseconds();
     const bool wasOpening = (sv->openState == OPEN_REQUESTED), wasReading = (sv->disc.aheadState == AHEAD_REQUESTED);
     while (sv->openState == OPEN_REQUESTED)   // (stopped while the I/O thread opens it: let it finish)
         usleep(500);
     sv->openState = OPEN_NONE;
+    while (sv->loopState == LOOP_REQUESTED)
+        usleep(500);
+    sv->loopState = LOOP_NONE;
     WaitReadAhead(&sv->disc);
     const uint64_t waitedUs = SYS_GetTimeMicroseconds() - waitFromUs;
     if (waitedUs > 1000)    // (the main thread held up by the I/O thread's disc work: a hitch, logged)
@@ -375,6 +495,31 @@ static void StreamStop(StreamVoice* sv)
     sv->disc.windowSize = 0;
     sv->active = false;
     sv->eof = false;
+    __asm__ volatile("" ::: "memory");   // (all of it freed before the slot is anyone's again)
+    sv->retiring = false;
+}
+
+// The voice's slot to start a stream in: its own, or -- that one still the I/O thread's to free -- the other of its
+// two. Both retiring (restarted twice within the I/O thread's work): waits for the other, logged as before.
+static StreamVoice* StreamFor(int32_t v)
+{
+    StreamVoice* cur = VoiceStream(v);
+    if (!cur->retiring)
+        return cur;
+    StreamVoice* other = (cur == &sStreamSlots[v * 2]) ? &sStreamSlots[v * 2 + 1] : &sStreamSlots[v * 2];
+    if (other->retiring)
+    {
+        const uint64_t waitFromUs = SYS_GetTimeMicroseconds();
+        while (other->retiring)
+        {
+            LWP_SemPost(sAudioIoSem);
+            usleep(500);
+        }
+        LogWarning("AUDIO stop waited %.1f ms (a voice restarted twice while its streams were still on the disc)",
+                   (SYS_GetTimeMicroseconds() - waitFromUs) / 1000.0f);
+    }
+    sStreams[v] = other;
+    return other;
 }
 
 // Keep-alive callback: non-NULL so an underrun parks the voice in SND_WAITING
@@ -865,7 +1010,7 @@ void AUD_Update()
     // Keep streamed voices fed (decode next chunk on the main thread).
     for (int32_t v = 0; v < AUDIO_MAX_VOICES; ++v)
     {
-        StreamVoice* sv = &sStreams[v];
+        StreamVoice* sv = VoiceStream(v);
         if (!sv->active) continue;
 
         // Opened by the I/O thread: still going, nothing to do; failed, gone; done, the voice set going
@@ -893,9 +1038,26 @@ void AUD_Update()
             continue;
         }
 
+        // Back at a loop's start (the I/O thread): decoding goes on. Still on its way: none this frame.
+        const int32_t loopNow = sv->loopState;
+        if (loopNow == LOOP_DONE)
+            sv->loopState = LOOP_NONE;
+        const bool looping = (loopNow == LOOP_REQUESTED);
+
+        // Near the end of the window with the next still being read: none this frame either, unless the voice is
+        // about to run dry (the I/O thread reads it while this thread waits on vsync).
+        const bool aboutDry = ASND_TestVoiceBufferReady(v);
+        bool waitDisc = false;
+        if (sv->disc.window != nullptr && sv->disc.aheadState == AHEAD_REQUESTED && !aboutDry)
+        {
+            const DiscSource& d = sv->disc;
+            const uint32_t left = (d.pos >= d.windowAt && d.pos < d.windowAt + d.windowSize) ? d.windowAt + d.windowSize - d.pos : 0;
+            waitDisc = (left < kDiscAheadMargin);
+        }
+
         // A slice of decoding, into the buffer that is neither playing nor queued.
         uint8_t* buf = sv->buf[sv->nextBuf];
-        if (!sv->eof && sv->filled < sv->bufSize)
+        if (!sv->eof && sv->filled < sv->bufSize && !looping && !waitDisc)
         {
             // A quarter more than the time that passed, so the decoder stays ahead of the playback.
             const uint32_t frameBytes = uint32_t(sv->channels * sv->bytesPerSample);
@@ -906,14 +1068,16 @@ void AUD_Update()
             if (want > slice) want = slice;
             // If the voice is about to run dry (a long frame, a slow read), finish the buffer now:
             // one long frame is better than a gap in the music.
-            if (ASND_TestVoiceBufferReady(v)) want = sv->bufSize - sv->filled;
+            if (aboutDry) want = sv->bufSize - sv->filled;
             uint32_t n = StreamFill(sv, buf + sv->filled, want);
             sv->filled += n;
-            if (n < want) sv->eof = true;
+            if (n < want && sv->loopState == LOOP_NONE) sv->eof = true;   // (short of it at a loop: the start's asked for)
         }
 
-        // Hand it over once it is full (or is all there is) and the voice has room for it.
-        if (sv->filled > 0 && (sv->filled >= sv->bufSize || sv->eof) && ASND_TestVoiceBufferReady(v))
+        // Hand it over once it is full (or is all there is) and the voice has room for it -- or, at a loop's end with
+        // the start still on its way and the voice about to run dry, what there is of it.
+        const bool loopWait = (sv->loopState == LOOP_REQUESTED);
+        if (sv->filled > 0 && (sv->filled >= sv->bufSize || sv->eof || loopWait) && ASND_TestVoiceBufferReady(v))
         {
             DCFlushRange(buf, sv->bufSize);
             ASND_AddVoice(v, buf, sv->filled);
@@ -971,8 +1135,8 @@ void AUD_Play(
 
     if (fromDisc || (soundWave->GetStream() && soundWave->GetCompressedData() != nullptr))
     {
-        StreamVoice* sv = &sStreams[voiceIndex];
-        StreamStop(sv);   // clean any previous stream on this voice
+        StreamStop(VoiceStream(voiceIndex));   // clean any previous stream on this voice (the I/O thread's to free, if busy)
+        StreamVoice* sv = StreamFor(voiceIndex);
         sv->active = true;  // so a failure below can StreamStop() what it allocated
         sv->buf[0] = sv->buf[1] = sv->buf[2] = nullptr;
         sv->memOwned = nullptr;
@@ -1143,7 +1307,7 @@ void AUD_Stop(uint32_t voiceIndex)
 
     if (voiceIndex < AUDIO_MAX_VOICES)
     {
-        StreamStop(&sStreams[voiceIndex]);
+        StreamStop(VoiceStream(voiceIndex));
     }
 }
 
@@ -1177,7 +1341,7 @@ bool AUD_IsPlaying(uint32_t voiceIndex)
             return false;
         }
 #endif
-        StreamVoice* sv = &sStreams[voiceIndex];
+        StreamVoice* sv = VoiceStream(voiceIndex);
         if (sv->active && (sv->openState == OPEN_REQUESTED || sv->openState == OPEN_DONE))
             return true;   // (still being opened by the I/O thread: playing, as far as anyone asks)
         if (sv->active && sv->eof && sv->filled == 0 && VoiceDrained(voiceIndex, sv->buf, 3))
@@ -1196,10 +1360,10 @@ void AUD_SetVolume(uint32_t voiceIndex, float leftVolume, float rightVolume)
     int32_t leftVolInt = int32_t(MID_VOLUME * leftVolume);
     int32_t rightVolInt = int32_t(MID_VOLUME * rightVolume);
     ASND_ChangeVolumeVoice(voiceIndex, leftVolInt, rightVolInt);
-    if (voiceIndex < AUDIO_MAX_VOICES && sStreams[voiceIndex].openState != OPEN_NONE)
+    if (voiceIndex < AUDIO_MAX_VOICES && VoiceStream(voiceIndex)->openState != OPEN_NONE)
     {
-        sStreams[voiceIndex].openVolL = leftVolInt;   // (not set going yet: it starts at this)
-        sStreams[voiceIndex].openVolR = rightVolInt;
+        VoiceStream(voiceIndex)->openVolL = leftVolInt;   // (not set going yet: it starts at this)
+        VoiceStream(voiceIndex)->openVolR = rightVolInt;
     }
 }
 

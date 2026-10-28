@@ -8,13 +8,26 @@
 
 #if LUA_ENABLED
 
+// The Vector metatable kept in the registry under this address (Bind), fetched by it (a raw get by pointer) for every
+// Vector made -- not luaL_getmetatable's lookup by name. Engine calls and scripts make Vectors by the hundred a frame.
+static const char sVectorMetatableKey = 0;
+
+static void PushVectorMetatable(lua_State* L)
+{
+    if (lua_rawgetp(L, LUA_REGISTRYINDEX, &sVectorMetatableKey) != LUA_TTABLE)
+    {
+        lua_pop(L, 1);
+        luaL_getmetatable(L, VECTOR_LUA_NAME);
+    }
+}
+
 int Vector_Lua::Create(lua_State* L)
 {
     int numArgs = lua_gettop(L);
 
     Vector_Lua* newVector = (Vector_Lua*)lua_newuserdata(L, sizeof(Vector_Lua));
     new (newVector) Vector_Lua();
-    luaL_getmetatable(L, VECTOR_LUA_NAME);
+    PushVectorMetatable(L);
     OCT_ASSERT(lua_istable(L, -1));
     lua_setmetatable(L, -2);
 
@@ -44,7 +57,7 @@ int Vector_Lua::Create(lua_State* L, glm::vec4 value)
     Vector_Lua* newVector = (Vector_Lua*)lua_newuserdata(L, sizeof(Vector_Lua));
     new (newVector) Vector_Lua();
     newVector->mVector = value;
-    luaL_getmetatable(L, VECTOR_LUA_NAME);
+    PushVectorMetatable(L);
     OCT_ASSERT(lua_istable(L, -1));
     lua_setmetatable(L, -2);
 
@@ -72,7 +85,8 @@ int Vector_Lua::Destroy(lua_State* L)
 
 int Vector_Lua::Index(lua_State* L)
 {
-    glm::vec4& value = CHECK_VECTOR(L, 1);
+    // (only the Vector metatable has this __index: arg 1 is a Vector, not checked again -- v.x read by the thousand)
+    glm::vec4& value = ((Vector_Lua*)lua_touserdata(L, 1))->mVector;
     const char* key = CHECK_STRING(L, 2);
 
     bool propertyFound = false;
@@ -117,7 +131,7 @@ int Vector_Lua::Index(lua_State* L)
     else
     {
         lua_getglobal(L, VECTOR_LUA_NAME);
-        lua_pushstring(L, key);
+        lua_pushvalue(L, 2);                // (the key as it is: not re-made from a C string)
         // I think this could be a normal lua_tableget() if you wanted to follow an inheritance chain.
         // But vector doesn't need that.
         lua_rawget(L, -2);
@@ -127,7 +141,8 @@ int Vector_Lua::Index(lua_State* L)
 
 int Vector_Lua::NewIndex(lua_State* L)
 {
-    glm::vec4& value = CHECK_VECTOR(L, 1);
+    // (only the Vector metatable has this __newindex: arg 1 is a Vector, not checked again)
+    glm::vec4& value = ((Vector_Lua*)lua_touserdata(L, 1))->mVector;
     const char* key = CHECK_STRING(L, 2);
     // Arg3 is value we want to assign
 
@@ -566,6 +581,9 @@ void Vector_Lua::Bind()
 
     luaL_newmetatable(L, VECTOR_LUA_NAME);
     int mtIndex = lua_gettop(L);
+
+    lua_pushvalue(L, mtIndex);              // (kept by address too: PushVectorMetatable)
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &sVectorMetatableKey);
 
     REGISTER_TABLE_FUNC(L, mtIndex, Create);
 

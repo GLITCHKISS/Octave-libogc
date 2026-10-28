@@ -8,6 +8,11 @@
 
 #include "Graphics/Graphics.h"
 
+#if PLATFORM_DOLPHIN
+#include <ogc/lwp_watchdog.h>          // (gettime: the CPU's timebase -- the stats timed in its ticks, not through
+                                       //  SYS_GetTimeMicroseconds' gettimeofday and its 64-bit divides)
+#endif
+
 static Profiler* sProfiler = nullptr;
 
 #if PLATFORM_DOLPHIN && PROFILING_ENABLED
@@ -19,6 +24,12 @@ static Profiler* sProfiler = nullptr;
 #include <string.h>
 #include <malloc.h>
 void OctLog(const char* format, ...);
+
+bool OctPerfLogging()
+{
+    const EngineConfig* config = GetEngineConfig();
+    return config != nullptr && config->mLogging;
+}
 
 static const float kPerfLogPeriod = 5.0f;
 // The last period's two halves, kept for System.GetPerfReport(): a game can put them on screen
@@ -47,20 +58,42 @@ namespace
         double mAllocKb;
         double mFreedKb;
     };
-    const uint32_t kMaxLuaPerf = 24;
+    const uint32_t kMaxLuaPerf = 48;                    // (a game's scripts and their PerfBegin parts: 24 were too few,
+                                                        //  the later parts never logged)
     LuaPerf sLuaPerf[kMaxLuaPerf];
     uint32_t sNumLuaPerf = 0;
 
     struct LuaPerfOpen
     {
         LuaPerf* mEntry;
-        uint64_t mStartUs;
+        uint64_t mStartTicks;                    // (the timebase's)
         int64_t mStartBytes;
     };
     LuaPerfOpen sLuaOpen[16];
     uint32_t sNumLuaOpen = 0;
 
+    // (each name's entry kept by the address of the string it came by -- a script's class name is the same string
+    //  every tick -- checked against the entry's name, so a string freed and its address reused finds its own)
+    struct LuaPerfSeen { const char* mPtr; LuaPerf* mEntry; };
+    LuaPerfSeen sLuaSeen[64];
+
+    LuaPerf* FindLuaPerfSlow(const char* name);
+
     LuaPerf* FindLuaPerf(const char* name)
+    {
+        LuaPerfSeen& seen = sLuaSeen[(uintptr_t(name) >> 2) & 63];
+        if (seen.mPtr == name && seen.mEntry != nullptr &&
+            strncmp(seen.mEntry->mName, name, sizeof(seen.mEntry->mName) - 1) == 0)
+        {
+            return seen.mEntry;
+        }
+        LuaPerf* e = FindLuaPerfSlow(name);
+        seen.mPtr = name;
+        seen.mEntry = e;
+        return e;
+    }
+
+    LuaPerf* FindLuaPerfSlow(const char* name)
     {
         for (uint32_t i = 0; i < sNumLuaPerf; ++i)
         {
@@ -89,7 +122,7 @@ namespace
 #endif
     }
 
-    void LuaPerfAdd(LuaPerf* e, uint64_t us, int64_t bytes)
+    void LuaPerfAdd(LuaPerf* e, float ms, int64_t bytes)
     {
         const uint32_t frame = GetEngineState()->mFrameNumber;
         if (e->mFrame != frame)
@@ -98,7 +131,6 @@ namespace
             e->mFrameMs = 0.0f;
             e->mFrame = frame;
         }
-        const float ms = us / 1000.0f;
         e->mFrameMs += ms;
         e->mSumMs += ms;
         if (bytes >= 0) e->mAllocKb += bytes / 1024.0;
@@ -137,24 +169,29 @@ namespace
 
 void OctLuaPerfBegin(const char* name)
 {
+    if (!OctPerfLogging())                  // (no log: nothing to time -- the Lua heap read twice and the clock
+        return;                             //  twice a script a frame for nothing)
     if (sNumLuaOpen < sizeof(sLuaOpen) / sizeof(sLuaOpen[0]))
     {
         LuaPerfOpen& o = sLuaOpen[sNumLuaOpen++];
         o.mEntry = FindLuaPerf(name);
         o.mStartBytes = LuaHeapBytes();
-        o.mStartUs = SYS_GetTimeMicroseconds();
+        o.mStartTicks = gettime();
     }
 }
 
 void OctLuaPerfEnd()
 {
+    if (!OctPerfLogging())
+        return;
     if (sNumLuaOpen > 0)
     {
-        const uint64_t nowUs = SYS_GetTimeMicroseconds();
+        const uint64_t nowTicks = gettime();
         LuaPerfOpen& o = sLuaOpen[--sNumLuaOpen];
         if (o.mEntry != nullptr)
         {
-            LuaPerfAdd(o.mEntry, nowUs - o.mStartUs, LuaHeapBytes() - o.mStartBytes);
+            const float ms = float(double(nowTicks - o.mStartTicks) / double(TB_TIMER_CLOCK));
+            LuaPerfAdd(o.mEntry, ms, LuaHeapBytes() - o.mStartBytes);
         }
     }
 }
@@ -317,7 +354,11 @@ void Profiler::BeginCpuStat(const char* name, bool persistent)
         }
     }
 
+#if PLATFORM_DOLPHIN
+    stat->mStartTime = gettime();            // (the timebase's ticks: EndCpuStat takes them back to ms)
+#else
     stat->mStartTime = SYS_GetTimeMicroseconds();
+#endif
 #endif
 }
 
@@ -329,8 +370,13 @@ void Profiler::EndCpuStat(const char* name, bool persistent)
 
     if (stat)
     {
+#if PLATFORM_DOLPHIN
+        stat->mEndTime = gettime();
+        stat->mTime += float(double(stat->mEndTime - stat->mStartTime) / double(TB_TIMER_CLOCK));
+#else
         stat->mEndTime = SYS_GetTimeMicroseconds();
         stat->mTime += (stat->mEndTime - stat->mStartTime) / 1000.0f;
+#endif
     }
 #endif
 }

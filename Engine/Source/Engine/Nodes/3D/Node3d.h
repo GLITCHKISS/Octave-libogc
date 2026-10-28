@@ -99,6 +99,10 @@ protected:
 
     glm::vec3 mPosition;
     glm::vec3 mRotationEuler;
+    // mRotationEuler behind the turn (mRotationQuat): filled when something reads it (RefreshEuler), not at every
+    // transform update -- its atan2/asin are software on the GameCube, and nearly nothing reads it at runtime
+    mutable bool mEulerStale = false;
+    void RefreshEuler() const;
     glm::vec3 mScale;
     
     glm::quat mRotationQuat;

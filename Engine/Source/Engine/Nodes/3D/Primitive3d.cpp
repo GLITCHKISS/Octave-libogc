@@ -307,6 +307,12 @@ void Primitive3D::EnablePhysics(bool enable)
         }
 
         EnableRigidBody(true);
+
+        // (a StaticMesh3D without physics is left off the tick list -- Node::NeedsTick: on it now, its body to sync)
+        if (enable && GetWorld() != nullptr)
+        {
+            GetWorld()->AddNewlyRegisteredNode(this);
+        }
     }
 }
 

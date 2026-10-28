@@ -536,6 +536,11 @@ World::World() :
     mSolver = new btSequentialImpulseConstraintSolver();
     mDynamicsWorld = new btDiscreteDynamicsWorld(mCollisionDispatcher, mBroadphase, mSolver, mCollisionConfig);
     mDynamicsWorld->setGravity(btVector3(0, -10, 0));
+    // Only the active bodies' bounds recomputed each step, not every collision object's (Bullet's default): a moved
+    // primitive is taken out of the world and put back (Primitive3D::FullSyncRigidBodyTransform, from UpdateTransform
+    // and SetTransform -- its scale set first), which computes its bounds anew, and a simulated one is active. Every
+    // static mesh of a level had its bounds worked out and handed to the broadphase each frame for nothing.
+    mDynamicsWorld->setForceUpdateAllAabbs(false);
 
     mDefaultDynamicsWorld = mDynamicsWorld;
 #endif

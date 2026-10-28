@@ -6,6 +6,7 @@
 #include "Log.h"
 #include "Maths.h"
 #include "Utilities.h"
+#include <algorithm>
 
 #include "Graphics/Graphics.h"
 #if API_GX
@@ -752,9 +753,8 @@ static inline float OctRsqrt(float x)
     double y;
     __asm__("frsqrte %0,%1" : "=f"(y) : "f"((double)x));
     const double h = 0.5 * x;
-    y = y * (1.5 - h * y * y);
-    y = y * (1.5 - h * y * y);
-    y = y * (1.5 - h * y * y);
+    y = y * (1.5 - h * y * y);                                      // (the estimate's 5 bits to 10,
+    y = y * (1.5 - h * y * y);                                      //  then 20: a unit normal to a millionth)
     return (float)y;
 #else
     return 1.0f / sqrtf(x);
@@ -1823,15 +1823,20 @@ void SkeletalMesh3D::CpuSkinVertices()
         mSkinnedVertices.resize(mesh->GetNumVertices());
         const std::vector<VertexSkinned>& verts = mesh->GetVertices();
         const uint32_t numVerts = mesh->GetNumVertices();
+        const VertexSkinned* src = verts.data();
+        Vertex* dst = mSkinnedVertices.data();
+        const glm::mat4* boneMats = mBoneMatrices.data();
 
-        // One pass a vertex: its morph targets' moves added (each by its weight), its normal made unit again, then its
-        // bones' blended transform -- as a 3x4 (the bottom row of a bone matrix is always 0 0 0 1). It used to copy
-        // the whole mesh each frame for the morphs, walk it again for each target and once more for the normals, and
-        // blend and apply full 4x4s: the parachute (morph targets, ~2500 vertices) took 4-6 ms on the GameCube.
-        // The same sums, the same result.
+        // The morph targets, each by its weight, added to the vertex's own as the vertices go by: a target's moves read
+        // straight alongside the vertex, in the same order as ever (target by target, from the vertex's own). The
+        // parachute's four targets each move every one of its 2542 vertices, so a list of the vertices each moves, and
+        // its sums kept aside then read back, only pulled more memory through the cache -- it was ~3.9 ms of a glide
+        // on the GameCube, nearly all of it waiting on memory: eight streams a vertex (the mesh's vertex, four targets'
+        // moves, two targets' normal changes, the scratch sums), none asked for ahead.
         struct ActiveMorph { const glm::vec3* mPos; const glm::vec3* mNrm; uint32_t mNumPos; uint32_t mNumNrm; float mWeight; };
         static std::vector<ActiveMorph> sMorphs;
         sMorphs.clear();
+        bool morphNormals = false;
         const uint32_t numMorphs = glm::min<uint32_t>(mesh->GetNumMorphTargets(), uint32_t(mMorphWeights.size()));
         for (uint32_t m = 0; m < numMorphs; ++m)
         {
@@ -1839,17 +1844,48 @@ void SkeletalMesh3D::CpuSkinVertices()
             if (w == 0.0f)
                 continue;
             const MorphTarget& morph = mesh->GetMorphTarget(m);
-            sMorphs.push_back({ morph.mPositions.data(), morph.mNormals.data(),
-                                uint32_t(morph.mPositions.size()), uint32_t(morph.mNormals.size()), w });
+            const uint32_t numPos = glm::min<uint32_t>(uint32_t(morph.mPositions.size()), numVerts);
+            const uint32_t numNrm = glm::min<uint32_t>(uint32_t(morph.mNormals.size()), numVerts);
+            if (numPos == 0 && numNrm == 0)
+                continue;
+            sMorphs.push_back({ morph.mPositions.data(), morph.mNormals.data(), numPos, numNrm, w });
+            morphNormals = morphNormals || (numNrm > 0);
         }
         const uint32_t numActive = uint32_t(sMorphs.size());
+        const ActiveMorph* active = sMorphs.data();
         const bool oneBone = (mBoneInfluenceMode == BoneInfluenceMode::One);
+
+#if PLATFORM_DOLPHIN
+        // Each 32-byte cache line of the array zeroed just before it's written (dcbz) -- every byte of a Vertex is
+        // written below, so nothing the zeroing clears is kept -- not read in from memory first, as a store to a line
+        // not in the cache otherwise is; and the source a few vertices ahead asked for (dcbt). The lines only partly
+        // in the array (its ends) are left alone.
+        const bool zeroLines = sizeof(Vertex) == 2 * sizeof(glm::vec3) + 2 * sizeof(glm::vec2);   // (no padding)
+        uintptr_t nextLine = ((uintptr_t)dst + 31) & ~(uintptr_t)31;
+        const uintptr_t dstEnd = (uintptr_t)(dst + numVerts);
+#endif
 
         static_assert(MAX_BONE_INFLUENCES == 4, "Need to adjust this code or convert to loop.");
         for (uint32_t i = 0; i < numVerts; ++i)
         {
-            const VertexSkinned& srcVert = verts[i];
-            Vertex& dstVert = mSkinnedVertices[i];
+            const VertexSkinned& srcVert = src[i];
+            Vertex& dstVert = dst[i];
+#if PLATFORM_DOLPHIN
+            if (zeroLines)
+            {
+                const uintptr_t vertEnd = (uintptr_t)(dst + i + 1);
+                while (nextLine < vertEnd && nextLine + 32 <= dstEnd)
+                {
+                    __asm__ volatile("dcbz 0,%0" : : "r"(nextLine) : "memory");
+                    nextLine += 32;
+                }
+            }
+            if (i + 4 < numVerts)
+            {
+                __asm__ volatile("dcbt 0,%0" : : "r"(src + i + 4));                                // (a source vertex is
+                __asm__ volatile("dcbt 0,%0" : : "r"((const char*)(src + i + 4) + 32));            //  two cache lines)
+            }
+#endif
 
             glm::vec3 pos = srcVert.mPosition;
             glm::vec3 nrm = srcVert.mNormal;
@@ -1857,34 +1893,51 @@ void SkeletalMesh3D::CpuSkinVertices()
             {
                 for (uint32_t m = 0; m < numActive; ++m)
                 {
-                    const ActiveMorph& am = sMorphs[m];
+                    const ActiveMorph& am = active[m];
+#if PLATFORM_DOLPHIN
+                    // (its moves 8 vertices ahead asked for: 12 bytes a vertex, a cache line every 2-3 vertices)
+                    if (i + 8 < am.mNumPos)
+                        __asm__ volatile("dcbt 0,%0" : : "r"(am.mPos + i + 8));
+                    if (i + 8 < am.mNumNrm)
+                        __asm__ volatile("dcbt 0,%0" : : "r"(am.mNrm + i + 8));
+#endif
                     if (i < am.mNumPos) pos += am.mPos[i] * am.mWeight;
                     if (i < am.mNumNrm) nrm += am.mNrm[i] * am.mWeight;
                 }
-                const float len2 = nrm.x * nrm.x + nrm.y * nrm.y + nrm.z * nrm.z;
-                if (len2 > 1e-8f) nrm *= OctRsqrt(len2);
+                if (morphNormals)                                   // (the normal turned: made unit again)
+                {
+                    const float len2 = nrm.x * nrm.x + nrm.y * nrm.y + nrm.z * nrm.z;
+                    if (len2 > 1e-8f) nrm *= OctRsqrt(len2);
+                }
             }
 
             // the bones' blended transform, its top three rows only (columns c0..c2 the rotation-scale, c3 the move);
-            // the rest, weighted 0, left out (most vertices have one or two bones)
-            const glm::mat4& b0 = mBoneMatrices[srcVert.mBoneIndices[0]];
+            // the rest, weighted 0, left out (most vertices have one or two bones). One bone of weight 1 (the most
+            // common: rigid parts): its matrix's columns as they are -- times 1, the same numbers
+            const glm::mat4& b0 = boneMats[srcVert.mBoneIndices[0]];
             const float w0 = oneBone ? 1.0f : srcVert.mBoneWeights[0];
-            glm::vec3 c0 = glm::vec3(b0[0]) * w0, c1 = glm::vec3(b0[1]) * w0, c2 = glm::vec3(b0[2]) * w0, c3 = glm::vec3(b0[3]) * w0;
-            if (!oneBone)
+            glm::vec3 c0, c1, c2, c3;
+            if (oneBone || (w0 == 1.0f && srcVert.mBoneWeights[1] == 0.0f && srcVert.mBoneWeights[2] == 0.0f &&
+                            srcVert.mBoneWeights[3] == 0.0f))
             {
+                c0 = glm::vec3(b0[0]); c1 = glm::vec3(b0[1]); c2 = glm::vec3(b0[2]); c3 = glm::vec3(b0[3]);
+            }
+            else
+            {
+                c0 = glm::vec3(b0[0]) * w0; c1 = glm::vec3(b0[1]) * w0; c2 = glm::vec3(b0[2]) * w0; c3 = glm::vec3(b0[3]) * w0;
                 for (uint32_t k = 1; k < 4; ++k)
                 {
                     const float w = srcVert.mBoneWeights[k];
                     if (w == 0.0f) continue;
-                    const glm::mat4& b = mBoneMatrices[srcVert.mBoneIndices[k]];
+                    const glm::mat4& b = boneMats[srcVert.mBoneIndices[k]];
                     c0 += glm::vec3(b[0]) * w; c1 += glm::vec3(b[1]) * w; c2 += glm::vec3(b[2]) * w; c3 += glm::vec3(b[3]) * w;
                 }
             }
 
             dstVert.mPosition = c0 * pos.x + c1 * pos.y + c2 * pos.z + c3;
-            dstVert.mNormal = c0 * nrm.x + c1 * nrm.y + c2 * nrm.z;
             dstVert.mTexcoord0 = srcVert.mTexcoord0;
             dstVert.mTexcoord1 = srcVert.mTexcoord1;
+            dstVert.mNormal = c0 * nrm.x + c1 * nrm.y + c2 * nrm.z;
         }
 
         GFX_UpdateSkeletalMeshCompVertexBuffer(this, mSkinnedVertices);

@@ -93,6 +93,7 @@ public:
     virtual void Start();
     virtual void Stop();
     virtual void PrepareTick(std::vector<NodePtrWeak>& outTickNodes, bool game, bool recurse);
+    bool NeedsTick() const;
     virtual void Tick(float deltaTime);
     virtual void EditorTick(float deltaTime);
     uint32_t GetLastTickedFrame() const;

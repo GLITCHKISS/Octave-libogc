@@ -124,6 +124,7 @@ const char* Node3D::GetTypeName() const
 void Node3D::GatherProperties(std::vector<Property>& outProps)
 {
     Node::GatherProperties(outProps);
+    RefreshEuler();                                     // (Rotation reads mRotationEuler: filled first)
 
     SCOPED_CATEGORY("3D");
 
@@ -136,6 +137,7 @@ void Node3D::GatherProperties(std::vector<Property>& outProps)
 void Node3D::GatherReplicatedData(std::vector<NetDatum>& outData)
 {
     Node::GatherReplicatedData(outData);
+    RefreshEuler();
 
     if (mReplicateTransform)
     {
@@ -229,9 +231,11 @@ void Node3D::UpdateTransform(bool updateChildren)
             scale = glm::vec3(mScale.x, mScale.x, mScale.x);
         }
         
-        mTransform = glm::translate(mTransform, mPosition);
-        mTransform *= glm::toMat4(mRotationQuat);
-        mTransform = glm::scale(mTransform, scale);
+        // translate * rotate * scale, written out: the turn's columns times the scale, the place the last column --
+        // the same matrix, without three 4x4 multiplies a node (scripts move dozens of nodes a frame)
+        const glm::mat3 r = glm::mat3_cast(mRotationQuat);
+        mTransform = glm::mat4(glm::vec4(r[0] * scale.x, 0.0f), glm::vec4(r[1] * scale.y, 0.0f),
+                               glm::vec4(r[2] * scale.z, 0.0f), glm::vec4(mPosition, 1.0f));
 
         if (parent != nullptr && mInheritTransform)
         {
@@ -249,8 +253,22 @@ void Node3D::UpdateTransform(bool updateChildren)
             }
         }
 
-        // Cache off the euler angle rotation.
+        // Cache off the euler angle rotation: at once where it's read every frame (the editor's Rotation field, a
+        // replicated transform's net datum), else when it's next read (RefreshEuler)
+#if EDITOR
         mRotationEuler = GetRotationEuler();
+        mEulerStale = false;
+#else
+        if (mReplicateTransform)
+        {
+            mRotationEuler = GetRotationEuler();
+            mEulerStale = false;
+        }
+        else
+        {
+            mEulerStale = true;
+        }
+#endif
 
         mTransformDirty = false;
     }
@@ -355,7 +373,17 @@ glm::vec3& Node3D::GetPositionRef()
 
 glm::vec3& Node3D::GetRotationEulerRef()
 {
+    RefreshEuler();
     return mRotationEuler;
+}
+
+void Node3D::RefreshEuler() const
+{
+    if (mEulerStale)
+    {
+        const_cast<Node3D*>(this)->mRotationEuler = GetRotationEuler();
+        mEulerStale = false;
+    }
 }
 
 glm::quat& Node3D::GetRotationQuatRef()
@@ -380,25 +408,46 @@ const glm::mat4& Node3D::GetTransform()
     return mTransform;
 }
 
+// (Each setter leaves the transform clean when its value hasn't changed: scripts set places, turns and sizes every
+// frame whether they moved or not, and each one marked the node's transform to be rebuilt. A parent that does change
+// marks its children dirty itself -- UpdateTransform -- so nothing waits on these.)
 void Node3D::SetPosition(glm::vec3 position)
 {
+    if (position == mPosition)
+        return;
     mPosition = position;
     MarkTransformDirty();
 }
 
 void Node3D::SetRotation(glm::vec3 rotation)
 {
-    SetRotation(glm::quat(rotation * DEGREES_TO_RADIANS));
+    // glm::quat(euler)'s own sums, an axis at exactly 0 not run through cosf/sinf (1 and 0 exactly: the same
+    // quaternion, bit for bit) -- scripts turn nodes about one axis, and each cosf/sinf is software on the GameCube
+    const glm::vec3 h = (rotation * DEGREES_TO_RADIANS) * 0.5f;
+    const float cx = (h.x == 0.0f) ? 1.0f : cosf(h.x), sx = (h.x == 0.0f) ? 0.0f : sinf(h.x);
+    const float cy = (h.y == 0.0f) ? 1.0f : cosf(h.y), sy = (h.y == 0.0f) ? 0.0f : sinf(h.y);
+    const float cz = (h.z == 0.0f) ? 1.0f : cosf(h.z), sz = (h.z == 0.0f) ? 0.0f : sinf(h.z);
+    glm::quat q;
+    q.w = cx * cy * cz + sx * sy * sz;
+    q.x = sx * cy * cz - cx * sy * sz;
+    q.y = cx * sy * cz + sx * cy * sz;
+    q.z = cx * cy * sz - sx * sy * cz;
+    SetRotation(q);
 }
 
 void Node3D::SetRotation(glm::quat quat)
 {
-    mRotationQuat = glm::normalize(quat);
+    const glm::quat q = glm::normalize(quat);
+    if (q == mRotationQuat)
+        return;
+    mRotationQuat = q;
     MarkTransformDirty();
 }
 
 void Node3D::SetScale(glm::vec3 scale)
 {
+    if (scale == mScale)
+        return;
     mScale = scale;
     MarkTransformDirty();
 }
@@ -412,6 +461,7 @@ void Node3D::SetTransform(const glm::mat4& transform)
     SetWorldScale(Maths::ExtractScale(transform));
     SetWorldRotation(Maths::ExtractRotation(transform));
     mRotationEuler = GetRotationEuler();
+    mEulerStale = false;
 
     mTransformDirty = false;
 
@@ -582,6 +632,7 @@ void Node3D::LookAt(glm::vec3 target, glm::vec3 up)
 
 glm::vec3 Node3D::GetCachedEulerRotation() const
 {
+    RefreshEuler();
     return mRotationEuler;
 }
 

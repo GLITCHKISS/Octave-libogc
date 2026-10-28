@@ -32,22 +32,35 @@ Node* CheckNodeWrapper(lua_State* L, int arg)
     return CheckNodeWrapperPtr(L, arg).Get();
 }
 
+// The node checked in C++: a node wrapper (its metatable), then the node's own class (Object::Is by name -- the
+// node classes' Lua names are their C++ names). It used to look classFlag up on the userdata, through the wrapper's
+// __index and the whole script and native class chain, for every node method a script called (node:SetPosition and
+// the rest), twice over with the method's own lookup.
 Node* CheckNodeLuaType(lua_State* L, int arg, const char* className, const char* classFlag)
 {
-    Node* ret = nullptr;
-    Node_Lua* luaObj = static_cast<Node_Lua*>(CheckHierarchyLuaType<Node_Lua>(L, arg, className, classFlag));
+    OCT_UNUSED(classFlag);
+    luaL_checktype(L, arg, LUA_TUSERDATA);
+    Node_Lua* luaObj = static_cast<Node_Lua*>(luaL_testudata(L, arg, NODE_WRAPPER_TABLE_NAME));
 
-    if (luaObj != nullptr)
+    if (luaObj == nullptr)
     {
-        ret = luaObj->mNode.Get();
-        if (ret == nullptr)
-        {
-            luaL_error(L, "Attempting to use invalid Node at arg %d", arg);
-        }
-        else if (ret->IsDestroyed())
-        {
-            luaL_error(L, "Attempting to use a destroyed Node at arg %d", arg);
-        }
+        luaL_error(L, "Error: Arg #%d: Expected %s", arg, className);
+        return nullptr;
+    }
+
+    Node* ret = luaObj->mNode.Get();
+    if (ret == nullptr)
+    {
+        luaL_error(L, "Attempting to use invalid Node at arg %d", arg);
+    }
+    else if (ret->IsDestroyed())
+    {
+        luaL_error(L, "Attempting to use a destroyed Node at arg %d", arg);
+    }
+    else if (!ret->Is(className))
+    {
+        luaL_error(L, "Error: Arg #%d: Expected %s", arg, className);
+        ret = nullptr;
     }
 
     return ret;
@@ -58,9 +71,9 @@ Object* CheckObjectLuaType(lua_State* L, int arg)
     Object* obj = nullptr;
     luaL_checktype(L, arg, LUA_TUSERDATA);
 
-    // Only nodes support script-to-native function calls.
-    bool isNode = (lua_getfield(L, arg, "cfNode") != LUA_TNIL);
-    lua_pop(L, 1);
+    // Only nodes support script-to-native function calls. (A node wrapper: its metatable, not "cfNode" looked up
+    // through its __index.)
+    bool isNode = (luaL_testudata(L, arg, NODE_WRAPPER_TABLE_NAME) != nullptr);
 
     if (isNode)
     {
