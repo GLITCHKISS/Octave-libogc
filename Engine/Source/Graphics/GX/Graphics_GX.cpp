@@ -1261,10 +1261,10 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
 // meet the edges are the same on both sides. Not for a mesh with morph targets (a morph moves the vertices before
 // the bones do), nor under a material whose texgens read the normals as they come (a sphere map, the sharp
 // specular's lobes: GxSkinRigidPlan), nor for a mesh mostly blended.
-// OFF for now (OCT_GX_RIGID_SKIN 0): it draws right in Dolphin, but a real GameCube hangs at the first frame that
-// draws a character with it. Not yet found why; the CPU skins every vertex as before.
+// (A real GameCube's GPU hangs on position-only vertices with a matrix index -- Dolphin draws them -- so the
+// projected shadow's caster draws the full lists too: the extra attributes go unread with no texgens or lighting.)
 #ifndef OCT_GX_RIGID_SKIN
-#define OCT_GX_RIGID_SKIN 0
+#define OCT_GX_RIGID_SKIN 1
 #endif
 static const uint32_t kRigidBones = 9;                  // (a batch's: slots 1-9)
 
@@ -1272,8 +1272,6 @@ struct GxRigidBatch
 {
     void* mFull = nullptr;                              // matrix index, position, normal, both texcoords a vertex
     uint32_t mFullSize = 0;
-    void* mPos = nullptr;                               // matrix index, position (the projected shadow's caster)
-    uint32_t mPosSize = 0;
     uint32_t mNumBones = 0;
     uint8_t mBones[kRigidBones] = {};                   // slot 1 + i: bone mBones[i]
 };
@@ -1427,7 +1425,6 @@ static void FreeRigidBatches(GxSkinLists& lists)
     for (GxRigidBatch& batch : lists.mRigid)
     {
         GxDeferFree(batch.mFull);                       // (the GPU may still be drawing the last frame from them)
-        GxDeferFree(batch.mPos);
     }
     lists.mRigid.clear();
     lists.mBlendedVerts.clear();
@@ -1550,8 +1547,7 @@ static void BuildRigidBatches(SkeletalMesh* mesh, GxSkinLists& lists)
         memcpy(out.mBones, batch.mBones, sizeof(out.mBones));
         const bool any = !strips.mLens.empty() || !strips.mSingles.empty();
         out.mFull = WriteSkinList(strips, 4, mtxIdx.data(), mesh->GetName().c_str(), out.mFullSize);
-        out.mPos = WriteSkinList(strips, 1, mtxIdx.data(), mesh->GetName().c_str(), out.mPosSize);
-        if (any && (out.mFull == nullptr || out.mPos == nullptr))
+        if (any && out.mFull == nullptr)
         {
             FreeRigidBatches(lists);                    // (out of memory: the CPU skins it all, as before)
             return;
@@ -1583,11 +1579,11 @@ static const GxSkinLists* GetRigidLists(SkeletalMesh3D* comp, SkeletalMesh* mesh
 // Each batch: its bones' matrices into slots 1-9 (normalMtx: the normal matrices too, for a draw that reads normals),
 // then its list. Slot 0 -- the model-view, for the vertices the CPU skinned -- the caller's.
 static void DrawRigidBatches(const GxSkinLists& lists, SkeletalMesh3D* comp, const Mtx modelView,
-                             const Mtx* normalMtx, bool posOnly)
+                             const Mtx* normalMtx)
 {
     for (const GxRigidBatch& batch : lists.mRigid)
     {
-        void* list = posOnly ? batch.mPos : batch.mFull;
+        void* list = batch.mFull;
         if (list == nullptr)
             continue;                                   // (only faces with no area)
         for (uint32_t s = 0; s < batch.mNumBones; ++s)
@@ -1604,7 +1600,7 @@ static void DrawRigidBatches(const GxSkinLists& lists, SkeletalMesh3D* comp, con
                 GX_LoadNrmMtxImm(normalTransform, GX_PNMTX0 + (s + 1) * 3);
             }
         }
-        GX_CallDispList(list, posOnly ? batch.mPosSize : batch.mFullSize);
+        GX_CallDispList(list, batch.mFullSize);
     }
 }
 
@@ -1940,7 +1936,7 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
         {
             if (rigid != nullptr)
             {
-                DrawRigidBatches(*rigid, skeletalMeshComp, modelView, readsNormals ? &normalMtx : nullptr, false);
+                DrawRigidBatches(*rigid, skeletalMeshComp, modelView, readsNormals ? &normalMtx : nullptr);
                 return;
             }
             uint32_t listSize = 0;
@@ -2153,7 +2149,20 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
         GX_ClearVtxDesc();
 #if OCT_SKELETAL
         if (rigid != nullptr)
-            GX_SetVtxDesc(GX_VA_PTNMTXIDX, GX_DIRECT);        // (each vertex's matrix: in the lists)
+        {
+            // the main draw's lists and format: matrix index, position, normal, both texcoords (position-only
+            // vertices with a matrix index hang a real GameCube's GPU)
+            GX_SetVtxDesc(GX_VA_PTNMTXIDX, GX_DIRECT);
+            GX_SetVtxDesc(GX_VA_NRM, GX_INDEX16);
+            GX_SetVtxDesc(GX_VA_TEX0, GX_INDEX16);
+            GX_SetVtxDesc(GX_VA_TEX1, GX_INDEX16);
+            GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+            GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+            GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
+            GX_SetArray(GX_VA_NRM, &vertices[0].mNormal, sizeof(Vertex));
+            GX_SetArray(GX_VA_TEX0, &vertices[0].mTexcoord0, sizeof(Vertex));
+            GX_SetArray(GX_VA_TEX1, &vertices[0].mTexcoord1, sizeof(Vertex));
+        }
 #endif
         GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
         GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
@@ -2190,7 +2199,7 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
     {
         if (rigid != nullptr)
         {
-            DrawRigidBatches(*rigid, skeletalMeshComp, modelView, nullptr, true);
+            DrawRigidBatches(*rigid, skeletalMeshComp, modelView, nullptr);
             return;
         }
         uint32_t listSize = 0;

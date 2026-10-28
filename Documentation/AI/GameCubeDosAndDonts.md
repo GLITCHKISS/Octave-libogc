@@ -47,6 +47,13 @@ moment after it started drawing plain rectangles that way; Dolphin drew them.
 **Do** draw solid colour with a small white texture, as Octave does
 (`T_White`), or with a colour channel.
 
+**Don't** draw position-only vertices with a per-vertex matrix index
+(`GX_VA_PTNMTXIDX` plus `GX_VA_POS` and nothing else). The console's GPU hung at
+the first such draw (a character's projected-shadow caster); Dolphin drew it,
+even with accurate cache emulation. The same lists with the normal and texture
+coordinates added drew fine. **Do** send the full vertex when it carries a
+matrix index; with no texgens and no lighting the extra attributes go unread.
+
 **Don't** `free()` anything the GPU reads (textures, vertex arrays, display
 lists) straight away. Octave lets the GPU draw one frame while the CPU works on
 the next, so the GPU can still be reading it. **Do** hand it to `GxDeferFree`.
