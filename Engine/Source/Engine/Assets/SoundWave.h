@@ -39,6 +39,11 @@ struct SoundAdpcmInfo
     int16_t  coefs[2][16] = {};     // each channel's 8 predictor pairs
     int16_t  yn1[2] = {};           // each channel's history at its start (0)
     int16_t  yn2[2] = {};
+    uint16_t ps[2] = {};            // each channel's predictor/scale at its start (its first frame's header byte)
+    uint16_t loopPs[2] = {};        // and at its loop's start (the cook's loop is the whole sound: the same)
+    int16_t  loopYn1[2] = {};
+    int16_t  loopYn2[2] = {};
+    bool     dsp = false;           // its data in ARAM as it is (DspAdpcm=1: AUD_StoreAdpcm), decoded by the DSP as it plays
 };
 #endif
 
@@ -116,6 +121,8 @@ public:
     bool IsAdpcm() const { return mAdpcm.channels != 0; }
     bool GetDiscAdpcm() const { return mDiscAdpcm; }
     const SoundAdpcmInfo& GetAdpcmInfo() const { return mAdpcm; }
+    // Its DSP-ADPCM data in ARAM at aramAddress as it is (the channels one after the other), for the DSP to decode.
+    void SetAdpcmInAram(uint32_t aramAddress) { mAramAddress = aramAddress; mAdpcm.dsp = true; }
 #endif
 
     // GameCube: the PCM moved to ARAM (see Audio_Dolphin.cpp), at this ARAM address; 0 while it

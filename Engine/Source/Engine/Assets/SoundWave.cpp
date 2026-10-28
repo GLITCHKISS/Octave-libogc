@@ -545,6 +545,10 @@ void SoundWave::LoadDspAdpcm(Stream& stream)
         memcpy(info.coefs[c], ch.coefs, sizeof(ch.coefs));
         info.yn1[c] = ch.yn1;
         info.yn2[c] = ch.yn2;
+        info.ps[c] = ch.ps;
+        info.loopPs[c] = ch.loopPs;
+        info.loopYn1[c] = ch.loopYn1;
+        info.loopYn2[c] = ch.loopYn2;
     }
     if (why != nullptr)
     {
