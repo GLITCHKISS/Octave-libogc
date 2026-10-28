@@ -990,7 +990,8 @@ void WriteMaterialLiteUniformData(MaterialData& outData, MaterialLite* material)
     outData.mOpacity = material->GetOpacity();
     outData.mMaskCutoff = material->GetMaskCutoff();
     outData.mShininess = material->GetShininess();
-    outData.mFresnelEnabled = static_cast<uint32_t>(material->IsFresnelEnabled());
+    outData.mFresnelEnabled = static_cast<uint32_t>(material->IsFresnelEnabled()) |
+                              (material->IsFresnelAlpha() ? 2u : 0u);   // (bit 1: its Fresnel as its opacity)
     outData.mVertexColorMode = static_cast<uint32_t>(material->GetVertexColorMode());
     outData.mApplyFog = static_cast<uint32_t>(material->ShouldApplyFog());
     outData.mEmission = material->GetEmission();

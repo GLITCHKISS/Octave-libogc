@@ -218,10 +218,14 @@ void main()
 
     outColor.rgb += gSpecular.rgb * material.mColor.rgb;
 
-    if (material.mFresnelEnabled != 0)
+    float fresnelAlpha = 1.0;
+    if ((material.mFresnelEnabled & 1u) != 0)
     {
         float intensity = pow((1 - abs(dot(N, V))), material.mFresnelPower);
-        outColor += intensity * material.mFresnelColor;
+        if ((material.mFresnelEnabled & 2u) != 0)
+            fresnelAlpha = intensity;                  // (its opacity: see-through face on, solid edge on)
+        else
+            outColor += intensity * material.mFresnelColor;
     }
 
     if (material.mApplyFog != 0)
@@ -229,5 +233,5 @@ void main()
         ApplyFog(outColor, inPosition, global);
     }
 
-    outColor.a = inColor.a * diffuse.a * material.mOpacity;
+    outColor.a = inColor.a * diffuse.a * material.mOpacity * fresnelAlpha;
 }

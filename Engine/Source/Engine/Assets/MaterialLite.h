@@ -32,6 +32,9 @@ struct MaterialLiteParams
     // Its textures sampled log2(picture height / 548) mip levels smaller on top of their own bias: hand-drawn mip
     // levels made for the GameCube's 640 x 548 picture land where they were meant to, whatever the window.
     bool mMipBiasFollowsHeight = false;
+    // Its Fresnel term as its opacity, not added colour: see-through face on, solid edge on (as water: the flatter
+    // it's seen, the less of what's under it shows).
+    bool mFresnelAlpha = false;
     float mShininess = 32.0f;
     int32_t mSortPriority = 0;
     uint32_t mNumTextures = 1;
@@ -115,6 +118,7 @@ public:
     float GetAlphaKeepAbove() const { return mLiteParams.mAlphaKeepAbove; }
     bool HasAlphaBand() const { return mLiteParams.mAlphaKeepBelow < 1.0f; }
     bool MipBiasFollowsHeight() const { return mLiteParams.mMipBiasFollowsHeight; }
+    bool IsFresnelAlpha() const { return mLiteParams.mFresnelAlpha; }
 
     float GetShininess() const;
     void SetShininess(float shininess);
