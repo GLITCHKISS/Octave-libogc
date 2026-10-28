@@ -195,7 +195,16 @@ void SkeletalMesh::LoadStream(Stream& stream, Platform platform)
             morph.mPositions.resize(stream.ReadUint32());
             for (glm::vec3& p : morph.mPositions) p = stream.ReadVec3();
             morph.mNormals.resize(stream.ReadUint32());
-            for (glm::vec3& n : morph.mNormals) n = stream.ReadVec3();
+            bool anyNormal = false;
+            for (glm::vec3& n : morph.mNormals)
+            {
+                n = stream.ReadVec3();
+                anyNormal = anyNormal || (n != glm::vec3(0.0f));
+            }
+            // (normal changes all zero -- a target that only moves the surface, as a ripple: none kept, so skinning
+            //  neither reads nor adds them; adding zeros changed nothing)
+            if (!anyNormal)
+                morph.mNormals.clear();
         }
     }
 }
