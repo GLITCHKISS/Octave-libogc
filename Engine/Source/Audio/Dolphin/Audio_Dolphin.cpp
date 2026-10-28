@@ -9,6 +9,7 @@
 #include "Maths.h"
 
 #include "System/System.h"
+#include "Engine.h"
 
 #include <gccore.h>
 #include <asndlib.h>
@@ -188,6 +189,10 @@ struct StreamVoice
     volatile int32_t decodeState = DECODE_NONE;
     volatile bool  decodeYield = false;
     volatile bool  decodeUrgent = false;
+    // Urgent: how much it decodes above the main thread before it goes back below it (StreamBoostBudget). A whole
+    // buffer at once -- 0.2 s of two streams -- was a 17 ms frame on hardware: a hitch every time a glide with two
+    // streams playing starved the thread, the character's moves jumping with it.
+    volatile uint32_t decodeBudget = 0;
     // The main thread's: when the audio handed to ASND runs out, as it reckons it (StreamQueued: each buffer's length
     // at the voice's pitch, from when it was handed over or the one before it ends) -- a little early if anything, as
     // the mixer takes each up a moment late. And the pitch it plays at (Hz).
@@ -558,8 +563,10 @@ static uint32_t StreamDecode(StreamVoice* sv, bool onMain)
                 break;
             if (sv->decodeUrgent)
             {
-                // Above the main thread till it's done. (Again each unit: the SD driver puts a noted thread back to the
-                // priority it noted after each read -- below the main thread.)
+                if (sv->decodeBudget == 0)
+                    break;                       // (its budget done: the rest below the main thread)
+                // Above the main thread till its budget's done. (Again each unit: the SD driver puts a noted thread
+                // back to the priority it noted after each read -- below the main thread.)
                 if (sDecodeBoosted)
                     LWP_SetThreadPriority(LWP_THREAD_NULL, kDecodeBoostPriority);
             }
@@ -568,9 +575,13 @@ static uint32_t StreamDecode(StreamVoice* sv, bool onMain)
         }
         uint32_t want = sv->bufSize - sv->filled;
         if (want > kDecodeUnitBytes) want = kDecodeUnitBytes;   // (whole sample frames: both multiples of 4)
+        const bool budgeted = !onMain && sv->decodeUrgent;
+        if (budgeted && want > sv->decodeBudget) want = sv->decodeBudget;
         const uint32_t n = StreamFill(sv, buf + sv->filled, want);
         sv->filled += n;
         decoded += n;
+        if (budgeted)
+            sv->decodeBudget -= (n < sv->decodeBudget) ? n : sv->decodeBudget;
         if (!onMain)
         {
             const u32 level = IRQ_Disable();
@@ -612,7 +623,10 @@ static void* AudioDecodeThread(void*)
             {
                 StreamVoice* sv = &sStreamSlots[s];
                 if (sv->decodeState == DECODE_REQUESTED && sv->decodeUrgent)
-                    StreamDecodeSlot(sv);
+                {
+                    StreamDecode(sv, false);        // (its budget's worth)
+                    sv->decodeUrgent = false;       // (still asked for: the rest below, in the main thread's wait)
+                }
             }
             if (sDecodeBoosted)
             {
@@ -656,6 +670,19 @@ static void StreamRequestDecode(StreamVoice* sv, bool urgent)
     __asm__ volatile("" ::: "memory");   // (all of it written before the thread is told)
     sv->decodeState = DECODE_REQUESTED;
     LWP_SemPost(sAudioDecodeSem);
+}
+
+// An urgent voice's budget above the main thread: kBoostBudgetUs of its audio at its pitch, whole sample frames -- a
+// few frames' worth, so the lead grows each frame it's boosted and the work's spread over them, as a slice a frame on
+// the main thread was.
+static const uint64_t kBoostBudgetUs = 42 * 1000;
+static void StreamBoostBudget(StreamVoice* sv)
+{
+    const uint32_t frame = uint32_t(glm::max<int32_t>(sv->channels * sv->bytesPerSample, 1));
+    const uint64_t perSec = uint64_t(glm::max<int32_t>(sv->pitchHz, 1)) * frame;
+    uint32_t bytes = uint32_t(perSec * kBoostBudgetUs / 1000000u);
+    bytes -= bytes % (frame * 4);
+    sv->decodeBudget = glm::max<uint32_t>(bytes, frame * 256);
 }
 
 // The decode thread raised above the main thread, for the voices nearly out (decodeUrgent): it runs at once -- here, as
@@ -713,9 +740,11 @@ static void StreamRetire(StreamVoice* sv)
 // A disc stream stopped with nothing in hand on the I/O thread: its decoder kept open in the cache (StreamTakeCached
 // starts it again), its PCM buffers and disc windows freed as before (made again at its start, so all it keeps is the
 // decoder). The voice gets the cache's slot in its place -- the one kept before that, left to the I/O thread to free.
-// False: not kept (freed as ever).
+// False: not kept (freed as ever). Only with Config.ini's AudioDecodeThread=1, as the decode thread.
 static bool StreamPark(StreamVoice* sv)
 {
+    if (!GetEngineConfig()->mAudioDecodeThread)
+        return false;
     if (!sv->vfOpen || sv->memOwned != nullptr || sv->openState == OPEN_FAILED)
         return false;                       // (not open, in RAM, or a restart's seek failed: its decoder's state unsure)
     int32_t v = 0;
@@ -1323,8 +1352,13 @@ void AUD_Initialize()
     // The decode thread (AudioDecodeThread). Priority 56: below the main thread, so it decodes while the main thread waits
     // and never in the middle of its work (but for a voice nearly out: kDecodeBoostLeadUs); above the I/O thread, so an
     // open's header parsing there (tens of ms of CPU) can't hold a playing stream's decoding up. 128 KB, as the I/O
-    // thread: it decodes, and may read the disc (libfat).
-    if (LWP_SemInit(&sAudioDecodeSem, 0, 64) != 0)
+    // thread: it decodes, and may read the disc (libfat). Only with Config.ini's AudioDecodeThread=1 (an opt-in: without
+    // it, as before).
+    if (!GetEngineConfig()->mAudioDecodeThread)
+    {
+        sAudioDecodeSem = LWP_SEM_NULL;   // (streams decoded on the main thread, a slice a frame)
+    }
+    else if (LWP_SemInit(&sAudioDecodeSem, 0, 64) != 0)
     {
         sAudioDecodeSem = LWP_SEM_NULL;
     }
@@ -1455,6 +1489,8 @@ void AUD_Update()
                 sv->loopState = LOOP_NONE;
             const bool more = !sv->eof && sv->filled < sv->bufSize && sv->loopState == LOOP_NONE;
 
+            if (urgent)
+                StreamBoostBudget(sv);           // (before it's asked: the thread may run at once)
             if (sv->decodeState == DECODE_NONE && more)
                 StreamRequestDecode(sv, urgent);
             else if (sv->decodeState == DECODE_REQUESTED && urgent)

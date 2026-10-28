@@ -329,6 +329,14 @@ effects. That frees main memory, and it already handles libasnd's traps:
 **Do** read streamed music's data off the main thread, or keep the reads small.
 Main-thread refills queued behind a loader's big reads caused 100 ms stutters.
 
+**Do** set `AudioDecodeThread=1` in Config.ini when a game plays two or more
+disc streams at once (music plus a looping ambience). Decoding them on the main
+thread took 1.3-2.8 ms of the worst frames; the decode thread does it in the
+vsync wait, and a stopped stream's decoder is kept open 10 s so a looping
+sound started again is a seek, not an open. It's opt-in: the thread costs a
+128 KB stack, and a game near its memory limit, or with card saves sharing the
+SD, should be played on hardware with it first.
+
 **Don't** mount a memory card while libasnd is running. A locked card is
 unlocked as it mounts, by a DSP task, and libasnd's mixer holds the DSP for
 good: the mount waits forever and the game goes black. A real card unlocked

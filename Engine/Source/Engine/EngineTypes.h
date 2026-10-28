@@ -299,6 +299,12 @@ struct EngineConfig
     // stretched across what they're anchored to still span it; text keeps its size. Elsewhere it does nothing.
     // Lay out a HUD by its corners (TopLeft, TopRight...) in a FullStretch canvas. Config.ini: UiTrueAspect=1.
     bool mUiTrueAspect = false;
+    // GameCube: disc streams decoded on a thread of their own, below the main thread (in its vsync wait), raised
+    // above it a few frames' worth at a time when a voice runs low -- the main thread only hands decoded buffers over;
+    // and a stopped stream's decoder kept open 10 s, so the same sound started again is a seek, not an open. Off,
+    // streams are decoded on the main thread, a slice a frame, and opened anew each time. The thread's stack is
+    // 128 KB. Config.ini: AudioDecodeThread=1.
+    bool mAudioDecodeThread = false;
     // Opaque draws sorted by their material's sort priority, then nearest first, then by material -- so the GPU's early
     // depth test skips what's already covered, whatever its material (a sky dome given a high priority drawn last).
     // Off: by material first, as ever. On GameCube a fill-bound view (a shop interior) textured each hidden layer.

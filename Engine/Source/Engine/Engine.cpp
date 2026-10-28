@@ -1315,6 +1315,7 @@ void WriteEngineConfig(std::string path)
         fprintf(configIni, "ShowSplash=%d\n", sEngineConfig.mShowSplash);
         fprintf(configIni, "Anamorphic=%d\n", sEngineConfig.mAnamorphic);
         fprintf(configIni, "UiTrueAspect=%d\n", sEngineConfig.mUiTrueAspect);
+        fprintf(configIni, "AudioDecodeThread=%d\n", sEngineConfig.mAudioDecodeThread);
         fprintf(configIni, "OpaqueFrontToBack=%d\n", sEngineConfig.mOpaqueFrontToBack);
         fprintf(configIni, "CookQuantizedMeshes=%d\n", sEngineConfig.mCookQuantizedMeshes);
 
@@ -1445,6 +1446,8 @@ void ReadEngineConfig(std::string path)
                 sEngineConfig.mAnamorphic = strToBool(value);
             else if (keyStr == "UiTrueAspect")
                 sEngineConfig.mUiTrueAspect = strToBool(value);
+            else if (keyStr == "AudioDecodeThread")
+                sEngineConfig.mAudioDecodeThread = strToBool(value);
             else if (keyStr == "OpaqueFrontToBack")
                 sEngineConfig.mOpaqueFrontToBack = strToBool(value);
             else if (keyStr == "CookQuantizedMeshes")
