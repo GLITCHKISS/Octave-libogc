@@ -160,8 +160,8 @@ void SYS_Initialize()
     }
 
     // Config.ini's UiTrueAspect=1: a scene's widgets narrowed to keep their editor shape on the TV -- undoing the
-    // anamorphic stretch, and widened 1.08 for the TV showing 640 px ~8% narrow (the eye's, on Castopia and
-    // Super Mario Sparkle; the theory, 711 samples a line, says 1.11)
+    // anamorphic stretch, and widened 1.08 for the TV showing 640 px ~8% narrow (judged by eye on two games;
+    // the theory, 711 samples a line, says 1.11)
     engine.mUiWidthScale = 1.0f;
     if (GetEngineConfig()->mUiTrueAspect)
     {

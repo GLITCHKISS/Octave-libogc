@@ -130,8 +130,8 @@ Two things change its width on the console:
   so art that is square in 640 x 480 comes out 4/3 too wide. Multiply by 0.75.
 - **The TV's picture.** Dolphin and TVs take a full line as about 711 samples,
   so 640 px fill only about 90% of the width and round art looks squeezed.
-  Multiply by 1.08, the factor the user confirmed by eye on Castopia and
-  Super Mario Sparkle.
+  Multiply by 1.08, the factor confirmed by eye on two games (the theory
+  says 1.11).
 
 For a 16:9 game that is 0.75 x 1.08 = 0.81. A 4:3 game should need only the
 1.08 (not yet tested).
@@ -150,11 +150,8 @@ looks the same on the TV.
   The engine's own overlays (console, stats, splash) aren't touched.
 - `Renderer.GetUiWidthScale()` returns the factor, for 2D placed some other way.
 - Check on a console or Dolphin screenshot that a round icon measures as wide
-  as it is tall. A guessed 1/1.1 left Super Mario Sparkle's HUD 11% too wide.
+  as it is tall. A guessed 1/1.1 once left a HUD 11% too wide.
 - Art under about 40 px doesn't show the squeeze.
-- Examples: Super Mario Sparkle's `Scripts/HUD.lua` uses the setting. Castopia
-  predates it and widens by hand: `BALL_WIDE` (`make_fishbar.py`) and `kWide`
-  (`LoadBall.cpp`).
 
 ---
 
