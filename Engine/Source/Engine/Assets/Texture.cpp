@@ -444,11 +444,48 @@ void CookTexture(
                    texture->GetName().c_str(), texWidth, texHeight);
     }
 
-    SYS_Exec(cookCmd.c_str());
+    // A converted texture is kept in Intermediate/CookCache under a hash of its pixels and the
+    // converter's command line, and reused while both are unchanged: the converter can take
+    // minutes on a big texture, and most textures are the same from one package to the next.
+    uint64_t cookHash = 14695981039346656037ull;
+    auto hashBytes = [&cookHash](const uint8_t* bytes, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            cookHash ^= bytes[i];
+            cookHash *= 1099511628211ull;
+        }
+    };
+    hashBytes(pixels.data(), pixels.size());
+    hashBytes((const uint8_t*)cookCmd.data(), cookCmd.size());
+    hashBytes((const uint8_t*)&texWidth, sizeof(texWidth));
+    hashBytes((const uint8_t*)&texHeight, sizeof(texHeight));
 
-    // (3) Use a stream to read the converted file, and copy all the data into outData
+    std::string cacheDir = tempDir + "/CookCache";
+    if (!DoesDirExist(cacheDir.c_str()))
+    {
+        CreateDir(cacheDir.c_str());
+    }
+    char cacheName[32];
+    snprintf(cacheName, sizeof(cacheName), "/%016llx.tex", (unsigned long long)cookHash);
+    std::string cachePath = cacheDir + cacheName;
+
     Stream stream;
-    stream.ReadFile(outPath.c_str(), false);
+    if (SYS_DoesFileExist(cachePath.c_str(), false))
+    {
+        stream.ReadFile(cachePath.c_str(), false);
+    }
+    else
+    {
+        SYS_Exec(cookCmd.c_str());
+
+        // (3) Use a stream to read the converted file, and copy all the data into outData
+        stream.ReadFile(outPath.c_str(), false);
+        if (stream.GetSize() > 0)
+        {
+            stream.WriteFile(cachePath.c_str());
+        }
+    }
     outData.resize(stream.GetSize());
     memcpy(outData.data(), stream.GetData(), stream.GetSize());
 

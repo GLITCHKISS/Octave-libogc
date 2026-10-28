@@ -264,9 +264,12 @@ bool EncodeCmprTpl(const uint8_t* rgba,
     if (rgba == nullptr || width == 0 || height == 0)
         return false;
 
-    // DXT1 works in 4x4 blocks and GX groups those into 8x8 tiles. Anything
-    // else would need padding the image out, which the cook does not do.
-    if ((width % 4) != 0 || (height % 4) != 0)
+    // DXT1 works in 4x4 blocks and GX groups those into 8x8 tiles, and the loop
+    // below writes whole tiles. A side that is a multiple of 4 but not of 8 (a
+    // 4x4 texture) would write a whole tile into a buffer sized for less: past
+    // its end, a heap corruption the cook only dies of later. Anything not in
+    // whole tiles goes to gxtexconv instead, which pads it.
+    if ((width % 8) != 0 || (height % 8) != 0)
         return false;
 
     // A TPL header is 64 bytes: magic, one image table entry, and one texture
