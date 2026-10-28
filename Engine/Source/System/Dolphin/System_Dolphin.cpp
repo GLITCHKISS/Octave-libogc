@@ -159,6 +159,15 @@ void SYS_Initialize()
         engine.mAspectRatioScale = (16.0f / 9.0f) / (4.0f / 3.0f);
     }
 
+    // Config.ini's UiTrueAspect=1: a scene's widgets narrowed to keep their editor shape on the TV -- undoing the
+    // anamorphic stretch, and widened 1.08 for the TV showing 640 px ~8% narrow (the eye's, on Castopia and
+    // Super Mario Sparkle; the theory, 711 samples a line, says 1.11)
+    engine.mUiWidthScale = 1.0f;
+    if (GetEngineConfig()->mUiTrueAspect)
+    {
+        engine.mUiWidthScale = 1.08f / engine.mAspectRatioScale;
+    }
+
 #if ENABLE_LIBOGC_CONSOLE
     // Initialize the console, required for printf
     system.mConsoleBuffer = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));

@@ -59,6 +59,15 @@ Set the global UI scale.
 Sig: `Renderer.SetGlobalUiScale(scale)`
  - Arg: `number scale` Global UI scale
 ---
+### GetUiWidthScale
+Get how much a scene's widgets are narrowed across, to keep the shape they have in the editor on the TV.
+Config.ini's `UiTrueAspect=1` sets it. On the GameCube it is 0.75 x 1.08 = 0.81 with `Anamorphic=1`, or
+1.08 without. Everywhere else, or with the setting off, it is 1. Widgets already apply it themselves. Use it
+only for 2D placed some other way.
+
+Sig: `scale = Renderer.GetUiWidthScale()`
+ - Ret: `number scale` Width scale of a scene's widgets
+---
 ### SetDebugMode
 Set the debug mode.
 Debug mode:

@@ -22,6 +22,7 @@ struct Renderer_Lua
     static int GetActiveScreenResolution(lua_State* L);
     static int GetGlobalUiScale(lua_State* L);
     static int SetGlobalUiScale(lua_State* L);
+    static int GetUiWidthScale(lua_State* L);
     static int SetDebugMode(lua_State* L);
     static int GetDebugMode(lua_State* L);
     static int EnableProxyRendering(lua_State* L);

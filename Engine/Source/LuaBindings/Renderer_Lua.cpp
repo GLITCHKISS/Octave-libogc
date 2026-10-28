@@ -176,6 +176,12 @@ int Renderer_Lua::SetGlobalUiScale(lua_State* L)
     return 0;
 }
 
+int Renderer_Lua::GetUiWidthScale(lua_State* L)
+{
+    lua_pushnumber(L, GetEngineState()->mUiWidthScale);
+    return 1;
+}
+
 int Renderer_Lua::SetDebugMode(lua_State* L)
 {
     DebugMode debugMode = (DebugMode)CHECK_INTEGER(L, 1);
@@ -426,6 +432,8 @@ void Renderer_Lua::Bind()
     REGISTER_TABLE_FUNC(L, tableIdx, GetGlobalUiScale);
 
     REGISTER_TABLE_FUNC(L, tableIdx, SetGlobalUiScale);
+
+    REGISTER_TABLE_FUNC(L, tableIdx, GetUiWidthScale);
 
     REGISTER_TABLE_FUNC(L, tableIdx, SetDebugMode);
 

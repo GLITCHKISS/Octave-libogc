@@ -5,6 +5,7 @@
 #include "Vertex.h"
 #include "Maths.h"
 #include "Utilities.h"
+#include "Engine.h"
 
 #include "Graphics/Graphics.h"
 
@@ -233,7 +234,9 @@ float Text::GetTextSize() const
 
 float Text::GetScaledTextSize() const
 {
-    return mTextSize * glm::min(mAbsoluteScale.x, mAbsoluteScale.y);
+    // (UiTrueAspect's narrowing left out: the text keeps its size)
+    const float sx = mAbsoluteScale.x / glm::max(GetEngineState()->mUiWidthScale, 0.01f);
+    return mTextSize * glm::min(sx, mAbsoluteScale.y);
 }
 
 float Text::GetOutlineSize() const

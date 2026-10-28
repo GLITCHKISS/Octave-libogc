@@ -293,6 +293,12 @@ struct EngineConfig
     // widescreen TV). The engine's aspect scale is set from the start (cameras see 16:9), and the boot
     // splash is drawn narrowed so it keeps its shape once stretched. Config.ini: Anamorphic=1.
     bool mAnamorphic = false;
+    // A scene's 2D widgets keep, on the TV, the shape they have in the editor. On the GameCube their widths and
+    // x offsets (from their anchors) are narrowed: by 0.75 when Anamorphic (the TV stretches the 640 px across
+    // 16:9) and by 1.08 (Dolphin and TVs show 640 px about 8% narrow -- measured by eye on two games). Widgets
+    // stretched across what they're anchored to still span it; text keeps its size. Elsewhere it does nothing.
+    // Lay out a HUD by its corners (TopLeft, TopRight...) in a FullStretch canvas. Config.ini: UiTrueAspect=1.
+    bool mUiTrueAspect = false;
     // Opaque draws sorted by their material's sort priority, then nearest first, then by material -- so the GPU's early
     // depth test skips what's already covered, whatever its material (a sky dome given a high priority drawn last).
     // Off: by material first, as ever. On GameCube a fill-bound view (a shop interior) textured each hidden layer.
@@ -386,6 +392,7 @@ struct EngineState
     float mRealElapsedTime = 0.0f;
     float mTimeDilation = 1.0f;
     float mAspectRatioScale = 1.0f;
+    float mUiWidthScale = 1.0f;     // (UiTrueAspect: a scene's widgets' widths and x offsets, times this)
     bool mPaused = false;
     bool mFrameStep = false;
     bool mInitialized = false;

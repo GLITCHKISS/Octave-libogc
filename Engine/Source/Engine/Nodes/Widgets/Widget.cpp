@@ -668,6 +668,12 @@ void Widget::UpdateRect()
     else
     {
         mAbsoluteScale *= Renderer::Get()->GetGlobalUiScale();
+        // UiTrueAspect: a scene's widgets narrowed on the console (the engine's own -- console, stats, splash --
+        // have no world and stay as they are); their children inherit it
+        if (GetWorld() != nullptr)
+        {
+            mAbsoluteScale.x *= GetEngineState()->mUiWidthScale;
+        }
     }
 
     if (stretchX)

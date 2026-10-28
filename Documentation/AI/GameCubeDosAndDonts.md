@@ -135,15 +135,26 @@ Two things change its width on the console:
 
 For a 16:9 game that is 0.75 x 1.08 = 0.81. A 4:3 game should need only the
 1.08 (not yet tested).
-- Scale the widths and the x positions together, measured from each piece's
-  own screen edge, so the layout keeps its corners.
-- Apply the factor only when `Engine.GetPlatform() == "GameCube"`. The PC
-  editor stays at 1.0.
+
+**Do** turn this on with `UiTrueAspect=1` in `Config.ini`; don't work the
+factor out by hand. On the GameCube the engine then narrows every widget a
+scene spawns: widths, and x offsets from the widget's anchor. Elsewhere (the PC
+editor) the setting does nothing, so a HUD laid out to look right in the editor
+looks the same on the TV.
+- Put the HUD in a `FullStretch` canvas with zero margins, so it covers the
+  whole screen whatever the factor.
+- Anchor each piece to its own corner (`TopLeft`, `TopRight`...) and place it
+  from that corner. That way the narrowing pulls it toward its own edge. A
+  right-hand piece placed from the left edge would drift inward.
+- Widgets stretched across their parent still span it. Text keeps its size.
+  The engine's own overlays (console, stats, splash) aren't touched.
+- `Renderer.GetUiWidthScale()` returns the factor, for 2D placed some other way.
 - Check on a console or Dolphin screenshot that a round icon measures as wide
   as it is tall. A guessed 1/1.1 left Super Mario Sparkle's HUD 11% too wide.
 - Art under about 40 px doesn't show the squeeze.
-- Examples: `GC_WIDE` in Super Mario Sparkle's `Scripts/HUD.lua`, and
-  `BALL_WIDE` (`make_fishbar.py`) and `kWide` (`LoadBall.cpp`) in Castopia.
+- Examples: Super Mario Sparkle's `Scripts/HUD.lua` uses the setting. Castopia
+  predates it and widens by hand: `BALL_WIDE` (`make_fishbar.py`) and `kWide`
+  (`LoadBall.cpp`).
 
 ---
 
