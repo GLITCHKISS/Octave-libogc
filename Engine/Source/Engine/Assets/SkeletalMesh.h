@@ -142,17 +142,27 @@ public:
     const MorphTarget& GetMorphTarget(uint32_t index) const;
     int32_t FindMorphTarget(const std::string& name) const;
 
-    // The GameCube's morph targets: all of their moves (and normal changes), a vertex at a time, in one array --
-    // mStride floats a vertex, target m's move at mPosOfs[m] in it and its normal change at mNrmOfs[m] (-1: none).
-    // Built when the mesh loads on the console, the targets' own arrays then let go: skinning a parachute read its four
-    // targets' moves and two normal changes as six streams beside the vertices, and the Gekko, with only a few cache
-    // misses in flight at once, waited on them (~2.5 ms a glide). Empty elsewhere: the PC reads the targets as ever.
+    // The GameCube's morph targets: all of their moves (and normal changes), a vertex at a time, in one array of
+    // 16-bit fixed point -- read by the skinning's paired-single loads (psq_l), which turn a pair of them into floats
+    // as they load. Built when the mesh loads on the console, the targets' own arrays then let go: skinning a parachute
+    // read its four targets' moves and two normal changes as six streams beside the vertices, and the Gekko, with only
+    // a few cache misses in flight at once, waited on them (~2.5 ms a glide); one stream of floats was as slow (the
+    // same bytes), so half the bytes. Empty elsewhere: the PC reads the targets as ever.
+    //   Each target's moves have a slot (mPosSlot[m], -1: none), its normal changes another (mNrmSlot[m]); slots go
+    // in pairs, and a vertex is mStride int16s: the pairs of move slots (mNumPosPairs, at least one), then the pairs of
+    // normal slots (mNumNrmPairs), each pair 6 int16s -- x y of its first slot, x y of its second, z of the first, z
+    // of the second -- a slot's value times its scale (mPosScale/mNrmScale, by slot) its float: the largest move of the
+    // slot 32767, so a vertex is off by at most 1/65534 of the target's largest move (a slot with no target: 0s).
     struct MorphBlock
     {
-        std::vector<float> mData;
+        std::vector<int16_t> mData;
         uint32_t mStride = 0;
-        std::vector<int32_t> mPosOfs;
-        std::vector<int32_t> mNrmOfs;
+        uint32_t mNumPosPairs = 0;
+        uint32_t mNumNrmPairs = 0;
+        std::vector<int32_t> mPosSlot;
+        std::vector<int32_t> mNrmSlot;
+        std::vector<float> mPosScale;
+        std::vector<float> mNrmScale;
     };
     const MorphBlock& GetMorphBlock() const { return mMorphBlock; }
 

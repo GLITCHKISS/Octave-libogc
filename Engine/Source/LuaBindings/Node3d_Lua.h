@@ -39,6 +39,7 @@ struct Node3D_Lua
     static int SetWorldPosition(lua_State* L);
     static int SetWorldPositionXYZ(lua_State* L);
     static int SetScaleXYZ(lua_State* L);
+    static int SetPositionRotationScale(lua_State* L);
     static int SetWorldRotationEuler(lua_State* L);
     static int SetWorldRotationQuat(lua_State* L);
     static int SetWorldScale(lua_State* L);

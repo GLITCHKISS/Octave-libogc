@@ -1920,6 +1920,425 @@ uint64_t gOctSkinTicks = 0;
 uint32_t gOctSkinVerts = 0;
 #endif
 
+#if PLATFORM_DOLPHIN && !EDITOR
+// ---- CPU skinning on the Gekko, two floats an instruction: its paired singles ---------------------------------------
+// Every FPR holds two singles, ps0 and ps1; a ps_ instruction works on both, and psq_l/psq_st load and store a pair
+// (or, W=1, one: ps1 then 1.0) through a GQR, which can turn integers into floats as they load. GQR0 is plain floats
+// (libogc's ps_guMtx functions, and the SDK, keep it 0); the morph block's int16s go through GQR7, set to signed 16-bit
+// just for the loop and put back after (a thread switch keeps each thread's own GQRs: PPCContext.gqr).
+//   The compiler doesn't know paired singles (GCC's -mpaired is gone): to it an FPR is a double, and it copies one with
+// fmr -- ps0 only -- and spills it with stfd, ps0 only, whenever its register allocation likes (it did, in the blend
+// and the morph sums, written as one asm an instruction). So all of a vertex's float work is one asm, registers named,
+// as the SDK's own PSVEC/PSMTX functions are: no pair is ever in a C variable. The C around it does the integer work
+// (the cache lines, the bones to blend); the asm's constants are scalars (ps0 only), in FPRs it leaves alone.
+#define OCT_GQR_S16 919                                             // (GQR7, while the skinning runs: s16, scale 0)
+#define OCT_GQR_S16_VALUE 0x00070007u
+// Each line of skinned vertices written out to memory as soon as it's finished (dcbst), while the loop goes on: the
+// flush after it (GFX_UpdateSkeletalMeshCompVertexBuffer) then finds the lines clean, instead of writing the whole
+// array back (~100 KB for a parachute) a line after another with nothing else to do. 0: as before
+#ifndef OCT_SKIN_STORE_LINES
+#define OCT_SKIN_STORE_LINES 1
+#endif
+
+// The vertex's own (VertexSkinned, 60 bytes: position 0, texture coordinates 12 and 20, normal 28) into f1 P (x y),
+// f2 PZ (z, ps0), f3 N, f4 NZ, f5 and f6 the texture coordinates
+#define OCT_SKIN_ASM_SRC \
+    "psq_l     1,0(%[src]),0,0\n\t" \
+    "psq_l     2,8(%[src]),1,0\n\t" \
+    "psq_l     3,28(%[src]),0,0\n\t" \
+    "psq_l     4,36(%[src]),1,0\n\t" \
+    "psq_l     5,12(%[src]),0,0\n\t" \
+    "psq_l     6,20(%[src]),0,0\n\t"
+// The pairs of morph slots of a vertex (at least one: SkeletalMesh::MorphBlock), each pair 6 int16s -- x y of its
+// first slot, x y of its second, the two z's -- by its weight pair (each slot's weight times its scale): the x y of the
+// first by its weight (ps_madds0) summed in A from the vertex's own (XY), the second's (ps_madds1) in B -- two chains,
+// not one twice as long -- the z's (a pair, by both weights) in Z; TW T0 T1 T2 the loads. OCT_SKIN_ASM_SUM then puts
+// the sums in XY and XZ (ps0) -- later, so the next sums' instructions go first and the FPU has work while it waits.
+#define OCT_SKIN_ASM_MORPH(XY, M, W, N, L1, L2, TW, T0, T1, T2, A, B, Z) \
+    "psq_l     " TW ",0(%[" W "]),0,0\n\t" \
+    "psq_l     " T0 ",0(%[" M "]),0,7\n\t" \
+    "psq_l     " T1 ",4(%[" M "]),0,7\n\t" \
+    "psq_l     " T2 ",8(%[" M "]),0,7\n\t" \
+    "addic.    %[" N "],%[" N "],-1\n\t" \
+    "ps_madds0 " A "," T0 "," TW "," XY "\n\t" \
+    "ps_muls1  " B "," T1 "," TW "\n\t" \
+    "ps_mul    " Z "," T2 "," TW "\n\t" \
+    "beq       " L2 "f\n" \
+    L1 ":\n\t" \
+    "psq_lu    " TW ",8(%[" W "]),0,0\n\t" \
+    "psq_lu    " T0 ",12(%[" M "]),0,7\n\t" \
+    "psq_l     " T1 ",4(%[" M "]),0,7\n\t" \
+    "psq_l     " T2 ",8(%[" M "]),0,7\n\t" \
+    "addic.    %[" N "],%[" N "],-1\n\t" \
+    "ps_madds0 " A "," T0 "," TW "," A "\n\t" \
+    "ps_madds1 " B "," T1 "," TW "," B "\n\t" \
+    "ps_madd   " Z "," T2 "," TW "," Z "\n\t" \
+    "bne       " L1 "b\n" \
+    L2 ":\n\t"
+#define OCT_SKIN_ASM_SUM(XY, XZ, A, B, Z) \
+    "ps_add    " XY "," A "," B "\n\t" \
+    "ps_sum0   " Z "," Z "," Z "," Z "\n\t" \
+    "fadds     " XZ "," Z "," XZ "\n\t"
+// The moves' sums in f11 f12 f13, the normal changes' in f17 f18 f19 (OCT_SKIN_ASM_MORPH); their tails side by side
+#define OCT_SKIN_ASM_SUM2 \
+    "ps_add    1,11,12\n\t" \
+    "ps_add    3,17,18\n\t" \
+    "ps_sum0   13,13,13,13\n\t" \
+    "ps_sum0   19,19,19,19\n\t" \
+    "fadds     2,13,2\n\t" \
+    "fadds     4,19,4\n\t"
+// The bones' blended 3x4 -- a glm::mat4's columns 0..3 (cols), each two pairs, x y and z w (w unused), f14..f21 --
+// times the position and the normal, and the vertex out (Vertex, 40 bytes: position 0, texture coordinates 12 and
+// 20, normal 28). Four chains of three side by side: the FPU has one reservation station, and a chain alone waits out
+// each step's three cycles
+#define OCT_SKIN_ASM_OUT \
+    "psq_l     14,0(%[cols]),0,0\n\t" \
+    "psq_l     15,8(%[cols]),0,0\n\t" \
+    "psq_l     20,48(%[cols]),0,0\n\t" \
+    "psq_l     21,56(%[cols]),0,0\n\t" \
+    "psq_l     16,16(%[cols]),0,0\n\t" \
+    "psq_l     17,24(%[cols]),0,0\n\t" \
+    "ps_madds0 22,14,1,20\n\t" \
+    "ps_madds0 23,15,1,21\n\t" \
+    "psq_l     18,32(%[cols]),0,0\n\t" \
+    "ps_muls0  24,14,3\n\t" \
+    "psq_l     19,40(%[cols]),0,0\n\t" \
+    "ps_muls0  25,15,3\n\t" \
+    "ps_madds1 22,16,1,22\n\t" \
+    "ps_madds1 23,17,1,23\n\t" \
+    "ps_madds1 24,16,3,24\n\t" \
+    "ps_madds1 25,17,3,25\n\t" \
+    "ps_madds0 22,18,2,22\n\t" \
+    "ps_madds0 23,19,2,23\n\t" \
+    "ps_madds0 24,18,4,24\n\t" \
+    "ps_madds0 25,19,4,25\n\t" \
+    "psq_st    5,12(%[dst]),0,0\n\t" \
+    "psq_st    6,20(%[dst]),0,0\n\t" \
+    "psq_st    22,0(%[dst]),0,0\n\t" \
+    "psq_st    23,8(%[dst]),1,0\n\t" \
+    "psq_st    24,28(%[dst]),0,0\n\t" \
+    "psq_st    25,36(%[dst]),1,0"
+// As OCT_SKIN_ASM_OUT, with the normal made unit again: 1/sqrt(x*x + y*y + z*z) -- the estimate (frsqrte) and two
+// Newton steps (the SDK's PSVECNormalize takes one, trusting the Gekko's estimate to 1/4096; the second, a few
+// cycles, holds to a millionth even from the 1/32 the PowerPC promises); left as it is when nearly 0 (as the PC: a
+// length squared under 1e-8). The transform is linear, so the normal goes through it as it is and its result is
+// scaled: the chain of steps, each waiting on the last, runs alongside the transform instead of before it
+#define OCT_SKIN_ASM_OUT_RENORM \
+    "ps_mul    7,3,3\n\t" \
+    "psq_l     14,0(%[cols]),0,0\n\t" \
+    "psq_l     15,8(%[cols]),0,0\n\t" \
+    "psq_l     20,48(%[cols]),0,0\n\t" \
+    "ps_madd   8,4,4,7\n\t" \
+    "psq_l     21,56(%[cols]),0,0\n\t" \
+    "psq_l     16,16(%[cols]),0,0\n\t" \
+    "psq_l     17,24(%[cols]),0,0\n\t" \
+    "ps_sum0   8,8,4,7\n\t" \
+    "ps_madds0 22,14,1,20\n\t" \
+    "psq_l     18,32(%[cols]),0,0\n\t" \
+    "ps_madds0 23,15,1,21\n\t" \
+    "frsqrte   9,8\n\t" \
+    "psq_l     19,40(%[cols]),0,0\n\t" \
+    "ps_muls0  24,14,3\n\t" \
+    "ps_muls0  25,15,3\n\t" \
+    "fsubs     10,8,%[tiny]\n\t" \
+    "ps_madds1 22,16,1,22\n\t" \
+    "fmuls     11,9,9\n\t" \
+    "ps_madds1 23,17,1,23\n\t" \
+    "fmuls     12,9,%[half]\n\t" \
+    "ps_madds1 24,16,3,24\n\t" \
+    "fnmsubs   11,11,8,%[three]\n\t" \
+    "ps_madds1 25,17,3,25\n\t" \
+    "ps_madds0 22,18,2,22\n\t" \
+    "ps_madds0 23,19,2,23\n\t" \
+    "fmuls     11,11,12\n\t" \
+    "ps_madds0 24,18,4,24\n\t" \
+    "fmuls     12,11,11\n\t" \
+    "ps_madds0 25,19,4,25\n\t" \
+    "fmuls     13,11,%[half]\n\t" \
+    "psq_st    22,0(%[dst]),0,0\n\t" \
+    "psq_st    23,8(%[dst]),1,0\n\t" \
+    "fnmsubs   12,12,8,%[three]\n\t" \
+    "psq_st    5,12(%[dst]),0,0\n\t" \
+    "psq_st    6,20(%[dst]),0,0\n\t" \
+    "fmuls     11,12,13\n\t" \
+    "fsel      11,10,11,%[one]\n\t" \
+    "ps_muls0  24,24,11\n\t" \
+    "ps_muls0  25,25,11\n\t" \
+    "psq_st    24,28(%[dst]),0,0\n\t" \
+    "psq_st    25,36(%[dst]),1,0"
+#define OCT_SKIN_ASM_CLOBBERS \
+    "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12", "fr13", \
+    "fr14", "fr15", "fr16", "fr17", "fr18", "fr19", "fr20", "fr21", "fr22", "fr23", "fr24", "fr25", \
+    "cr0", "xer", "memory"
+
+// The bones' blended 3x4 for a vertex of more than one bone, into out (16 floats, 8-aligned): bone b0 by its weight
+// (w0, a float), then each other bone weighted (n, from list: a bone's matrix, its weight), in order -- the PC's sums
+struct OctSkinBone { const char* mMat; const float* mWeight; };
+static inline __attribute__((always_inline)) void OctSkinBlend(float* out, const char* b0, const float* w0,
+                                                              const OctSkinBone* list, uint32_t n)
+{
+    const char* b;
+    const float* w;
+    __asm__ volatile(
+        "psq_l     0,0(%[w0]),1,0\n\t"
+        "psq_l     1,0(%[b0]),0,0\n\t"
+        "psq_l     2,8(%[b0]),0,0\n\t"
+        "psq_l     3,16(%[b0]),0,0\n\t"
+        "psq_l     4,24(%[b0]),0,0\n\t"
+        "ps_muls0  1,1,0\n\t"
+        "psq_l     5,32(%[b0]),0,0\n\t"
+        "ps_muls0  2,2,0\n\t"
+        "psq_l     6,40(%[b0]),0,0\n\t"
+        "ps_muls0  3,3,0\n\t"
+        "psq_l     7,48(%[b0]),0,0\n\t"
+        "ps_muls0  4,4,0\n\t"
+        "psq_l     8,56(%[b0]),0,0\n\t"
+        "ps_muls0  5,5,0\n\t"
+        "cmpwi     %[n],0\n\t"
+        "ps_muls0  6,6,0\n\t"
+        "ps_muls0  7,7,0\n\t"
+        "ps_muls0  8,8,0\n\t"
+        "beq       2f\n\t"
+        "mtctr     %[n]\n"
+        "1:\n\t"
+        "lwz       %[b],0(%[list])\n\t"
+        "lwz       %[w],4(%[list])\n\t"
+        "addi      %[list],%[list],8\n\t"
+        "psq_l     0,0(%[w]),1,0\n\t"
+        "psq_l     9,0(%[b]),0,0\n\t"
+        "psq_l     10,8(%[b]),0,0\n\t"
+        "psq_l     11,16(%[b]),0,0\n\t"
+        "psq_l     12,24(%[b]),0,0\n\t"
+        "ps_madds0 1,9,0,1\n\t"
+        "psq_l     9,32(%[b]),0,0\n\t"
+        "ps_madds0 2,10,0,2\n\t"
+        "psq_l     10,40(%[b]),0,0\n\t"
+        "ps_madds0 3,11,0,3\n\t"
+        "psq_l     11,48(%[b]),0,0\n\t"
+        "ps_madds0 4,12,0,4\n\t"
+        "psq_l     12,56(%[b]),0,0\n\t"
+        "ps_madds0 5,9,0,5\n\t"
+        "ps_madds0 6,10,0,6\n\t"
+        "ps_madds0 7,11,0,7\n\t"
+        "ps_madds0 8,12,0,8\n\t"
+        "bdnz      1b\n"
+        "2:\n\t"
+        "psq_st    1,0(%[out]),0,0\n\t"
+        "psq_st    2,8(%[out]),0,0\n\t"
+        "psq_st    3,16(%[out]),0,0\n\t"
+        "psq_st    4,24(%[out]),0,0\n\t"
+        "psq_st    5,32(%[out]),0,0\n\t"
+        "psq_st    6,40(%[out]),0,0\n\t"
+        "psq_st    7,48(%[out]),0,0\n\t"
+        "psq_st    8,56(%[out]),0,0"
+        : [b] "=&b"(b), [w] "=&b"(w), [list] "+b"(list)
+        : [out] "b"(out), [b0] "b"(b0), [w0] "b"(w0), [n] "r"(n)
+        : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12",
+          "cr0", "ctr", "memory");
+}
+
+// What CpuSkinVertices hands the loop: the vertices, and with the morph targets on (MORPH) the block's first vertex
+// and a weight pair for each pair of slots -- each slot's target's weight times the slot's scale, so the int16s go
+// straight to a move (0 for a target off)
+struct OctSkinJob
+{
+    const VertexSkinned* mSrc;
+    Vertex* mDst;
+    uint32_t mNumVerts;
+    const glm::mat4* mBones;
+    bool mOneBone;
+    const int16_t* mMorph;
+    uint32_t mMorphStride;      // (bytes a vertex)
+    const float* mPosW;         // (2 floats a pair of move slots)
+    uint32_t mNumPos;           // (pairs of move slots read: at least 1)
+    const float* mNrmW;
+    uint32_t mNrmOfs;           // (bytes from a vertex's first pair to its first normal pair)
+    uint32_t mNumNrm;           // (pairs of normal slots read: at least 1 with RENORM)
+};
+
+// CpuSkinVertices' loop, on the console: the same sums as the PC's -- the morph targets each by its weight added to
+// the vertex's own, the normal made unit again when a target turns it, the bones' blended transform -- in pairs.
+// MORPH: a morph target on; RENORM: one of those turns normals.
+template<bool MORPH, bool RENORM>
+static void OctSkinPairs(const OctSkinJob& job)
+{
+    const VertexSkinned* src = job.mSrc;
+    Vertex* dst = job.mDst;
+    const uint32_t numVerts = job.mNumVerts;
+    const glm::mat4* bones = job.mBones;
+    const bool oneBone = job.mOneBone;
+    const char* morph = (const char*)job.mMorph;
+    const uint32_t morphStride = job.mMorphStride;
+    const float* posW = job.mPosW;
+    const uint32_t numPos = job.mNumPos;
+    const float* nrmW = job.mNrmW;
+    const uint32_t nrmOfs = job.mNrmOfs;
+    const uint32_t numNrm = job.mNumNrm;
+    static_assert(sizeof(VertexSkinned) == 60 && sizeof(Vertex) == 40 && sizeof(glm::mat4) == 64,
+                  "OctSkinPairs' asm reads and writes them at these offsets");
+
+    // Each 32-byte cache line of the array zeroed just before it's written (dcbz) -- every byte of a Vertex is
+    // written below, so nothing the zeroing clears is kept -- not read in from memory first, as a store to a line
+    // not in the cache otherwise is; the lines only partly in the array (its ends) left alone. And the source a few
+    // vertices ahead asked for (dcbt), a cache line at a time, PF_AHEAD vertices ahead: each line once, not a dcbt
+    // for every vertex whether its line was asked for already or not. (Past the arrays' ends too, for the last few:
+    // a dcbt only reads, and one that can't is nothing.)
+    static_assert(sizeof(Vertex) == 2 * sizeof(glm::vec3) + 2 * sizeof(glm::vec2), "dcbz: a Vertex has no padding");
+    uintptr_t nextLine = ((uintptr_t)dst + 31) & ~(uintptr_t)31;
+    const uintptr_t dstEnd = (uintptr_t)(dst + numVerts);
+#if OCT_SKIN_STORE_LINES
+    uintptr_t doneLine = (uintptr_t)dst & ~(uintptr_t)31;
+#endif
+    const uint32_t PF_AHEAD = 6;
+    uintptr_t srcPf = (uintptr_t)src & ~(uintptr_t)31;
+    uintptr_t morphPf = (uintptr_t)morph & ~(uintptr_t)31;
+
+    // (the Newton step's constants, and the normal too short to make unit: scalars. Made opaque, so the compiler
+    //  keeps them in four FPRs through the loop -- the asm leaves f26-f31 alone -- not loads them again each vertex)
+    double kHalf = 0.5, kThree = 3.0, kOne = 1.0, kTiny = 1e-8;
+    __asm__("" : "+f"(kHalf), "+f"(kThree), "+f"(kOne), "+f"(kTiny));
+    float blended[16] __attribute__((aligned(32)));            // (a vertex of more than one bone: its 3x4)
+
+    uint32_t oldGqr = 0;
+    if (MORPH)
+    {
+        __asm__ volatile("mfspr %0,%1" : "=r"(oldGqr) : "i"(OCT_GQR_S16));
+        __asm__ volatile("mtspr %0,%1\n\tisync" : : "i"(OCT_GQR_S16), "r"(OCT_GQR_S16_VALUE) : "memory");
+    }
+
+    // (the first PF_AHEAD vertices asked for before the loop; then each vertex asks for the lines one more brings)
+    while (srcPf < (uintptr_t)(src + PF_AHEAD))
+    {
+        __asm__ volatile("dcbt 0,%0" : : "r"(srcPf));
+        srcPf += 32;
+    }
+    while (MORPH && morphPf < (uintptr_t)(morph + PF_AHEAD * morphStride))
+    {
+        __asm__ volatile("dcbt 0,%0" : : "r"(morphPf));
+        morphPf += 32;
+    }
+
+    const VertexSkinned* sv = src;
+    Vertex* dv = dst;
+    const char* mv = morph;
+    for (uint32_t i = 0; i < numVerts; ++i, ++sv, ++dv, mv += morphStride)
+    {
+        // (a vertex, 40 bytes, starts at most two lines, and one 60 bytes on brings at most two more to ask for)
+        {
+            const uintptr_t vertEnd = (uintptr_t)(dv + 1);
+            if (nextLine < vertEnd && nextLine + 32 <= dstEnd)
+            {
+                __asm__ volatile("dcbz 0,%0" : : "r"(nextLine) : "memory");
+                nextLine += 32;
+                if (nextLine < vertEnd && nextLine + 32 <= dstEnd)
+                {
+                    __asm__ volatile("dcbz 0,%0" : : "r"(nextLine) : "memory");
+                    nextLine += 32;
+                }
+            }
+        }
+        {
+            const uintptr_t want = (uintptr_t)(sv + PF_AHEAD);
+            if (srcPf < want)
+            {
+                __asm__ volatile("dcbt 0,%0" : : "r"(srcPf));
+                srcPf += 32;
+                if (srcPf < want)
+                {
+                    __asm__ volatile("dcbt 0,%0" : : "r"(srcPf));
+                    srcPf += 32;
+                }
+            }
+        }
+        if (MORPH)
+        {
+            const uintptr_t want = (uintptr_t)(mv + PF_AHEAD * morphStride);
+#pragma GCC unroll 1
+            while (morphPf < want)
+            {
+                __asm__ volatile("dcbt 0,%0" : : "r"(morphPf));
+                morphPf += 32;
+            }
+        }
+
+        // the bones' blended transform, its top three rows only; the rest, weighted 0, left out (most vertices have
+        // one or two bones). One bone of weight 1 (the most common: rigid parts): its matrix's columns as they are
+        // -- times 1, the same numbers. (The weights' bits compared, not floats: -0 is 0 as ever.)
+        uint32_t wb0, wb1, wb2, wb3;
+        __builtin_memcpy(&wb0, &sv->mBoneWeights[0], 4);
+        __builtin_memcpy(&wb1, &sv->mBoneWeights[1], 4);
+        __builtin_memcpy(&wb2, &sv->mBoneWeights[2], 4);
+        __builtin_memcpy(&wb3, &sv->mBoneWeights[3], 4);
+        const char* cols = (const char*)(bones + sv->mBoneIndices[0]);
+        if (!oneBone && !(wb0 == 0x3f800000u && ((wb1 | wb2 | wb3) << 1) == 0))
+        {
+            OctSkinBone list[3];
+            uint32_t n = 0;
+            if ((wb1 << 1) != 0) { list[n].mMat = (const char*)(bones + sv->mBoneIndices[1]); list[n].mWeight = &sv->mBoneWeights[1]; ++n; }
+            if ((wb2 << 1) != 0) { list[n].mMat = (const char*)(bones + sv->mBoneIndices[2]); list[n].mWeight = &sv->mBoneWeights[2]; ++n; }
+            if ((wb3 << 1) != 0) { list[n].mMat = (const char*)(bones + sv->mBoneIndices[3]); list[n].mWeight = &sv->mBoneWeights[3]; ++n; }
+            OctSkinBlend(blended, cols, &sv->mBoneWeights[0], list, n);
+            cols = (const char*)blended;
+        }
+
+        // the vertex, its morph targets each by its weight added to its own, through the bones
+        const char* m = mv;
+        const char* mn = mv + nrmOfs;
+        const float* pw = posW;
+        const float* nw = nrmW;
+        uint32_t np = numPos, nn = numNrm;
+#define OCT_SKIN_ASM_OPERANDS \
+        : [m] "+b"(m), [mn] "+b"(mn), [pw] "+b"(pw), [nw] "+b"(nw), [np] "+r"(np), [nn] "+r"(nn) \
+        : [src] "b"(sv), [dst] "b"(dv), [cols] "b"(cols), \
+          [half] "f"(kHalf), [three] "f"(kThree), [one] "f"(kOne), [tiny] "f"(kTiny) \
+        : OCT_SKIN_ASM_CLOBBERS
+        if (MORPH && RENORM)
+        {
+            __asm__ volatile(OCT_SKIN_ASM_SRC
+                             OCT_SKIN_ASM_MORPH("1", "m", "pw", "np", "1", "2", "7", "8", "9", "10", "11", "12", "13")
+                             OCT_SKIN_ASM_MORPH("3", "mn", "nw", "nn", "3", "4", "0", "14", "15", "16", "17", "18", "19")
+                             OCT_SKIN_ASM_SUM2
+                             OCT_SKIN_ASM_OUT_RENORM
+                             OCT_SKIN_ASM_OPERANDS);
+        }
+        else if (MORPH)
+        {
+            __asm__ volatile(OCT_SKIN_ASM_SRC
+                             OCT_SKIN_ASM_MORPH("1", "m", "pw", "np", "1", "2", "7", "8", "9", "10", "11", "12", "13")
+                             OCT_SKIN_ASM_SUM("1", "2", "11", "12", "13")
+                             OCT_SKIN_ASM_OUT
+                             OCT_SKIN_ASM_OPERANDS);
+        }
+        else
+        {
+            __asm__ volatile(OCT_SKIN_ASM_SRC
+                             OCT_SKIN_ASM_OUT
+                             OCT_SKIN_ASM_OPERANDS);
+        }
+#undef OCT_SKIN_ASM_OPERANDS
+
+#if OCT_SKIN_STORE_LINES
+        {
+            const uintptr_t vertEnd = (uintptr_t)(dv + 1);         // (a vertex finishes at most two lines)
+            if (doneLine + 32 <= vertEnd)
+            {
+                __asm__ volatile("dcbst 0,%0" : : "r"(doneLine) : "memory");
+                doneLine += 32;
+                if (doneLine + 32 <= vertEnd)
+                {
+                    __asm__ volatile("dcbst 0,%0" : : "r"(doneLine) : "memory");
+                    doneLine += 32;
+                }
+            }
+        }
+#endif
+    }
+
+    if (MORPH)
+        __asm__ volatile("mtspr %0,%1" : : "i"(OCT_GQR_S16), "r"(oldGqr) : "memory");
+}
+#endif
+
 void SkeletalMesh3D::CpuSkinVertices()
 {
 #if PLATFORM_DOLPHIN && PROFILING_ENABLED
@@ -1959,28 +2378,59 @@ void SkeletalMesh3D::CpuSkinVertices()
         // its sums kept aside then read back, only pulled more memory through the cache -- it was ~3.9 ms of a glide
         // on the GameCube, nearly all of it waiting on memory: eight streams a vertex (the mesh's vertex, four targets'
         // moves, two targets' normal changes, the scratch sums), none asked for ahead.
-        bool morphNormals = false;
         const uint32_t numMorphs = glm::min<uint32_t>(mesh->GetNumMorphTargets(), uint32_t(mMorphWeights.size()));
+        const bool oneBone = (mBoneInfluenceMode == BoneInfluenceMode::One);
 #if PLATFORM_DOLPHIN && !EDITOR
-        // (the console: the mesh's interleaved block -- SkeletalMesh::GetMorphBlock -- every target's moves for a vertex
-        //  side by side, one stream beside the vertices instead of one a target: the same sums in the same order)
-        struct ActiveBlock { int32_t mPos; int32_t mNrm; float mWeight; };
-        static std::vector<ActiveBlock> sMorphs;
-        sMorphs.clear();
+        // (the console: OctSkinPairs, two floats an instruction, the targets from the mesh's block -- GetMorphBlock:
+        //  every target's moves for a vertex side by side, in 16-bit fixed point -- by a weight for each slot, its
+        //  target's times the slot's scale; the pairs of slots past the last one on not read, and none when all are off)
         const SkeletalMesh::MorphBlock& block = mesh->GetMorphBlock();
-        for (uint32_t m = 0; m < numMorphs && m < block.mPosOfs.size(); ++m)
+        static std::vector<float> sMorphW;
+        const uint32_t numPosW = 2 * block.mNumPosPairs;
+        sMorphW.assign(numPosW + 2 * block.mNumNrmPairs, 0.0f);
+        uint32_t usedPos = 0, usedNrm = 0;
+        for (uint32_t m = 0; m < numMorphs && m < block.mPosSlot.size(); ++m)
         {
             const float w = mMorphWeights[m];
-            if (w == 0.0f || (block.mPosOfs[m] < 0 && block.mNrmOfs[m] < 0))
+            if (w == 0.0f)
                 continue;
-            sMorphs.push_back({ block.mPosOfs[m], block.mNrmOfs[m], w });
-            morphNormals = morphNormals || (block.mNrmOfs[m] >= 0);
+            const int32_t posSlot = block.mPosSlot[m];
+            const int32_t nrmSlot = block.mNrmSlot[m];
+            if (posSlot >= 0)
+            {
+                sMorphW[posSlot] = w * block.mPosScale[posSlot];
+                usedPos = glm::max<uint32_t>(usedPos, uint32_t(posSlot) / 2 + 1);
+            }
+            if (nrmSlot >= 0)
+            {
+                sMorphW[numPosW + nrmSlot] = w * block.mNrmScale[nrmSlot];
+                usedNrm = glm::max<uint32_t>(usedNrm, uint32_t(nrmSlot) / 2 + 1);
+            }
         }
-        const uint32_t numActive = (block.mData.size() >= size_t(numVerts) * block.mStride) ? uint32_t(sMorphs.size()) : 0u;
-        const ActiveBlock* active = sMorphs.data();
-        const float* morphData = block.mData.data();
-        const uint32_t morphStride = block.mStride;
+        const bool morphOn = (usedPos > 0 || usedNrm > 0) && block.mStride > 0 &&
+                             block.mData.size() >= size_t(numVerts) * block.mStride;
+
+        OctSkinJob job;
+        job.mSrc = src;
+        job.mDst = dst;
+        job.mNumVerts = numVerts;
+        job.mBones = boneMats;
+        job.mOneBone = oneBone;
+        job.mMorph = block.mData.data();
+        job.mMorphStride = block.mStride * uint32_t(sizeof(int16_t));
+        job.mPosW = sMorphW.data();
+        job.mNumPos = glm::max<uint32_t>(usedPos, 1u);         // (the block has at least one pair of move slots)
+        job.mNrmW = sMorphW.data() + numPosW;
+        job.mNrmOfs = 12 * block.mNumPosPairs;
+        job.mNumNrm = usedNrm;
+        if (!morphOn)
+            OctSkinPairs<false, false>(job);
+        else if (usedNrm == 0)
+            OctSkinPairs<true, false>(job);
+        else
+            OctSkinPairs<true, true>(job);                      // (a normal turned: made unit again)
 #else
+        bool morphNormals = false;
         struct ActiveMorph { const glm::vec3* mPos; const glm::vec3* mNrm; uint32_t mNumPos; uint32_t mNumNrm; float mWeight; };
         static std::vector<ActiveMorph> sMorphs;
         sMorphs.clear();
@@ -1999,80 +2449,23 @@ void SkeletalMesh3D::CpuSkinVertices()
         }
         const uint32_t numActive = uint32_t(sMorphs.size());
         const ActiveMorph* active = sMorphs.data();
-#endif
-        const bool oneBone = (mBoneInfluenceMode == BoneInfluenceMode::One);
-
-#if PLATFORM_DOLPHIN
-        // Each 32-byte cache line of the array zeroed just before it's written (dcbz) -- every byte of a Vertex is
-        // written below, so nothing the zeroing clears is kept -- not read in from memory first, as a store to a line
-        // not in the cache otherwise is; and the source a few vertices ahead asked for (dcbt). The lines only partly
-        // in the array (its ends) are left alone.
-        const bool zeroLines = sizeof(Vertex) == 2 * sizeof(glm::vec3) + 2 * sizeof(glm::vec2);   // (no padding)
-        uintptr_t nextLine = ((uintptr_t)dst + 31) & ~(uintptr_t)31;
-        const uintptr_t dstEnd = (uintptr_t)(dst + numVerts);
-        // (the streams read asked for a cache line at a time, PF_AHEAD vertices ahead: each line once, not a dcbt for
-        //  every vertex and target whether its line was asked for already or not)
-        const uint32_t PF_AHEAD = 6;
-        uintptr_t srcPf = (uintptr_t)src & ~(uintptr_t)31;
-        const uintptr_t srcEnd = (uintptr_t)(src + numVerts);
-        uintptr_t morphPf = (numActive > 0) ? ((uintptr_t)morphData & ~(uintptr_t)31) : 0;
-        const uintptr_t morphEnd = (numActive > 0) ? (uintptr_t)(morphData + size_t(numVerts) * morphStride) : 0;
-#endif
 
         static_assert(MAX_BONE_INFLUENCES == 4, "Need to adjust this code or convert to loop.");
         for (uint32_t i = 0; i < numVerts; ++i)
         {
             const VertexSkinned& srcVert = src[i];
             Vertex& dstVert = dst[i];
-#if PLATFORM_DOLPHIN
-            if (zeroLines)
-            {
-                const uintptr_t vertEnd = (uintptr_t)(dst + i + 1);
-                while (nextLine < vertEnd && nextLine + 32 <= dstEnd)
-                {
-                    __asm__ volatile("dcbz 0,%0" : : "r"(nextLine) : "memory");
-                    nextLine += 32;
-                }
-            }
-            {
-                const uintptr_t want = (uintptr_t)(src + glm::min(i + PF_AHEAD, numVerts));
-                while (srcPf < want && srcPf < srcEnd)
-                {
-                    __asm__ volatile("dcbt 0,%0" : : "r"(srcPf));
-                    srcPf += 32;
-                }
-            }
-            if (numActive > 0)
-            {
-                const uintptr_t want = (uintptr_t)(morphData + size_t(glm::min(i + PF_AHEAD, numVerts)) * morphStride);
-                while (morphPf < want && morphPf < morphEnd)
-                {
-                    __asm__ volatile("dcbt 0,%0" : : "r"(morphPf));
-                    morphPf += 32;
-                }
-            }
-#endif
 
             glm::vec3 pos = srcVert.mPosition;
             glm::vec3 nrm = srcVert.mNormal;
             if (numActive > 0)
             {
-#if PLATFORM_DOLPHIN && !EDITOR
-                const float* md = morphData + size_t(i) * morphStride;
-                for (uint32_t m = 0; m < numActive; ++m)
-                {
-                    const ActiveBlock& am = active[m];
-                    if (am.mPos >= 0) pos += glm::vec3(md[am.mPos], md[am.mPos + 1], md[am.mPos + 2]) * am.mWeight;
-                    if (am.mNrm >= 0) nrm += glm::vec3(md[am.mNrm], md[am.mNrm + 1], md[am.mNrm + 2]) * am.mWeight;
-                }
-#else
                 for (uint32_t m = 0; m < numActive; ++m)
                 {
                     const ActiveMorph& am = active[m];
                     if (i < am.mNumPos) pos += am.mPos[i] * am.mWeight;
                     if (i < am.mNumNrm) nrm += am.mNrm[i] * am.mWeight;
                 }
-#endif
                 if (morphNormals)                                   // (the normal turned: made unit again)
                 {
                     const float len2 = nrm.x * nrm.x + nrm.y * nrm.y + nrm.z * nrm.z;
@@ -2108,6 +2501,7 @@ void SkeletalMesh3D::CpuSkinVertices()
             dstVert.mTexcoord1 = srcVert.mTexcoord1;
             dstVert.mNormal = c0 * nrm.x + c1 * nrm.y + c2 * nrm.z;
         }
+#endif
 
         GFX_UpdateSkeletalMeshCompVertexBuffer(this, mSkinnedVertices);
     }

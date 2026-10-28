@@ -1259,20 +1259,36 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
 // matrix x them: the GPU-skinned path's matrices), loaded before each batch's list. Every face is in a batch, those
 // with a CPU-skinned vertex too: a rigid vertex goes through its bone in every face it's in, so where the two kinds
 // meet the edges are the same on both sides. Not for a mesh with morph targets (a morph moves the vertices before
-// the bones do), nor under a material whose texgens read the normals as they come (a sphere map, the sharp
-// specular's lobes: GxSkinRigidPlan), nor for a mesh mostly blended.
+// the bones do), nor under a material whose texgens read the normals as they come some other way than one sphere
+// map (the sharp specular's lobes, two sphere-mapped slots: GxSkinRigidPlan), nor for a mesh mostly blended.
 // (A real GameCube's GPU hangs on position-only vertices with a matrix index -- Dolphin draws them -- so the
 // projected shadow's caster draws the full lists too: the extra attributes go unread with no texgens or lighting.)
+// A sphere map (UV_MAP_ENVIRONMENT) reads the normal as the vertex brings it, through GX_TEXMTX2: a rigid vertex
+// left in its bind pose would be mapped by its bind-pose normal. Under such a material (a power-up's look) the faces
+// go in a second set of batches, of at most seven bones, each vertex with a texture-matrix index too (the sphere
+// map's texcoord n: GX_VA_TEXnMTXIDX, the byte after its matrix index, before its position) -- GX_TEXMTX2 + slot x 3:
+// slot 0 the plain sphere map (TEXMTX2, LoadEnvTexMtx), slots 1-7 the sphere map x the batch's bones' rotation
+// (TEXMTX3-9), as the CPU would have turned those normals (mat3 of the bone, not made unit again). Seven: the GPU's
+// 64 rows of matrix memory hold the position matrices (PNMTX0-7: rows 0-23) and the texture matrices (rows 30-59);
+// the UV matrices (TEXMTX0/1) and the sphere map stay as BindMaterial and the draw loaded them, and TEXMTX3-9 have
+// nothing live in a skinned draw (the sharp specular's lobes, TEXMTX5/6, are loaded by each draw that has them,
+// SetupLightMask, and refused here; the projected shadow's receivers load TEXMTX7-9 each, in their own pass). Built
+// with the plain set, as the mesh loads: the material can change at any moment, and building them then would be a
+// hitch. A tenth or so bigger than the plain set (a byte more a vertex, a few more strip breaks).
 #ifndef OCT_GX_RIGID_SKIN
 #define OCT_GX_RIGID_SKIN 1
 #endif
+#ifndef OCT_GX_RIGID_SKIN_ENV
+#define OCT_GX_RIGID_SKIN_ENV 1
+#endif
 static const uint32_t kRigidBones = 9;                  // (a batch's: slots 1-9)
+static const uint32_t kRigidEnvBones = 7;               // (a sphere-mapped batch's: slots 1-7, TEXMTX3-9)
 
 struct GxRigidBatch
 {
     void* mFull = nullptr;                              // matrix index, position, normal, both texcoords a vertex
-    uint32_t mFullSize = 0;
-    uint32_t mNumBones = 0;
+    uint32_t mFullSize = 0;                             // (a sphere-mapped one: its texture-matrix index after the
+    uint32_t mNumBones = 0;                             //  matrix index)
     uint8_t mBones[kRigidBones] = {};                   // slot 1 + i: bone mBones[i]
 };
 
@@ -1285,6 +1301,7 @@ struct GxSkinLists
     bool mFullTried = false;
     bool mPosTried = false;
     std::vector<GxRigidBatch> mRigid;                   // (none: the CPU skins every vertex)
+    std::vector<GxRigidBatch> mRigidEnv;                // (under a sphere map; none: the CPU skins every vertex then)
     std::vector<uint16_t> mBlendedVerts;                // the vertices the CPU skins, in order
     std::vector<uint16_t> mRigidVerts;                  // the rest
 };
@@ -1321,13 +1338,15 @@ static void StripSkinFaces(const IndexType* faceIdx, uint32_t numFaces, GxStripS
 }
 
 // A strip set's list: `perVertex` 16-bit indices a vertex (4: position, normal, both texcoords; 1: position), after
-// its matrix index when there's `mtxIdx` (a byte for each of the mesh's vertices). nullptr: out of memory, or no
-// faces with any area.
-static void* WriteSkinList(const GxStripSet& s, uint32_t perVertex, const uint8_t* mtxIdx, const char* meshName,
-                           uint32_t& outSize)
+// its matrix index when there's `mtxIdx` (a byte for each of the mesh's vertices), and after that its texture-matrix
+// index when `texMtxIdx` (GX_TEXMTX2 + the matrix index: its slot's sphere map). nullptr: out of memory, or no faces
+// with any area.
+static void* WriteSkinList(const GxStripSet& s, uint32_t perVertex, const uint8_t* mtxIdx, bool texMtxIdx,
+                           const char* meshName, uint32_t& outSize)
 {
     outSize = 0;
-    const uint32_t vertBytes = perVertex * 2 + ((mtxIdx != nullptr) ? 1 : 0);
+    texMtxIdx = texMtxIdx && (mtxIdx != nullptr);
+    const uint32_t vertBytes = perVertex * 2 + ((mtxIdx != nullptr) ? 1 : 0) + (texMtxIdx ? 1 : 0);
     const uint32_t numSingles = uint32_t(s.mSingles.size());
     const uint32_t kPrimVerts = 65535;                  // (GX_Begin's count is 16-bit: 21845 triangles)
     const uint32_t singlePrims = (numSingles + kPrimVerts - 1) / kPrimVerts;
@@ -1350,10 +1369,12 @@ static void* WriteSkinList(const GxStripSet& s, uint32_t perVertex, const uint8_
         *at++ = uint8_t(count >> 8);
         *at++ = uint8_t(count & 0xff);
     };
-    auto vert = [&at, perVertex, mtxIdx](uint16_t idx)
+    auto vert = [&at, perVertex, mtxIdx, texMtxIdx](uint16_t idx)
     {
         if (mtxIdx != nullptr)
             *at++ = mtxIdx[idx];
+        if (texMtxIdx)
+            *at++ = uint8_t(GX_TEXMTX2 + mtxIdx[idx]);  // (GX's attribute order: PTNMTXIDX, TEXnMTXIDX, POS...)
         for (uint32_t k = 0; k < perVertex; ++k)
         {
             *at++ = uint8_t(idx >> 8);
@@ -1394,7 +1415,7 @@ static void* BuildSkinList(SkeletalMesh* mesh, bool posOnly, uint32_t& outSize)
 
     GxStripSet strips;
     StripSkinFaces(indices, numFaces, strips);
-    return WriteSkinList(strips, posOnly ? 1 : 4, nullptr, mesh->GetName().c_str(), outSize);
+    return WriteSkinList(strips, posOnly ? 1 : 4, nullptr, false, mesh->GetName().c_str(), outSize);
 }
 
 // The mesh's full skinned list, made now if it hasn't been tried (nullptr: send the indices as before)
@@ -1420,68 +1441,43 @@ static void* GetSkinList(SkeletalMesh* mesh, bool posOnly, uint32_t& outSize)
     return lists.mFull;
 }
 
-static void FreeRigidBatches(GxSkinLists& lists)
+static void FreeRigidBatchSet(std::vector<GxRigidBatch>& set)
 {
-    for (GxRigidBatch& batch : lists.mRigid)
+    for (GxRigidBatch& batch : set)
     {
         GxDeferFree(batch.mFull);                       // (the GPU may still be drawing the last frame from them)
     }
-    lists.mRigid.clear();
+    set.clear();
+}
+
+static void FreeRigidBatches(GxSkinLists& lists)
+{
+    FreeRigidBatchSet(lists.mRigid);
+    FreeRigidBatchSet(lists.mRigidEnv);
     lists.mBlendedVerts.clear();
     lists.mRigidVerts.clear();
 }
 
-// The mesh's rigid batches (above), if it's one for them
-static void BuildRigidBatches(SkeletalMesh* mesh, GxSkinLists& lists)
+// A face's bones (its rigid vertices'), and the lowest of them (256: no rigid vertex, any batch takes it)
+struct GxFaceBones { uint8_t mBones[3]; uint32_t mNum; uint32_t mLowest; };
+
+// One set of the mesh's rigid batches: each face (in `order`) into the first batch with room for its bones, at most
+// `maxBones` a batch; `env`: each vertex's texture-matrix index too (a sphere map's batches). False: out of memory
+// (what was made of the set freed).
+static bool MakeRigidBatchSet(SkeletalMesh* mesh, const std::vector<GxFaceBones>& faceBones,
+                              const std::vector<uint32_t>& order, uint32_t maxBones, bool env,
+                              std::vector<GxRigidBatch>& out)
 {
     const uint32_t numVerts = mesh->GetNumVertices();
-    const uint32_t numFaces = mesh->GetNumFaces();
     const IndexType* indices = mesh->GetIndices();
     const VertexSkinned* verts = mesh->GetVertices().data();
-    if (mesh->GetNumMorphTargets() > 0 || numFaces == 0 || indices == nullptr || verts == nullptr)
-        return;
-
-    for (uint32_t i = 0; i < numVerts; ++i)
-        (IsRigidSkinVertex(verts[i]) ? lists.mRigidVerts : lists.mBlendedVerts).push_back(uint16_t(i));
-    if (lists.mRigidVerts.size() * 2 < numVerts)
-    {
-        FreeRigidBatches(lists);                        // (mostly blended: little to gain)
-        return;
-    }
-
-    // Each face's bones (its rigid vertices'), and the faces in order of their lowest, so a part's faces come together
-    struct FaceBones { uint8_t mBones[3]; uint32_t mNum; uint32_t mLowest; };
-    std::vector<FaceBones> faceBones(numFaces);
-    std::vector<uint32_t> order(numFaces);
-    for (uint32_t f = 0; f < numFaces; ++f)
-    {
-        FaceBones& fb = faceBones[f];
-        fb.mNum = 0;
-        fb.mLowest = 256;                               // (no rigid vertex: any batch takes it)
-        for (uint32_t c = 0; c < 3; ++c)
-        {
-            const VertexSkinned& v = verts[indices[f * 3 + c]];
-            if (!IsRigidSkinVertex(v))
-                continue;
-            const uint8_t b = v.mBoneIndices[0];
-            bool have = false;
-            for (uint32_t k = 0; k < fb.mNum; ++k)
-                have = have || (fb.mBones[k] == b);
-            if (!have)
-                fb.mBones[fb.mNum++] = b;
-            fb.mLowest = (b < fb.mLowest) ? b : fb.mLowest;
-        }
-        order[f] = f;
-    }
-    std::stable_sort(order.begin(), order.end(),
-                     [&faceBones](uint32_t a, uint32_t b) { return faceBones[a].mLowest < faceBones[b].mLowest; });
 
     // Each face into the first batch with room for its bones
     struct Batch { uint8_t mBones[kRigidBones]; uint32_t mNum; std::vector<uint32_t> mFaces; };
     std::vector<Batch> batches;
     for (uint32_t f : order)
     {
-        const FaceBones& fb = faceBones[f];
+        const GxFaceBones& fb = faceBones[f];
         Batch* into = nullptr;
         for (Batch& batch : batches)
         {
@@ -1493,7 +1489,7 @@ static void BuildRigidBatches(SkeletalMesh* mesh, GxSkinLists& lists)
                     have = have || (batch.mBones[j] == fb.mBones[k]);
                 extra += have ? 0 : 1;
             }
-            if (batch.mNum + extra <= kRigidBones)
+            if (batch.mNum + extra <= maxBones)
             {
                 into = &batch;
                 break;
@@ -1521,7 +1517,7 @@ static void BuildRigidBatches(SkeletalMesh* mesh, GxSkinLists& lists)
     std::vector<uint8_t> mtxIdx(numVerts, 0);
     std::vector<IndexType> faceIdx;
     GxStripSet strips;
-    lists.mRigid.resize(batches.size());
+    out.resize(batches.size());
     for (uint32_t i = 0; i < batches.size(); ++i)
     {
         Batch& batch = batches[i];
@@ -1542,17 +1538,81 @@ static void BuildRigidBatches(SkeletalMesh* mesh, GxSkinLists& lists)
         }
         StripSkinFaces(faceIdx.data(), uint32_t(batch.mFaces.size()), strips);
 
-        GxRigidBatch& out = lists.mRigid[i];
-        out.mNumBones = batch.mNum;
-        memcpy(out.mBones, batch.mBones, sizeof(out.mBones));
+        GxRigidBatch& set = out[i];
+        set.mNumBones = batch.mNum;
+        memcpy(set.mBones, batch.mBones, sizeof(set.mBones));
         const bool any = !strips.mLens.empty() || !strips.mSingles.empty();
-        out.mFull = WriteSkinList(strips, 4, mtxIdx.data(), mesh->GetName().c_str(), out.mFullSize);
-        if (any && out.mFull == nullptr)
+        set.mFull = WriteSkinList(strips, 4, mtxIdx.data(), env, mesh->GetName().c_str(), set.mFullSize);
+        if (any && set.mFull == nullptr)
         {
-            FreeRigidBatches(lists);                    // (out of memory: the CPU skins it all, as before)
-            return;
+            FreeRigidBatchSet(out);
+            return false;
         }
     }
+    return true;
+}
+
+// The mesh's rigid batches (above), if it's one for them: the plain set, and the sphere map's
+static void BuildRigidBatches(SkeletalMesh* mesh, GxSkinLists& lists)
+{
+    const uint32_t numVerts = mesh->GetNumVertices();
+    const uint32_t numFaces = mesh->GetNumFaces();
+    const IndexType* indices = mesh->GetIndices();
+    const VertexSkinned* verts = mesh->GetVertices().data();
+    if (mesh->GetNumMorphTargets() > 0 || numFaces == 0 || indices == nullptr || verts == nullptr)
+        return;
+
+    for (uint32_t i = 0; i < numVerts; ++i)
+        (IsRigidSkinVertex(verts[i]) ? lists.mRigidVerts : lists.mBlendedVerts).push_back(uint16_t(i));
+    if (lists.mRigidVerts.size() * 2 < numVerts)
+    {
+        FreeRigidBatches(lists);                        // (mostly blended: little to gain)
+        return;
+    }
+
+    // Each face's bones, and the faces in order of their lowest, so a part's faces come together
+    std::vector<GxFaceBones> faceBones(numFaces);
+    std::vector<uint32_t> order(numFaces);
+    for (uint32_t f = 0; f < numFaces; ++f)
+    {
+        GxFaceBones& fb = faceBones[f];
+        fb.mNum = 0;
+        fb.mLowest = 256;                               // (no rigid vertex: any batch takes it)
+        for (uint32_t c = 0; c < 3; ++c)
+        {
+            const VertexSkinned& v = verts[indices[f * 3 + c]];
+            if (!IsRigidSkinVertex(v))
+                continue;
+            const uint8_t b = v.mBoneIndices[0];
+            bool have = false;
+            for (uint32_t k = 0; k < fb.mNum; ++k)
+                have = have || (fb.mBones[k] == b);
+            if (!have)
+                fb.mBones[fb.mNum++] = b;
+            fb.mLowest = (b < fb.mLowest) ? b : fb.mLowest;
+        }
+        order[f] = f;
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&faceBones](uint32_t a, uint32_t b) { return faceBones[a].mLowest < faceBones[b].mLowest; });
+
+    if (!MakeRigidBatchSet(mesh, faceBones, order, kRigidBones, false, lists.mRigid))
+    {
+        FreeRigidBatches(lists);                        // (out of memory: the CPU skins it all, as before)
+        return;
+    }
+    // (out of memory for these: the CPU skins every vertex under a sphere map, as before)
+    if (OCT_GX_RIGID_SKIN_ENV)
+        MakeRigidBatchSet(mesh, faceBones, order, kRigidEnvBones, true, lists.mRigidEnv);
+
+    uint32_t plainBytes = 0, envBytes = 0;
+    for (const GxRigidBatch& batch : lists.mRigid)
+        plainBytes += batch.mFullSize;
+    for (const GxRigidBatch& batch : lists.mRigidEnv)
+        envBytes += batch.mFullSize;
+    LogDebug("Mesh %s: GPU rigid skinning, %u of %u vertices; %u batches (%u bytes), sphere-mapped %u (%u bytes)",
+             mesh->GetName().c_str(), uint32_t(lists.mRigidVerts.size()), numVerts, uint32_t(lists.mRigid.size()),
+             plainBytes, uint32_t(lists.mRigidEnv.size()), envBytes);
 }
 
 static void FreeSkinLists(const SkeletalMesh* mesh)
@@ -1576,12 +1636,13 @@ static const GxSkinLists* GetRigidLists(SkeletalMesh3D* comp, SkeletalMesh* mesh
     return (it != sSkinLists.end() && !it->second.mRigid.empty()) ? &it->second : nullptr;
 }
 
-// Each batch: its bones' matrices into slots 1-9 (normalMtx: the normal matrices too, for a draw that reads normals),
-// then its list. Slot 0 -- the model-view, for the vertices the CPU skinned -- the caller's.
-static void DrawRigidBatches(const GxSkinLists& lists, SkeletalMesh3D* comp, const Mtx modelView,
-                             const Mtx* normalMtx)
+// Each batch: its bones' matrices into slots 1-9 (normalMtx: the normal matrices too, for a draw that reads normals;
+// envMtx, the sphere map's batches: the sphere map x each bone's rotation into GX_TEXMTX2 + its slot x 3), then its
+// list. Slot 0 -- the model-view (and the plain sphere map, TEXMTX2), for the vertices the CPU skinned -- the caller's.
+static void DrawRigidBatches(const std::vector<GxRigidBatch>& batches, SkeletalMesh3D* comp, const Mtx modelView,
+                             const Mtx* normalMtx, const Mtx* envMtx = nullptr)
 {
-    for (const GxRigidBatch& batch : lists.mRigid)
+    for (const GxRigidBatch& batch : batches)
     {
         void* list = batch.mFull;
         if (list == nullptr)
@@ -1599,21 +1660,38 @@ static void DrawRigidBatches(const GxSkinLists& lists, SkeletalMesh3D* comp, con
                 c_guMtxConcat(*normalMtx, bone, normalTransform);
                 GX_LoadNrmMtxImm(normalTransform, GX_PNMTX0 + (s + 1) * 3);
             }
+            if (envMtx != nullptr)
+            {
+                // (the bone's rotation-scale alone: the texgen takes the normal with a 1 after it, and the move
+                //  would slide the map)
+                Mtx rot, envTransform;
+                memcpy(rot, bone, sizeof(Mtx));
+                rot[0][3] = rot[1][3] = rot[2][3] = 0.0f;
+                c_guMtxConcat(*envMtx, rot, envTransform);
+                GX_LoadTexMtxImm(envTransform, GX_TEXMTX2 + (s + 1) * 3, GX_TG_MTX3x4);
+            }
         }
         GX_CallDispList(list, batch.mFullSize);
     }
 }
 
-// Whether a material's texgens read the normals as the vertices bring them (a sphere map, the sharp specular's lobes:
-// BindMaterial): a rigid vertex left in its bind pose would be mapped by its bind-pose normal. Asked as BindMaterial
-// would, or more (a slot it would skip): then the CPU skins every vertex.
-static bool MaterialTexgenReadsNormals(MaterialLite* material)
+// A material's texgens that read the normals as the vertices bring them (BindMaterial): a rigid vertex left in its
+// bind pose would be mapped by its bind-pose normal. Asked as BindMaterial would, or more (a slot it would skip). Its
+// sphere-mapped slots: one takes the sphere map's batches (each vertex its own matrix), more the CPU skinning every
+// vertex -- as the sharp specular's lobes (their matrices, TEXMTX5/6, the lights' and not a bone's).
+static uint32_t MaterialEnvSlots(MaterialLite* material)
 {
+    uint32_t slots = 0;
     for (uint32_t i = 0; i < 4; ++i)
     {
         if (material->GetUvMap(i) == UV_MAP_ENVIRONMENT)
-            return true;
+            slots++;
     }
+    return slots;
+}
+
+static bool MaterialSpecLobes(MaterialLite* material)
+{
     return material->GetSpecular() > 0.0f && material->IsSharpSpecular() &&
            material->GetShadingModel() != ShadingModel::Unlit;
 }
@@ -1634,7 +1712,10 @@ bool GxSkinRigidPlan(SkeletalMesh3D* component, const uint16_t*& blended, uint32
     MaterialLite* material = Material::AsLite(component->GetMaterial());
     if (material == nullptr)
         material = Renderer::Get()->GetDefaultMaterial();
-    if (material == nullptr || MaterialTexgenReadsNormals(material))
+    if (material == nullptr || MaterialSpecLobes(material))
+        return false;
+    const uint32_t envSlots = MaterialEnvSlots(material);
+    if (envSlots > 1 || (envSlots == 1 && it->second.mRigidEnv.empty()))
         return false;
 
     const GxSkinLists& lists = it->second;
@@ -1669,8 +1750,8 @@ void GFX_CreateSkeletalMeshResource(SkeletalMesh* skeletalMesh, uint32_t numVert
         GxSkinLists& lists = sSkinLists[skeletalMesh];
         GxStripSet strips;
         StripSkinFaces(skeletalMesh->GetIndices(), skeletalMesh->GetNumFaces(), strips);
-        lists.mFull = WriteSkinList(strips, 4, nullptr, skeletalMesh->GetName().c_str(), lists.mFullSize);
-        lists.mPos = WriteSkinList(strips, 1, nullptr, skeletalMesh->GetName().c_str(), lists.mPosSize);
+        lists.mFull = WriteSkinList(strips, 4, nullptr, false, skeletalMesh->GetName().c_str(), lists.mFullSize);
+        lists.mPos = WriteSkinList(strips, 1, nullptr, false, skeletalMesh->GetName().c_str(), lists.mPosSize);
         lists.mFullTried = true;
         lists.mPosTried = true;
         if (OCT_GX_RIGID_SKIN)
@@ -1936,7 +2017,25 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
         {
             if (rigid != nullptr)
             {
-                DrawRigidBatches(*rigid, skeletalMeshComp, modelView, readsNormals ? &normalMtx : nullptr);
+                // Under a sphere map (one texcoord at most: GxSkinRigidPlan) its batches: each vertex's texture
+                // matrix for that texcoord in the lists (GX_VA_TEXnMTXIDX), out of the format again after. (A sphere
+                // map bound: readsNormals, the normal matrix made.)
+                const uint32_t envCoords = GxBoundEnvTexCoords();
+                if (envCoords != 0 && (envCoords & (envCoords - 1)) == 0 && !rigid->mRigidEnv.empty())
+                {
+                    uint32_t n = 0;
+                    while ((envCoords & (1u << n)) == 0)
+                        ++n;
+                    Mtx env;
+                    GxEnvTexMtx(normalMtx, env);
+                    GX_SetVtxDesc(GX_VA_TEX0MTXIDX + n, GX_DIRECT);
+                    DrawRigidBatches(rigid->mRigidEnv, skeletalMeshComp, modelView, &normalMtx, &env);
+                    GX_SetVtxDesc(GX_VA_TEX0MTXIDX + n, GX_NONE);
+                }
+                else
+                {
+                    DrawRigidBatches(rigid->mRigid, skeletalMeshComp, modelView, readsNormals ? &normalMtx : nullptr);
+                }
                 return;
             }
             uint32_t listSize = 0;
@@ -2108,14 +2207,27 @@ void GFX_DrawShadowMeshComp(ShadowMesh3D* shadowMeshComp)
 // again with its texture coordinates generated from its position through the same camera, multiplying what is
 // already there (white leaves it, grey darkens it), only where it is the nearest surface (equal depth). The camera
 // is fitted to the casters each frame, so the texture is spent on them alone and stays crisp at a small size.
+// For every caster wherever it is, as the Vulkan renderer's (e106e097): the casters in groups -- each into the first
+// group whose box its own box fits in (a character and what it wears or carries; a small one beside a big one), else
+// a group of its own -- up to six, each its own silhouette (drawn in the same corner in turn, copied out before the
+// next) in its own texture and its own camera over its first caster. Each receiver under a group's box is drawn once
+// for it; where two groups meet, both darken it (each pass multiplies what the last left). One box for all, over the
+// first caster, lost any caster away from it, or laid its silhouette on the first's ground. One group: the draws as
+// before, a character alone unchanged.
 static const uint32_t kProjShadowRes = 128;
-static void* sProjShadowTex = nullptr;
-static GXTexObj sProjShadowTexObj;
-static Mtx sProjShadowView;
-static float sProjShadowHalf = 1.0f;
-static glm::vec3 sProjShadowCenter = { 0.0f, 0.0f, 0.0f };
-static float sProjShadowTop = 0.0f;
-static bool sProjShadowValid = false;
+static const uint32_t kMaxProjShadows = 6;
+struct GxProjShadow
+{
+    void* mTex = nullptr;                       // (kProjShadowRes square, I8: made the first time a frame needs this
+    GXTexObj mTexObj;                           //  many groups, then kept -- 16 KB each, 96 KB for all six)
+    Mtx mView;
+    float mHalf = 1.0f;
+    glm::vec3 mCenter = { 0.0f, 0.0f, 0.0f };
+    float mTop = 0.0f;
+    std::vector<SkeletalMesh3D*> mCasters;      // (cleared each frame, its room kept: no allocation once grown)
+};
+static GxProjShadow sProjShadows[kMaxProjShadows];
+static uint32_t sNumProjShadows = 0;            // (the groups drawn this frame, each with its texture filled)
 // The shadow only on what's no higher than the caster's feet and this, and not on what faces down -- as the Vulkan
 // receiver (ProjShadowReceiver.frag): laid straight down, it landed on anything in the column, a block over a
 // character's head and the underside of what he stands on. GX has no shader: each test is a texture coordinate
@@ -2199,7 +2311,7 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
     {
         if (rigid != nullptr)
         {
-            DrawRigidBatches(*rigid, skeletalMeshComp, modelView, nullptr);
+            DrawRigidBatches(rigid->mRigid, skeletalMeshComp, modelView, nullptr);   // (the plain set: no texgens)
             return;
         }
         uint32_t listSize = 0;
@@ -2247,20 +2359,13 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
 
 void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
 {
-    sProjShadowValid = false;
+    sNumProjShadows = 0;
+    for (GxProjShadow& ps : sProjShadows)
+        ps.mCasters.clear();
     Camera3D* camera = gGxContext.mWorld ? gGxContext.mWorld->GetActiveCamera() : nullptr;
     if (casters.empty() || camera == nullptr)
         return;
 
-    if (sProjShadowTex == nullptr)
-    {
-        uint32_t size = GX_GetTexBufferSize(kProjShadowRes, kProjShadowRes, GX_TF_I8, GX_FALSE, 0);
-        sProjShadowTex = memalign(32, size);
-        if (sProjShadowTex == nullptr)
-            return;
-        GX_InitTexObj(&sProjShadowTexObj, sProjShadowTex, kProjShadowRes, kProjShadowRes, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
-        GX_InitTexObjLOD(&sProjShadowTexObj, GX_LINEAR, GX_LINEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
-    }
     if (sProjShadowStep == nullptr)
     {
         // 8 x 4 I8 (one tile, rows of 8): black left of s = 0.5, white from it
@@ -2275,23 +2380,64 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
         GX_InitTexObjLOD(&sProjShadowStepObj, GX_NEAR, GX_NEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
     }
 
-    // The camera: over the first caster (the others -- what it wears, what it holds -- ride with it), looking
-    // straight down, its view half the size of the caster's bounds each way (the bounds hold it in every pose).
-    SkeletalMesh3D* lead = casters[0];
-    Bounds b = lead->GetBounds();
-    float radius = (lead->GetBoundsRadiusOverride() > 0.0f) ? lead->GetBoundsRadiusOverride() : b.mRadius;
-    sProjShadowHalf = glm::max(0.25f, radius * 0.5f);
-    sProjShadowCenter = lead->GetWorldPosition();
-    sProjShadowTop = sProjShadowCenter.y + radius;
+    // The groups (the Vulkan renderer's rule and order): each caster into the first group whose box its own box fits
+    // in (a small one walked up to a big one joins it; never the other way, cut off by the small one's box), else a
+    // group of its own -- its camera over it (the others in it ride with it), looking straight down, its view half the
+    // size of the caster's bounds each way (the bounds hold it in every pose). Past six, a caster in none: no shadow.
+    uint32_t numGroups = 0;
+    for (SkeletalMesh3D* caster : casters)
+    {
+        glm::vec3 p = caster->GetWorldPosition();
+        Bounds b = caster->GetBounds();
+        float radius = (caster->GetBoundsRadiusOverride() > 0.0f) ? caster->GetBoundsRadiusOverride() : b.mRadius;
+        float half = glm::max(0.25f, radius * 0.5f);
+        GxProjShadow* group = nullptr;
+        for (uint32_t g = 0; g < numGroups; ++g)
+        {
+            GxProjShadow& ps = sProjShadows[g];
+            float room = ps.mHalf + 0.01f - half;
+            if (room >= 0.0f && fabsf(p.x - ps.mCenter.x) <= room && fabsf(p.z - ps.mCenter.z) <= room)
+            {
+                group = &ps;
+                break;
+            }
+        }
 
-    guVector eye = { sProjShadowCenter.x, sProjShadowCenter.y + 20.0f, sProjShadowCenter.z };
-    guVector up = { 0.0f, 0.0f, -1.0f };
-    guVector look = { sProjShadowCenter.x, sProjShadowCenter.y, sProjShadowCenter.z };
-    guLookAt(sProjShadowView, &eye, &up, &look);
+        if (group == nullptr)
+        {
+            if (numGroups == kMaxProjShadows)
+                continue;
 
-    // The corner of the EFB, white first (no shadow), its border kept white (clamped, nothing smears off its edge).
+            GxProjShadow& ps = sProjShadows[numGroups];
+            if (ps.mTex == nullptr)
+            {
+                // (kept once made: the GPU samples it every frame after; never freed, so nothing for GxDeferFree)
+                uint32_t size = GX_GetTexBufferSize(kProjShadowRes, kProjShadowRes, GX_TF_I8, GX_FALSE, 0);
+                ps.mTex = memalign(32, size);
+                if (ps.mTex == nullptr)
+                    continue;                       // (no room: this caster without a shadow, the slot tried again)
+                GX_InitTexObj(&ps.mTexObj, ps.mTex, kProjShadowRes, kProjShadowRes, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+                GX_InitTexObjLOD(&ps.mTexObj, GX_LINEAR, GX_LINEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
+            }
+            group = &ps;
+            numGroups++;
+            group->mHalf = half;
+            group->mCenter = p;
+            group->mTop = p.y + radius;
+
+            guVector eye = { p.x, p.y + 20.0f, p.z };
+            guVector up = { 0.0f, 0.0f, -1.0f };
+            guVector look = { p.x, p.y, p.z };
+            guLookAt(group->mView, &eye, &up, &look);
+        }
+
+        group->mCasters.push_back(caster);
+    }
+    if (numGroups == 0)
+        return;
+
+    // The corner of the EFB (the frame's first draws: the last frame's display copy cleared it all).
     GX_SetViewport(0, 0, kProjShadowRes, kProjShadowRes, 0, 1);
-    GX_SetScissor(0, 0, kProjShadowRes, kProjShadowRes);
 
     GxResetIndirect();
     GX_SetNumTexGens(0);
@@ -2310,46 +2456,61 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
     GX_SetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, { 0, 0, 0, 0 });
     gGxContext.mApplyFog = false;
 
-    Mtx44 proj;
-    guOrtho(proj, 1.0f, -1.0f, -1.0f, 1.0f, 0.0f, 2.0f);
-    GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
-    Mtx ident;
-    guMtxIdentity(ident);
-    GX_LoadPosMtxImm(ident, GX_PNMTX0);
-    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-    GX_SetChanMatColor(GX_COLOR0A0, { 255, 255, 255, 255 });
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-    GX_Position3f32(-1.0f, -1.0f, -1.0f);
-    GX_Position3f32(1.0f, -1.0f, -1.0f);
-    GX_Position3f32(1.0f, 1.0f, -1.0f);
-    GX_Position3f32(-1.0f, 1.0f, -1.0f);
-    GX_End();
-
     // The casters in one grey: as dark as the world's shadow colour says (its colour, by its alpha).
     glm::vec4 sc = gGxContext.mWorld->GetShadowColor();
     glm::vec3 g = glm::mix(glm::vec3(1.0f), glm::vec3(sc), glm::clamp(sc.a, 0.0f, 1.0f));
-    GX_SetChanMatColor(GX_COLOR0A0, { uint8_t(g.r * 255.0f), uint8_t(g.g * 255.0f), uint8_t(g.b * 255.0f), 255 });
-    GX_SetScissor(2, 2, kProjShadowRes - 4, kProjShadowRes - 4);
-    guOrtho(proj, sProjShadowHalf, -sProjShadowHalf, -sProjShadowHalf, sProjShadowHalf, 0.1f, 200.0f);
-    GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
-    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
-    for (SkeletalMesh3D* caster : casters)
-    {
-        ProjShadowDrawCaster(caster, sProjShadowView);
-    }
+    const GXColor grey = { uint8_t(g.r * 255.0f), uint8_t(g.g * 255.0f), uint8_t(g.b * 255.0f), 255 };
 
-    // Into the texture, the corner cleared again for the frame (the copy's clear: the frame's own clear colour and
-    // depth). No copy filter on it (the display copy's vertical filter would soften it).
+    // No copy filter on the copies (the display copy's vertical filter would soften them).
     GXRModeObj* rmode = &GetEngineState()->mSystem.mGxRmode;
     GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
-    GX_SetTexCopySrc(0, 0, kProjShadowRes, kProjShadowRes);
-    // R8: the red channel copied as it is. An I8 copy goes through the video luma conversion (white comes out
-    // 235, black 16), and every receiver under the box was darkened by 235/255 where there was no shadow.
-    GX_SetTexCopyDst(kProjShadowRes, kProjShadowRes, GX_CTF_R8, GX_FALSE);
-    GX_CopyTex(sProjShadowTex, GX_TRUE);
+
+    Mtx44 proj;
+    Mtx ident;
+    guMtxIdentity(ident);
+    for (uint32_t gi = 0; gi < numGroups; ++gi)
+    {
+        GxProjShadow& ps = sProjShadows[gi];
+
+        // The corner white first (no shadow) -- over what the last group's copy cleared it to -- its border kept
+        // white (clamped, nothing smears off its edge). The casters' draws before set their own vertex format and
+        // matrices: the quad's set again each time.
+        GX_SetScissor(0, 0, kProjShadowRes, kProjShadowRes);
+        guOrtho(proj, 1.0f, -1.0f, -1.0f, 1.0f, 0.0f, 2.0f);
+        GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
+        GX_LoadPosMtxImm(ident, GX_PNMTX0);
+        GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+        GX_ClearVtxDesc();
+        GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+        GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+        GX_SetChanMatColor(GX_COLOR0A0, { 255, 255, 255, 255 });
+        GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position3f32(-1.0f, -1.0f, -1.0f);
+        GX_Position3f32(1.0f, -1.0f, -1.0f);
+        GX_Position3f32(1.0f, 1.0f, -1.0f);
+        GX_Position3f32(-1.0f, 1.0f, -1.0f);
+        GX_End();
+
+        // its casters, from its own camera
+        GX_SetChanMatColor(GX_COLOR0A0, grey);
+        GX_SetScissor(2, 2, kProjShadowRes - 4, kProjShadowRes - 4);
+        guOrtho(proj, ps.mHalf, -ps.mHalf, -ps.mHalf, ps.mHalf, 0.1f, 200.0f);
+        GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
+        GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+        for (SkeletalMesh3D* caster : ps.mCasters)
+        {
+            ProjShadowDrawCaster(caster, ps.mView);
+        }
+
+        // Into its texture, the corner cleared again (the copy's clear: the frame's own clear colour and depth) --
+        // for the next group, or for the frame after the last. The GPU runs the copy before the next group's quad.
+        GX_SetTexCopySrc(0, 0, kProjShadowRes, kProjShadowRes);
+        // R8: the red channel copied as it is. An I8 copy goes through the video luma conversion (white comes out
+        // 235, black 16), and every receiver under the box was darkened by 235/255 where there was no shadow.
+        GX_SetTexCopyDst(kProjShadowRes, kProjShadowRes, GX_CTF_R8, GX_FALSE);
+        GX_CopyTex(ps.mTex, GX_TRUE);
+    }
+    // (once, after all the copies: every texture written before the receivers sample one; the cache keyed by address)
     GX_PixModeSync();
     GX_InvalidateTexAll();
     GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE, rmode->vfilter);
@@ -2363,7 +2524,7 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
     GX_LoadProjectionMtx(projection, camera->GetProjectionMode() == ProjectionMode::ORTHOGRAPHIC ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
     GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 
-    sProjShadowValid = true;
+    sNumProjShadows = numGroups;
 }
 
 // The screen rectangle the projected shadow can fall in, the receivers' pass scissored to it: the shadow texture
@@ -2372,7 +2533,7 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
 // column's eight corners projected by the camera (as the GPU does: its view, then the projection as GX has it, rows),
 // rounded out and kept within the scene's scissor. -1: nothing of it on screen; 0: not scissored (a corner behind
 // the camera, or no viewport known); 1: scissored. Before, the receivers' whole visible area was drawn again.
-static int ProjShadowScissor(Camera3D* camera, float yLo, float yHi)
+static int ProjShadowScissor(Camera3D* camera, const GxProjShadow& ps, float yLo, float yHi)
 {
     if (!sCurViewKnown)
         return 0;
@@ -2380,12 +2541,12 @@ static int ProjShadowScissor(Camera3D* camera, float yLo, float yHi)
     const glm::mat4 projG = camera->GetProjectionMatrix();
     float p[4][4];
     memcpy(p, &projG, sizeof(p));               // (GFX_BeginFrame loads these bytes as GX's Mtx44: rows)
-    const float h = sProjShadowHalf;
+    const float h = ps.mHalf;
     float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
     for (uint32_t i = 0; i < 8; ++i)
     {
-        const glm::vec4 w(sProjShadowCenter.x + ((i & 1) ? h : -h), (i & 2) ? yHi : yLo,
-                          sProjShadowCenter.z + ((i & 4) ? h : -h), 1.0f);
+        const glm::vec4 w(ps.mCenter.x + ((i & 1) ? h : -h), (i & 2) ? yHi : yLo,
+                          ps.mCenter.z + ((i & 4) ? h : -h), 1.0f);
         const glm::vec4 v = view * w;
         const float cx = p[0][0] * v.x + p[0][1] * v.y + p[0][2] * v.z + p[0][3];
         const float cy = p[1][0] * v.x + p[1][1] * v.y + p[1][2] * v.z + p[1][3];
@@ -2411,24 +2572,17 @@ static int ProjShadowScissor(Camera3D* camera, float yLo, float yHi)
 void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receivers)
 {
     Camera3D* camera = gGxContext.mWorld ? gGxContext.mWorld->GetActiveCamera() : nullptr;
-    if (!sProjShadowValid || camera == nullptr)
+    if (sNumProjShadows == 0 || camera == nullptr)
         return;
-
-    // texture coordinates from the shadow camera's view: s across, t down the texture
-    Mtx texFromView = { { 0.5f / sProjShadowHalf, 0.0f, 0.0f, 0.5f },
-                        { 0.0f, -0.5f / sProjShadowHalf, 0.0f, 0.5f },
-                        { 0.0f, 0.0f, 0.0f, 1.0f } };
-    Mtx texFromWorld;
-    c_guMtxConcat(texFromView, sProjShadowView, texFromWorld);
 
     Mtx view;
     ProjShadowLoadMtx(camera->GetViewMatrix(), view);
 
+    // the state every group's pass shares (each group then its own texture, matrices and scissor)
     GxResetIndirect();
     GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_POS, GX_TEXMTX9);
     GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_POS, GX_TEXMTX8);   // (its height: above the cut, white)
     GX_SetTexCoordGen(GX_TEXCOORD2, GX_TG_MTX2x4, GX_TG_NRM, GX_TEXMTX7);   // (its normal: facing down, white)
-    GX_LoadTexObj(&sProjShadowTexObj, GX_TEXMAP0);
     GX_LoadTexObj(&sProjShadowStepObj, GX_TEXMAP1);
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
     GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
@@ -2441,7 +2595,6 @@ void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receiver
         GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
         GX_SetTevAlphaOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
     }
-    const float cut = sProjShadowCenter.y + kProjShadowAboveFeet;   // (the caster's feet: its origin)
     gGxContext.mLighting.mEnabled = false;
     gGxContext.mLighting.mColorChannel = false;
     gGxContext.mLighting.mMaterialSrc = GX_SRC_REG;
@@ -2457,87 +2610,112 @@ void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receiver
     GX_SetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, { 0, 0, 0, 0 });
     gGxContext.mApplyFog = false;
 
-    const float reach = sProjShadowHalf * 1.42f;               // (the box's corner)
-
-    // the column the shadow can fall in, down to the lowest receiver it reaches: the pass scissored to it
-    float yLow = cut;
-    bool anyReceiver = false;
-    for (StaticMesh3D* comp : receivers)
+    bool scissored = false;                     // (the scene's scissor narrowed by a group's pass)
+    for (uint32_t gi = 0; gi < sNumProjShadows; ++gi)
     {
-        if (comp->GetStaticMesh() == nullptr)
-            continue;
-        Bounds b = comp->GetBounds();
-        float dx = b.mCenter.x - sProjShadowCenter.x, dz = b.mCenter.z - sProjShadowCenter.z;
-        float r = b.mRadius + reach;
-        if (dx * dx + dz * dz > r * r || b.mCenter.y - b.mRadius > sProjShadowTop)
-            continue;
-        yLow = glm::min(yLow, b.mCenter.y - b.mRadius);
-        anyReceiver = true;
-    }
-    const int scissor = anyReceiver ? ProjShadowScissor(camera, yLow - 0.05f, cut + 0.05f) : -1;
+        GxProjShadow& ps = sProjShadows[gi];   // (GX_LoadTexObj takes it unconst)
 
-    for (StaticMesh3D* comp : receivers)
-    {
-        if (scissor < 0)
-            break;                                  // (none, or none of it on screen)
-        StaticMesh* mesh = comp->GetStaticMesh();
-        if (mesh == nullptr)
-            continue;
-        StaticMeshResource* res = mesh->GetResource();
-
-        // only what lies under the box, and not above the caster's top
-        Bounds b = comp->GetBounds();
-        float dx = b.mCenter.x - sProjShadowCenter.x, dz = b.mCenter.z - sProjShadowCenter.z;
-        float r = b.mRadius + reach;
-        if (dx * dx + dz * dz > r * r || b.mCenter.y - b.mRadius > sProjShadowTop)
-            continue;
-
-        bool hasInstanceColors = comp->HasInstanceColors();
-        bool hasColor = mesh->HasVertexColor() || hasInstanceColors;
-        BindStaticMesh(mesh, hasInstanceColors ? comp->GetInstanceColors().data() : nullptr);
-
-        Mtx model, modelView, texMtx;
-        ProjShadowLoadMtx(comp->GetRenderTransform(), model);
-        c_guMtxConcat(view, model, modelView);
-        GX_LoadPosMtxImm(modelView, GX_PNMTX0);
-        c_guMtxConcat(texFromWorld, model, texMtx);
-        GX_LoadTexMtxImm(texMtx, GX_TEXMTX9, GX_TG_MTX2x4);
-
-        // its world height less the cut, a metre to a texture's width, from the step's middle
-        Mtx heightMtx = { { model[1][0], model[1][1], model[1][2], model[1][3] - cut + 0.5f },
-                          { 0.0f, 0.0f, 0.0f, 0.5f },
-                          { 0.0f, 0.0f, 0.0f, 1.0f } };
-        GX_LoadTexMtxImm(heightMtx, GX_TEXMTX8, GX_TG_MTX2x4);
-        // a compact mesh has no normals: the height test alone
-        const bool normals = !res->mCompact;
-        if (normals)
-        {
-            // its world normal's y, made negative (down: past the middle, white); a wall's 0 a hair short of it
-            glm::mat3 nm = glm::transpose(glm::inverse(glm::mat3(comp->GetRenderTransform())));
-            glm::vec3 ny = glm::vec3(nm[0][1], nm[1][1], nm[2][1]);
-            const float len = glm::length(ny);
-            ny = (len > 1e-6f) ? ny / len : glm::vec3(0.0f, 1.0f, 0.0f);
-            Mtx downMtx = { { -ny.x, -ny.y, -ny.z, 0.49f },
-                            { 0.0f, 0.0f, 0.0f, 0.5f },
+        // texture coordinates from the group's camera's view: s across, t down the texture
+        Mtx texFromView = { { 0.5f / ps.mHalf, 0.0f, 0.0f, 0.5f },
+                            { 0.0f, -0.5f / ps.mHalf, 0.0f, 0.5f },
                             { 0.0f, 0.0f, 0.0f, 1.0f } };
-            GX_LoadTexMtxImm(downMtx, GX_TEXMTX7, GX_TG_MTX2x4);
-        }
-        GX_SetNumTexGens(normals ? 3 : 2);
-        GX_SetNumTevStages(normals ? 3 : 2);
+        Mtx texFromWorld;
+        c_guMtxConcat(texFromView, ps.mView, texFromWorld);
 
-        if (hasColor)
+        const float cut = ps.mCenter.y + kProjShadowAboveFeet;    // (the group's first caster's feet: its origin)
+        const float reach = ps.mHalf * 1.42f;                     // (the box's corner)
+
+        // the column the shadow can fall in, down to the lowest receiver it reaches: the pass scissored to it. A
+        // group with none under its box, or none of it on screen, draws nothing.
+        float yLow = cut;
+        bool anyReceiver = false;
+        for (StaticMesh3D* comp : receivers)
         {
-            if (res->mColorDisplayList == nullptr)
-                res->mColorDisplayList = CreateMeshDisplayList(mesh, true, res->mColorDisplayListSize);
-            CallMeshDisplayList(res->mColorDisplayList, res->mColorDisplayListSize);
+            if (comp->GetStaticMesh() == nullptr)
+                continue;
+            Bounds b = comp->GetBounds();
+            float dx = b.mCenter.x - ps.mCenter.x, dz = b.mCenter.z - ps.mCenter.z;
+            float r = b.mRadius + reach;
+            if (dx * dx + dz * dz > r * r || b.mCenter.y - b.mRadius > ps.mTop)
+                continue;
+            yLow = glm::min(yLow, b.mCenter.y - b.mRadius);
+            anyReceiver = true;
         }
-        else
+        if (!anyReceiver)
+            continue;
+        const int scissor = ProjShadowScissor(camera, ps, yLow - 0.05f, cut + 0.05f);
+        if (scissor < 0)
+            continue;
+        if (scissor == 0 && scissored)          // (not scissored: the scene's, not the last group's)
         {
-            CallMeshDisplayList(res->mDisplayList, res->mDisplayListSize);
+            GX_SetScissor(sCurScissor[0], sCurScissor[1], sCurScissor[2], sCurScissor[3]);
+            scissored = false;
+        }
+        scissored = scissored || scissor > 0;
+
+        GX_LoadTexObj(&ps.mTexObj, GX_TEXMAP0);
+
+        for (StaticMesh3D* comp : receivers)
+        {
+            StaticMesh* mesh = comp->GetStaticMesh();
+            if (mesh == nullptr)
+                continue;
+            StaticMeshResource* res = mesh->GetResource();
+
+            // only what lies under the box, and not above the casters' top
+            Bounds b = comp->GetBounds();
+            float dx = b.mCenter.x - ps.mCenter.x, dz = b.mCenter.z - ps.mCenter.z;
+            float r = b.mRadius + reach;
+            if (dx * dx + dz * dz > r * r || b.mCenter.y - b.mRadius > ps.mTop)
+                continue;
+
+            bool hasInstanceColors = comp->HasInstanceColors();
+            bool hasColor = mesh->HasVertexColor() || hasInstanceColors;
+            BindStaticMesh(mesh, hasInstanceColors ? comp->GetInstanceColors().data() : nullptr);
+
+            Mtx model, modelView, texMtx;
+            ProjShadowLoadMtx(comp->GetRenderTransform(), model);
+            c_guMtxConcat(view, model, modelView);
+            GX_LoadPosMtxImm(modelView, GX_PNMTX0);
+            c_guMtxConcat(texFromWorld, model, texMtx);
+            GX_LoadTexMtxImm(texMtx, GX_TEXMTX9, GX_TG_MTX2x4);
+
+            // its world height less the cut, a metre to a texture's width, from the step's middle
+            Mtx heightMtx = { { model[1][0], model[1][1], model[1][2], model[1][3] - cut + 0.5f },
+                              { 0.0f, 0.0f, 0.0f, 0.5f },
+                              { 0.0f, 0.0f, 0.0f, 1.0f } };
+            GX_LoadTexMtxImm(heightMtx, GX_TEXMTX8, GX_TG_MTX2x4);
+            // a compact mesh has no normals: the height test alone
+            const bool normals = !res->mCompact;
+            if (normals)
+            {
+                // its world normal's y, made negative (down: past the middle, white); a wall's 0 a hair short of it
+                glm::mat3 nm = glm::transpose(glm::inverse(glm::mat3(comp->GetRenderTransform())));
+                glm::vec3 ny = glm::vec3(nm[0][1], nm[1][1], nm[2][1]);
+                const float len = glm::length(ny);
+                ny = (len > 1e-6f) ? ny / len : glm::vec3(0.0f, 1.0f, 0.0f);
+                Mtx downMtx = { { -ny.x, -ny.y, -ny.z, 0.49f },
+                                { 0.0f, 0.0f, 0.0f, 0.5f },
+                                { 0.0f, 0.0f, 0.0f, 1.0f } };
+                GX_LoadTexMtxImm(downMtx, GX_TEXMTX7, GX_TG_MTX2x4);
+            }
+            GX_SetNumTexGens(normals ? 3 : 2);
+            GX_SetNumTevStages(normals ? 3 : 2);
+
+            if (hasColor)
+            {
+                if (res->mColorDisplayList == nullptr)
+                    res->mColorDisplayList = CreateMeshDisplayList(mesh, true, res->mColorDisplayListSize);
+                CallMeshDisplayList(res->mColorDisplayList, res->mColorDisplayListSize);
+            }
+            else
+            {
+                CallMeshDisplayList(res->mDisplayList, res->mDisplayListSize);
+            }
         }
     }
 
-    if (scissor > 0)                            // (the scene's scissor back)
+    if (scissored)                              // (the scene's scissor back)
         GX_SetScissor(sCurScissor[0], sCurScissor[1], sCurScissor[2], sCurScissor[3]);
 
     // The draws after this bind their materials again (blend, depth, texgens, TEV); fog comes back with the first

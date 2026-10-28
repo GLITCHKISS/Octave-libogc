@@ -333,6 +333,41 @@ static void LoadSpecTexMtx(const Mtx normalMtx, float k, const glm::vec3& h, uin
     GX_LoadTexMtxImm(m, texMtx, GX_TG_MTX3x4);
 }
 
+// The texgen reads the raw (object space) normal, so the matrix takes it to view space first.
+// The normal matrix is the inverse transpose of the model-view: an object scaled by s gives
+// rows 1/s long. Its determinant is then 1/s^3, so scale back by the cube root to keep the
+// coordinates on the matcap. (Non-uniform scale cannot be undone per object; GX has no
+// per-vertex normalize without dual texgen, so such an object's mapping is a little off.)
+static float NormalMtxScale(const Mtx normalMtx)
+{
+    const float det =
+        normalMtx[0][0] * (normalMtx[1][1] * normalMtx[2][2] - normalMtx[1][2] * normalMtx[2][1]) -
+        normalMtx[0][1] * (normalMtx[1][0] * normalMtx[2][2] - normalMtx[1][2] * normalMtx[2][0]) +
+        normalMtx[0][2] * (normalMtx[1][0] * normalMtx[2][1] - normalMtx[1][1] * normalMtx[2][0]);
+    const float absDet = fabsf(det);
+    return (absDet > 1e-12f) ? 1.0f / cbrtf(absDet) : 1.0f;
+}
+
+// u = n_view.x * 0.5 + 0.5, v = -n_view.y * 0.5 + 0.5 (see UV_MAP_ENVIRONMENT); q = 1, as a
+// 3x4 texgen divides by its third row.
+static void MakeEnvTexMtx(const Mtx normalMtx, float k, Mtx env)
+{
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        env[0][c] = 0.5f * k * normalMtx[0][c];
+        env[1][c] = -0.5f * k * normalMtx[1][c];
+        env[2][c] = 0.0f;
+    }
+    env[0][3] = 0.5f;
+    env[1][3] = 0.5f;
+    env[2][3] = 1.0f;
+}
+
+void GxEnvTexMtx(const Mtx normalMtx, Mtx env)
+{
+    MakeEnvTexMtx(normalMtx, NormalMtxScale(normalMtx), env);
+}
+
 void LoadEnvTexMtx(const Mtx normalMtx)
 {
     if (!gGxContext.mEnvMapBound && !gGxContext.mSpecTexBound)
@@ -340,17 +375,7 @@ void LoadEnvTexMtx(const Mtx normalMtx)
         return;
     }
 
-    // The texgen reads the raw (object space) normal, so the matrix takes it to view space first.
-    // The normal matrix is the inverse transpose of the model-view: an object scaled by s gives
-    // rows 1/s long. Its determinant is then 1/s^3, so scale back by the cube root to keep the
-    // coordinates on the matcap. (Non-uniform scale cannot be undone per object; GX has no
-    // per-vertex normalize without dual texgen, so such an object's mapping is a little off.)
-    const float det =
-        normalMtx[0][0] * (normalMtx[1][1] * normalMtx[2][2] - normalMtx[1][2] * normalMtx[2][1]) -
-        normalMtx[0][1] * (normalMtx[1][0] * normalMtx[2][2] - normalMtx[1][2] * normalMtx[2][0]) +
-        normalMtx[0][2] * (normalMtx[1][0] * normalMtx[2][1] - normalMtx[1][1] * normalMtx[2][0]);
-    const float absDet = fabsf(det);
-    const float k = (absDet > 1e-12f) ? 1.0f / cbrtf(absDet) : 1.0f;
+    const float k = NormalMtxScale(normalMtx);
 
     if (gGxContext.mSpecTexBound)
     {
@@ -362,20 +387,18 @@ void LoadEnvTexMtx(const Mtx normalMtx)
         return;
     }
 
-    // u = n_view.x * 0.5 + 0.5, v = -n_view.y * 0.5 + 0.5 (see UV_MAP_ENVIRONMENT); q = 1, as a
-    // 3x4 texgen divides by its third row.
     Mtx env;
-    for (uint32_t c = 0; c < 3; ++c)
-    {
-        env[0][c] = 0.5f * k * normalMtx[0][c];
-        env[1][c] = -0.5f * k * normalMtx[1][c];
-        env[2][c] = 0.0f;
-    }
-    env[0][3] = 0.5f;
-    env[1][3] = 0.5f;
-    env[2][3] = 1.0f;
-
+    MakeEnvTexMtx(normalMtx, k, env);
     GX_LoadTexMtxImm(env, GX_TEXMTX2, GX_TG_MTX3x4);
+}
+
+// The texture coordinates BindMaterial last set to the sphere map (bit n: GX_TEXCOORD0 + n), for a draw that gives
+// each vertex its own sphere-map matrix (GxBoundEnvTexCoords)
+static uint32_t sEnvTexCoords = 0;
+
+uint32_t GxBoundEnvTexCoords()
+{
+    return sEnvTexCoords;
 }
 
 // The texgen for a texture slot's coordinates, by its UV map.
@@ -387,6 +410,7 @@ static void SetupSlotTexGen(uint32_t texIdx, uint32_t uvMap, bool hasNormals)
         // loads per object (LoadEnvTexMtx) once its normal matrix is known.
         GX_SetTexCoordGen(GX_TEXCOORD0 + texIdx, GX_TG_MTX3x4, GX_TG_NRM, GX_TEXMTX2);
         gGxContext.mEnvMapBound = true;
+        sEnvTexCoords |= (1u << texIdx);
     }
     else if (uvMap == UV_MAP_ENVIRONMENT)
     {
@@ -507,6 +531,7 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
 
     uint32_t texIdx = 0;
     gGxContext.mEnvMapBound = false;
+    sEnvTexCoords = 0;
     for (uint32_t i = 0; i < 4; ++i)
     {
         Texture* texture = material->GetTexture(i);

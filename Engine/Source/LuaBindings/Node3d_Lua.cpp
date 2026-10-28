@@ -204,6 +204,19 @@ int Node3D_Lua::SetScaleXYZ(lua_State* L)
     return 0;
 }
 
+// node:SetPositionRotationScale(px, py, pz, qx, qy, qz, qw, sx, sy, sz): SetPosition, SetRotationQuat and SetScale
+// in one call, from numbers -- for effects placing dozens of nodes a frame (each call into Lua's C side costs on the
+// console, and three a node, with their Vectors filled first, added up)
+int Node3D_Lua::SetPositionRotationScale(lua_State* L)
+{
+    Node3D* comp = CHECK_NODE_3D(L, 1);
+    comp->SetPosition(glm::vec3(float(luaL_checknumber(L, 2)), float(luaL_checknumber(L, 3)), float(luaL_checknumber(L, 4))));
+    const glm::vec4 q(float(luaL_checknumber(L, 5)), float(luaL_checknumber(L, 6)), float(luaL_checknumber(L, 7)), float(luaL_checknumber(L, 8)));
+    comp->SetRotation(LuaVectorToQuat(q));
+    comp->SetScale(glm::vec3(float(luaL_checknumber(L, 9)), float(luaL_checknumber(L, 10)), float(luaL_checknumber(L, 11))));
+    return 0;
+}
+
 int Node3D_Lua::SetWorldRotationEuler(lua_State* L)
 {
     Node3D* comp = CHECK_NODE_3D(L, 1);
@@ -392,6 +405,7 @@ void Node3D_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, SetWorldPosition);
     REGISTER_TABLE_FUNC(L, mtIndex, SetWorldPositionXYZ);
     REGISTER_TABLE_FUNC(L, mtIndex, SetScaleXYZ);
+    REGISTER_TABLE_FUNC(L, mtIndex, SetPositionRotationScale);
     REGISTER_TABLE_FUNC_EX(L, mtIndex, SetWorldPosition, "SetAbsolutePosition");
 
     REGISTER_TABLE_FUNC(L, mtIndex, SetWorldRotationEuler);

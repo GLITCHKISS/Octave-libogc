@@ -11,6 +11,7 @@
 #if PLATFORM_DOLPHIN
 #include <ogc/lwp_watchdog.h>          // (gettime: the CPU's timebase -- the stats timed in its ticks, not through
                                        //  SYS_GetTimeMicroseconds' gettimeofday and its 64-bit divides)
+#include <ogc/system.h>                // (SYS_GetArena1Lo/Hi: the memory malloc hasn't taken yet)
 #endif
 
 static Profiler* sProfiler = nullptr;
@@ -243,7 +244,11 @@ static void LogFrameStats(const std::vector<CpuStat>& stats, float deltaTime)
     {
         char line[500];
         struct mallinfo info = mallinfo();
-        int at = snprintf(line, sizeof(line), "PERF %.1ffps heap=%dK avg", sFrames / sTime, int(info.fordblks / 1024));
+        // heap: the free gaps inside what malloc has taken (it swings as blocks come and go); free: those and the
+        // arena malloc hasn't taken yet -- the memory really left
+        const int freeK = int((info.fordblks + size_t((char*)SYS_GetArena1Hi() - (char*)SYS_GetArena1Lo())) / 1024);
+        int at = snprintf(line, sizeof(line), "PERF %.1ffps free=%dK heap=%dK avg", sFrames / sTime, freeK,
+                          int(info.fordblks / 1024));
 
         for (uint32_t i = 0; i < count && at < int(sizeof(line)) - 24; ++i)
         {

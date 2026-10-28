@@ -210,44 +210,67 @@ void SkeletalMesh::LoadStream(Stream& stream, Platform platform)
 
     mMorphBlock = MorphBlock();
 #if PLATFORM_DOLPHIN && !EDITOR
-    // the console's: every target's moves and normal changes interleaved, a vertex at a time (GetMorphBlock) -- a move
-    // past a target's own count left 0 (adding it changes nothing) -- and the targets' own arrays let go
+    // the console's: every target's moves and normal changes interleaved, a vertex at a time, in 16-bit fixed point
+    // (GetMorphBlock: the layout) -- a move past a target's own count left 0 (adding it changes nothing) -- and the
+    // targets' own arrays let go
     if (!mMorphTargets.empty())
     {
         MorphBlock& block = mMorphBlock;
         const uint32_t numMorphs = uint32_t(mMorphTargets.size());
-        block.mPosOfs.assign(numMorphs, -1);
-        block.mNrmOfs.assign(numMorphs, -1);
+        uint32_t numPos = 0, numNrm = 0;
+        block.mPosSlot.assign(numMorphs, -1);
+        block.mNrmSlot.assign(numMorphs, -1);
         for (uint32_t m = 0; m < numMorphs; ++m)
         {
-            if (!mMorphTargets[m].mPositions.empty()) { block.mPosOfs[m] = int32_t(block.mStride); block.mStride += 3; }
+            if (!mMorphTargets[m].mPositions.empty()) block.mPosSlot[m] = int32_t(numPos++);
+            if (!mMorphTargets[m].mNormals.empty()) block.mNrmSlot[m] = int32_t(numNrm++);
         }
-        for (uint32_t m = 0; m < numMorphs; ++m)
-        {
-            if (!mMorphTargets[m].mNormals.empty()) { block.mNrmOfs[m] = int32_t(block.mStride); block.mStride += 3; }
-        }
+        // (at least one pair of move slots: the skinning reads one whenever a target is on -- 0s, by 0, if none)
+        block.mNumPosPairs = glm::max<uint32_t>((numPos + 1) / 2, 1u);
+        block.mNumNrmPairs = (numNrm + 1) / 2;
+        block.mStride = 6 * (block.mNumPosPairs + block.mNumNrmPairs);
+        block.mPosScale.assign(2 * block.mNumPosPairs, 0.0f);
+        block.mNrmScale.assign(2 * block.mNumNrmPairs, 0.0f);
         const uint32_t numVerts = uint32_t(mVertices.size());
-        block.mData.assign(size_t(numVerts) * block.mStride, 0.0f);
+        block.mData.assign(size_t(numVerts) * block.mStride, int16_t(0));
+
+        // one slot's values into the block: pair `pair` of the vertex (counted from its first), lane slot & 1
+        auto pack = [&](const std::vector<glm::vec3>& values, uint32_t slot, uint32_t pair, float& outScale)
+        {
+            const uint32_t n = glm::min<uint32_t>(uint32_t(values.size()), numVerts);
+            float maxAbs = 0.0f;
+            for (uint32_t i = 0; i < n; ++i)
+                maxAbs = glm::max(maxAbs, glm::max(glm::abs(values[i].x), glm::max(glm::abs(values[i].y), glm::abs(values[i].z))));
+            if (!(maxAbs > 0.0f) || !(maxAbs < 1e30f))
+                return;                                         // (all 0 -- or not a number: left 0s, scale 0)
+            outScale = maxAbs / 32767.0f;
+            const float toFixed = 32767.0f / maxAbs;
+            auto fixed = [&](float v) -> int16_t
+            {
+                const float q = floorf(v * toFixed + 0.5f);
+                return int16_t(glm::clamp(q, -32767.0f, 32767.0f));
+            };
+            const uint32_t lane = slot & 1;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                int16_t* d = &block.mData[size_t(i) * block.mStride + 6 * pair];
+                d[2 * lane + 0] = fixed(values[i].x);
+                d[2 * lane + 1] = fixed(values[i].y);
+                d[4 + lane] = fixed(values[i].z);
+            }
+        };
         for (uint32_t m = 0; m < numMorphs; ++m)
         {
             MorphTarget& morph = mMorphTargets[m];
-            if (block.mPosOfs[m] >= 0)
+            if (block.mPosSlot[m] >= 0)
             {
-                const uint32_t n = glm::min<uint32_t>(uint32_t(morph.mPositions.size()), numVerts);
-                for (uint32_t i = 0; i < n; ++i)
-                {
-                    float* d = &block.mData[size_t(i) * block.mStride + block.mPosOfs[m]];
-                    d[0] = morph.mPositions[i].x; d[1] = morph.mPositions[i].y; d[2] = morph.mPositions[i].z;
-                }
+                const uint32_t slot = uint32_t(block.mPosSlot[m]);
+                pack(morph.mPositions, slot, slot / 2, block.mPosScale[slot]);
             }
-            if (block.mNrmOfs[m] >= 0)
+            if (block.mNrmSlot[m] >= 0)
             {
-                const uint32_t n = glm::min<uint32_t>(uint32_t(morph.mNormals.size()), numVerts);
-                for (uint32_t i = 0; i < n; ++i)
-                {
-                    float* d = &block.mData[size_t(i) * block.mStride + block.mNrmOfs[m]];
-                    d[0] = morph.mNormals[i].x; d[1] = morph.mNormals[i].y; d[2] = morph.mNormals[i].z;
-                }
+                const uint32_t slot = uint32_t(block.mNrmSlot[m]);
+                pack(morph.mNormals, slot, block.mNumPosPairs + slot / 2, block.mNrmScale[slot]);
             }
             std::vector<glm::vec3>().swap(morph.mPositions);   // (let go: nothing on the console reads them again)
             std::vector<glm::vec3>().swap(morph.mNormals);

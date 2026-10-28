@@ -52,6 +52,14 @@ Set this node's relative scale.
 Sig: `Node3D:SetScale(scale)`
  - Arg: `Vector scale` Relative scale
 ---
+### SetPositionRotationScale
+Set this node's relative position, rotation (a quaternion) and scale in one call, from numbers. The same as SetPosition, SetRotationQuat and SetScale, for effects that place many nodes every frame: one call instead of three, and no Vectors to fill.
+
+Sig: `Node3D:SetPositionRotationScale(px, py, pz, qx, qy, qz, qw, sx, sy, sz)`
+ - Arg: `number px, py, pz` Relative position
+ - Arg: `number qx, qy, qz, qw` Relative rotation quaternion
+ - Arg: `number sx, sy, sz` Relative scale
+---
 ### RotateAround
 Rotate this node around a given pivot point in world space.
 

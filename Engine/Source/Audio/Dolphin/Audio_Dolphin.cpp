@@ -13,6 +13,7 @@
 #include <gccore.h>
 #include <asndlib.h>
 #include <ogc/semaphore.h>
+#include <ogc/lwp_watchdog.h>
 #include <unistd.h>
 #include <malloc.h>
 #include <string.h>
@@ -37,9 +38,11 @@ static int32_t sSampleRates[AUDIO_MAX_VOICES] = {};
 //
 // A SoundWave flagged Stream keeps its compressed Vorbis in RAM instead of
 // decoding to full PCM. Here we open it with vorbisfile (over an in-RAM buffer)
-// and decode it a chunk at a time into a double PCM buffer, feeding ASND via
-// ASND_AddVoice. Decode runs on the main thread (AUD_Update), never in the audio
-// interrupt. A long track costs its compressed size (~KB) instead of MBs of PCM.
+// and decode it a chunk at a time into a triple PCM buffer, feeding ASND via
+// ASND_AddVoice. Decode runs on the audio decode thread (AudioDecodeThread) while
+// the main thread waits on vsync, never in the audio interrupt; the main thread
+// only hands decoded buffers to ASND (AUD_Update). A long track costs its
+// compressed size (~KB) instead of MBs of PCM.
 // ---------------------------------------------------------------------------
 
 struct MemSource
@@ -95,8 +98,43 @@ enum { LOOP_NONE = 0, LOOP_REQUESTED, LOOP_DONE };
 // dry still decodes at once.
 static const uint32_t kDiscAheadMargin = 4 * 1024;
 
+// The decoding itself, done by the audio decode thread (AudioDecodeThread). On the main thread, a slice of every playing
+// stream decoded each frame was 0.6-1.4 ms a frame on hardware with two disc streams at once, and up to 2.8 ms, in frames
+// with no time to spare -- while the same frames waited 4-9 ms on vsync. Now the main thread asks (DECODE_REQUESTED) and
+// that thread fills the buffer being filled while the main thread waits; the main thread hands full buffers to ASND, as
+// before. While REQUESTED only that thread touches vf, the disc source's window, the buffer being filled, `filled` and
+// `eof`; DECODE_NONE hands them back. Its own thread, not the I/O thread's work: an open there holds that thread for up
+// to a second, and the disc reads it waits on would hold the decoding up behind them.
+enum { DECODE_NONE = 0, DECODE_REQUESTED };
+
+// PCM decoded between the decode thread's looks at whether the main thread wants the stream back (a few packets:
+// well under a millisecond).
+static const uint32_t kDecodeUnitBytes = 4 * 1024;
+// The decode thread's priorities. Below the main thread (64) it decodes while the main thread waits on vsync and the GPU.
+// But a frame with almost no wait (1-2 ms of it a frame on hardware, gliding fast with two disc streams) starves it,
+// and the voice runs out: so once a voice has less than kDecodeBoostLeadUs of audio left in ASND with the next buffer
+// not decoded yet, the main thread raises it above itself (StreamBoostDecode) and it decodes that buffer there and
+// then, and goes back down. 65: above the main thread, below the SD driver's reads (66).
+static const u32 kDecodePriority = 56;
+static const u32 kDecodeBoostPriority = 65;
+static const uint64_t kDecodeBoostLeadUs = 150 * 1000;
+// The last resort: under this much left and the decode thread still not done (in a disc read), the main thread takes
+// the stream back and decodes the rest itself -- more than a decode and one ASND mix (21 ms) take.
+static const uint64_t kDecodeMainLeadUs = 40 * 1000;
+// How long the main thread waits for the decode thread to give a stream back (StreamTakeBack): the rest of a unit.
+// Longer is the thread in a disc read: tried again next frame.
+static const uint64_t kDecodeTakeBackUs = 2000;
+
 static sem_t sAudioIoSem = LWP_SEM_NULL;
 static lwp_t sAudioIoThread = LWP_THREAD_NULL;
+static sem_t sAudioDecodeSem = LWP_SEM_NULL;
+static lwp_t sAudioDecodeThread = LWP_THREAD_NULL;
+// PCM the decode thread decoded since the main thread last looked (AUD_Update: the AudDecKB perf figure). Interrupts
+// off around each change: one CPU.
+static volatile uint32_t sDecodedBytes = 0;
+// The decode thread raised above the main thread (StreamBoostDecode) and not yet back down. (Set by the main thread,
+// cleared by the decode thread as it goes back down: while it's up, the main thread can't run.)
+static volatile bool sDecodeBoosted = false;
 static void RequestReadAhead(DiscSource* d);
 
 struct StreamVoice
@@ -144,6 +182,17 @@ struct StreamVoice
     bool           cached = false;
     uint64_t       cachedAtUs = 0;
     bool           restart = false;
+    // Decoded by the decode thread (DECODE_*). `decodeYield` asks it to give the stream back at once (StreamTakeBack);
+    // `decodeUrgent`, that the voice is nearly out: it decodes it above the main thread, and reads the disc itself
+    // rather than wait on the I/O thread's read-ahead.
+    volatile int32_t decodeState = DECODE_NONE;
+    volatile bool  decodeYield = false;
+    volatile bool  decodeUrgent = false;
+    // The main thread's: when the audio handed to ASND runs out, as it reckons it (StreamQueued: each buffer's length
+    // at the voice's pitch, from when it was handed over or the one before it ends) -- a little early if anything, as
+    // the mixer takes each up a moment late. And the pitch it plays at (Hz).
+    uint64_t       playEndUs = 0;
+    int32_t        pitchHz = 0;
 };
 
 // Two slots a voice, in turn: one can be left to the I/O thread to finish and free (retiring) while the voice
@@ -186,10 +235,12 @@ static int MemClose(void* ds);
 static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want);
 static void StreamFree(StreamVoice* sv);
 
-// Whether the I/O thread has work in hand on this slot. (Interrupts off around it where it decides who frees it.)
+// Whether the I/O thread (or the decode thread) has work in hand on this slot. (Interrupts off around it where it decides
+// who frees it.)
 static bool StreamIoBusy(const StreamVoice* sv)
 {
-    return sv->openState == OPEN_REQUESTED || sv->disc.aheadState == AHEAD_REQUESTED || sv->loopState == LOOP_REQUESTED;
+    return sv->openState == OPEN_REQUESTED || sv->disc.aheadState == AHEAD_REQUESTED || sv->loopState == LOOP_REQUESTED ||
+           sv->decodeState == DECODE_REQUESTED;
 }
 
 // The I/O thread, done with a slot its voice has left: freed here, once nothing is left in hand on it. It stays
@@ -355,8 +406,9 @@ static size_t DiscRead(void* ptr, size_t size, size_t nmemb, void* ds)
         if (d->pos < d->windowAt || d->pos >= d->windowAt + d->windowSize)
         {
             // Not read ahead (the stream's start, a seek, a loop): read it here. (Timed only on the main
-            // thread: the profiler's stats aren't the I/O thread's to touch, and it opens streams.)
-            const bool onMain = (LWP_GetSelf() != sAudioIoThread);
+            // thread: the profiler's stats aren't the audio threads' to touch, and they open and decode streams.)
+            const lwp_t self = LWP_GetSelf();
+            const bool onMain = (self != sAudioIoThread && self != sAudioDecodeThread);
             if (onMain) BEGIN_FRAME_STAT("AudRead");
             uint32_t fill = d->size - d->pos;
             if (fill > kDiscWindowBytes) fill = kDiscWindowBytes;
@@ -478,6 +530,177 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
     return written;
 }
 
+// Near the end of the window with the next still being read: no decoding now (the I/O thread reads it while the main
+// thread waits on vsync), unless the voice is about to run dry -- a disc read here would only queue behind that one.
+static bool StreamWaitsOnDisc(const StreamVoice* sv)
+{
+    const DiscSource& d = sv->disc;
+    if (d.window == nullptr || d.aheadState != AHEAD_REQUESTED)
+        return false;
+    const uint32_t left = (d.pos >= d.windowAt && d.pos < d.windowAt + d.windowSize) ? d.windowAt + d.windowSize - d.pos : 0;
+    return left < kDiscAheadMargin;
+}
+
+// The rest of the buffer being filled decoded, a unit at a time: till it's full, the stream ends, or a loop's start is
+// asked of the I/O thread -- and, on the decode thread, till the disc's next window is still being read (unless the
+// voice is nearly out), another voice nearly out wants the thread, or the main thread wants the stream back. The
+// decode thread's, or the main thread's when it has taken the stream back (the whole rest at once, a disc read here if
+// need be). Returns the bytes decoded.
+static uint32_t StreamDecode(StreamVoice* sv, bool onMain)
+{
+    uint8_t* buf = sv->buf[sv->nextBuf];
+    uint32_t decoded = 0;
+    while (!sv->eof && sv->filled < sv->bufSize && sv->loopState == LOOP_NONE)
+    {
+        if (!onMain)
+        {
+            if (sv->decodeYield || sv->retiring)
+                break;
+            if (sv->decodeUrgent)
+            {
+                // Above the main thread till it's done. (Again each unit: the SD driver puts a noted thread back to the
+                // priority it noted after each read -- below the main thread.)
+                if (sDecodeBoosted)
+                    LWP_SetThreadPriority(LWP_THREAD_NULL, kDecodeBoostPriority);
+            }
+            else if (sDecodeBoosted || StreamWaitsOnDisc(sv))
+                break;                       // (another voice nearly out: that one first)
+        }
+        uint32_t want = sv->bufSize - sv->filled;
+        if (want > kDecodeUnitBytes) want = kDecodeUnitBytes;   // (whole sample frames: both multiples of 4)
+        const uint32_t n = StreamFill(sv, buf + sv->filled, want);
+        sv->filled += n;
+        decoded += n;
+        if (!onMain)
+        {
+            const u32 level = IRQ_Disable();
+            sDecodedBytes += n;
+            IRQ_Restore(level);
+        }
+        if (n < want && sv->loopState == LOOP_NONE) sv->eof = true;   // (short of it at a loop: the start's asked for)
+    }
+    return decoded;
+}
+
+// One stream's buffer being filled decoded, and the stream handed back to the main thread.
+static void StreamDecodeSlot(StreamVoice* sv)
+{
+    StreamDecode(sv, false);
+    __asm__ volatile("" ::: "memory");   // (all of it written before the main thread is told)
+    sv->decodeState = DECODE_NONE;
+    if (sv->retiring && sAudioIoSem != LWP_SEM_NULL)
+        LWP_SemPost(sAudioIoSem);         // (stopped while decoding: the I/O thread's next pass frees it)
+}
+
+// Decodes the streams the main thread asks it to (AUD_Update, DECODE_REQUESTED), each into its buffer being filled. Above
+// the I/O thread and below the main thread (see AUD_Initialize): it runs while the main thread waits on vsync and the GPU,
+// and the main thread takes the CPU back the moment it wakes -- except for a voice nearly out (kDecodeBoostLeadUs).
+static void* AudioDecodeThread(void*)
+{
+#if PLATFORM_GAMECUBE
+    OctSd_NoteThreadPriority(kDecodePriority);  // (as created in AUD_Initialize: a disc read here, should one be needed,
+                                                //  as the I/O thread's)
+#endif
+    while (true)
+    {
+        LWP_SemWait(sAudioDecodeSem);
+
+        while (true)
+        {
+            // The voices nearly out first, above the main thread (StreamBoostDecode); then back below it for the rest.
+            for (int32_t s = 0; s < kStreamSlots; ++s)
+            {
+                StreamVoice* sv = &sStreamSlots[s];
+                if (sv->decodeState == DECODE_REQUESTED && sv->decodeUrgent)
+                    StreamDecodeSlot(sv);
+            }
+            if (sDecodeBoosted)
+            {
+                sDecodeBoosted = false;
+                LWP_SetThreadPriority(LWP_THREAD_NULL, kDecodePriority);   // (the main thread goes on from here)
+            }
+
+            bool boosted = false;
+            for (int32_t s = 0; s < kStreamSlots && !boosted; ++s)
+            {
+                StreamVoice* sv = &sStreamSlots[s];
+                if (sv->decodeState == DECODE_REQUESTED)
+                    StreamDecodeSlot(sv);
+                boosted = sDecodeBoosted;            // (a voice nearly out meanwhile: round again, that one first)
+            }
+            if (!boosted)
+                break;
+        }
+    }
+    return nullptr;
+}
+
+// The stream back from the decode thread, the voice about to run dry with it still decoding (the thread starved, or
+// behind the disc): asked to stop after its unit, which it does as soon as the main thread waits (it's the highest
+// thread below it). False: not back yet (in a disc read) -- next frame.
+static bool StreamTakeBack(StreamVoice* sv)
+{
+    sv->decodeYield = true;
+    const uint64_t fromUs = SYS_GetTimeMicroseconds();
+    while (sv->decodeState == DECODE_REQUESTED && SYS_GetTimeMicroseconds() - fromUs < kDecodeTakeBackUs)
+        usleep(100);
+    return sv->decodeState != DECODE_REQUESTED;
+}
+
+// The buffer being filled asked of the decode thread, to be decoded while the main thread waits on vsync. (The main
+// thread's, with the stream its own and more of it to decode.)
+static void StreamRequestDecode(StreamVoice* sv, bool urgent)
+{
+    sv->decodeYield = false;
+    sv->decodeUrgent = urgent;
+    __asm__ volatile("" ::: "memory");   // (all of it written before the thread is told)
+    sv->decodeState = DECODE_REQUESTED;
+    LWP_SemPost(sAudioDecodeSem);
+}
+
+// The decode thread raised above the main thread, for the voices nearly out (decodeUrgent): it runs at once -- here, as
+// the main thread asks -- decodes them, and goes back below the main thread, which goes on from here with them decoded
+// (unless the thread waits on the disc: then the main thread goes on at once, and its last resort is StreamTakeBack).
+static void StreamBoostDecode()
+{
+    sDecodeBoosted = true;
+    __asm__ volatile("" ::: "memory");
+    LWP_SetThreadPriority(sAudioDecodeThread, kDecodeBoostPriority);
+    LWP_SemPost(sAudioDecodeSem);        // (should it be waiting for work)
+}
+
+// How long `bytes` of the stream's PCM plays for at its pitch, and the audio handed to ASND reckoned on by that (from
+// now, or from when what it has already runs out).
+static uint64_t StreamPlayUs(const StreamVoice* sv, uint32_t bytes)
+{
+    const uint64_t perSec = uint64_t(glm::max<int32_t>(sv->pitchHz, 1)) * uint32_t(sv->channels * sv->bytesPerSample);
+    return uint64_t(bytes) * 1000000u / perSec;
+}
+static void StreamQueued(StreamVoice* sv, uint32_t bytes, uint64_t nowUs)
+{
+    sv->playEndUs = glm::max(sv->playEndUs, nowUs) + StreamPlayUs(sv, bytes);
+}
+
+// The main thread's old way, without a decode thread (it couldn't be made): a slice a frame, keeping pace with time.
+static void StreamDecodeSlice(StreamVoice* sv, bool aboutDry, float elapsed)
+{
+    if (!aboutDry && StreamWaitsOnDisc(sv))
+        return;
+    // A quarter more than the time that passed, so the decoder stays ahead of the playback.
+    const uint32_t frameBytes = uint32_t(sv->channels * sv->bytesPerSample);
+    uint32_t slice = uint32_t(sv->bytesPerSec * elapsed * 1.25f);
+    slice -= slice % frameBytes;
+    slice = glm::max(slice, sv->sliceBytes);
+    uint32_t want = sv->bufSize - sv->filled;
+    if (want > slice) want = slice;
+    // If the voice is about to run dry (a long frame, a slow read), finish the buffer now:
+    // one long frame is better than a gap in the music.
+    if (aboutDry) want = sv->bufSize - sv->filled;
+    uint32_t n = StreamFill(sv, sv->buf[sv->nextBuf] + sv->filled, want);
+    sv->filled += n;
+    if (n < want && sv->loopState == LOOP_NONE) sv->eof = true;   // (short of it at a loop: the start's asked for)
+}
+
 // A slot nothing is in hand on, left to the I/O thread to free (StreamTryRetire): the decoder's frees off the main thread.
 static void StreamRetire(StreamVoice* sv)
 {
@@ -522,6 +745,8 @@ static bool StreamPark(StreamVoice* sv)
     sv->disc.aheadState = AHEAD_EMPTY;      // (EMPTY or READY here: not busy)
     sv->openState = OPEN_NONE;              // (NONE, or DONE if stopped before its voice was set)
     sv->loopState = LOOP_NONE;              // (NONE or DONE: it's seeked to its start anyway)
+    sv->decodeYield = false;                // (decodeState NONE here: not busy)
+    sv->decodeUrgent = false;
     sv->eof = false;
     sv->active = false;
     sv->cached = true;
@@ -589,6 +814,11 @@ static void StreamFree(StreamVoice* sv)
     while (sv->loopState == LOOP_REQUESTED)
         usleep(500);
     sv->loopState = LOOP_NONE;
+    sv->decodeYield = true;                   // (decoding: done after its unit)
+    while (sv->decodeState == DECODE_REQUESTED)
+        usleep(500);
+    sv->decodeYield = false;
+    sv->decodeUrgent = false;
     WaitReadAhead(&sv->disc);
     const uint64_t waitedUs = SYS_GetTimeMicroseconds() - waitFromUs;
     if (waitedUs > 1000)    // (the main thread held up by the I/O thread's disc work: a hitch, logged)
@@ -641,7 +871,8 @@ static StreamVoice* StreamFor(int32_t v)
 }
 
 // Keep-alive callback: non-NULL so an underrun parks the voice in SND_WAITING
-// instead of ending it. Feeding happens on the main thread in AUD_Update.
+// instead of ending it. Feeding happens on the main thread in AUD_Update (the
+// decoding on the decode thread).
 static void StreamCallback(s32 voice) { (void)voice; }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1319,21 @@ void AUD_Initialize()
         LWP_SemDestroy(sAudioIoSem);
         sAudioIoSem = LWP_SEM_NULL;   // no thread: streams read on the main thread, as before
     }
+
+    // The decode thread (AudioDecodeThread). Priority 56: below the main thread, so it decodes while the main thread waits
+    // and never in the middle of its work (but for a voice nearly out: kDecodeBoostLeadUs); above the I/O thread, so an
+    // open's header parsing there (tens of ms of CPU) can't hold a playing stream's decoding up. 128 KB, as the I/O
+    // thread: it decodes, and may read the disc (libfat).
+    if (LWP_SemInit(&sAudioDecodeSem, 0, 64) != 0)
+    {
+        sAudioDecodeSem = LWP_SEM_NULL;
+    }
+    else if (LWP_CreateThread(&sAudioDecodeThread, AudioDecodeThread, nullptr, nullptr, 128 * 1024, kDecodePriority) != 0)
+    {
+        LWP_SemDestroy(sAudioDecodeSem);
+        sAudioDecodeSem = LWP_SEM_NULL;   // no thread: streams decoded on the main thread, a slice a frame, as before
+        sAudioDecodeThread = LWP_THREAD_NULL;
+    }
 }
 
 void AUD_Shutdown()
@@ -1125,6 +1371,33 @@ void AUD_Update()
     elapsed = glm::min(elapsed, 0.1f);
     sLastUpdateUs = nowUs;
 
+#if PROFILING_ENABLED
+    // What the decode thread decoded since the last frame, off the main thread: AudDecKB in the perf log (KB of PCM a
+    // frame). (Its time can't be told: the main thread preempts it partway.)
+    {
+        const u32 level = IRQ_Disable();
+        const uint32_t decoded = sDecodedBytes;
+        sDecodedBytes = 0;
+        IRQ_Restore(level);
+        if (decoded != 0)
+        {
+            BEGIN_FRAME_STAT("AudDecKB");
+            END_FRAME_STAT("AudDecKB");
+            CpuStat* stat = GetProfiler()->FindCpuStat("AudDecKB", false);
+            if (stat != nullptr)
+                stat->mTime = decoded / 1024.0f;
+        }
+    }
+#endif
+
+    // The decode thread behind (raised above the main thread), the main thread's own decoding (the last resort) and the
+    // buffers ASND refused (taken next frame), logged once a second at most.
+    static uint32_t sBoosts = 0;
+    static uint32_t sMainDecodes = 0;
+    static uint32_t sTakeBackFails = 0;
+    static uint32_t sRefused = 0;
+    static uint64_t sMainDecodeLoggedUs = 0;
+
     // A stopped stream's decoder kept its while and not started again: left to the I/O thread to free (StreamPark).
     for (int32_t c = 0; c < kStreamCacheSlots; ++c)
     {
@@ -1133,7 +1406,7 @@ void AUD_Update()
             StreamRetire(kept);
     }
 
-    // Keep streamed voices fed (decode next chunk on the main thread).
+    // Keep streamed voices fed (the decoding asked of the decode thread; the buffers it decoded handed to ASND here).
     for (int32_t v = 0; v < AUDIO_MAX_VOICES; ++v)
     {
         StreamVoice* sv = VoiceStream(v);
@@ -1155,6 +1428,8 @@ void AUD_Update()
             sv->openState = OPEN_NONE;
             ASND_SetVoice(v, sv->openFormat, sv->openPitchHz, 0, sv->buf[0], sv->openFilled,
                           sv->openVolL, sv->openVolR, StreamCallback);
+            sv->playEndUs = 0;
+            StreamQueued(sv, sv->openFilled, nowUs);
             continue;
         }
 
@@ -1164,52 +1439,96 @@ void AUD_Update()
             continue;
         }
 
-        // Back at a loop's start (the I/O thread): decoding goes on. Still on its way: none this frame.
-        const int32_t loopNow = sv->loopState;
-        if (loopNow == LOOP_DONE)
-            sv->loopState = LOOP_NONE;
-        const bool looping = (loopNow == LOOP_REQUESTED);
-
-        // Near the end of the window with the next still being read: none this frame either, unless the voice is
-        // about to run dry (the I/O thread reads it while this thread waits on vsync).
         const bool aboutDry = ASND_TestVoiceBufferReady(v);
-        bool waitDisc = false;
-        if (sv->disc.window != nullptr && sv->disc.aheadState == AHEAD_REQUESTED && !aboutDry)
-        {
-            const DiscSource& d = sv->disc;
-            const uint32_t left = (d.pos >= d.windowAt && d.pos < d.windowAt + d.windowSize) ? d.windowAt + d.windowSize - d.pos : 0;
-            waitDisc = (left < kDiscAheadMargin);
-        }
 
-        // A slice of decoding, into the buffer that is neither playing nor queued.
-        uint8_t* buf = sv->buf[sv->nextBuf];
-        if (!sv->eof && sv->filled < sv->bufSize && !looping && !waitDisc)
+        if (sAudioDecodeSem != LWP_SEM_NULL)
         {
-            // A quarter more than the time that passed, so the decoder stays ahead of the playback.
-            const uint32_t frameBytes = uint32_t(sv->channels * sv->bytesPerSample);
-            uint32_t slice = uint32_t(sv->bytesPerSec * elapsed * 1.25f);
-            slice -= slice % frameBytes;
-            slice = glm::max(slice, sv->sliceBytes);
-            uint32_t want = sv->bufSize - sv->filled;
-            if (want > slice) want = slice;
-            // If the voice is about to run dry (a long frame, a slow read), finish the buffer now:
-            // one long frame is better than a gap in the music.
-            if (aboutDry) want = sv->bufSize - sv->filled;
-            uint32_t n = StreamFill(sv, buf + sv->filled, want);
-            sv->filled += n;
-            if (n < want && sv->loopState == LOOP_NONE) sv->eof = true;   // (short of it at a loop: the start's asked for)
+            // The audio ASND has left, as reckoned (StreamQueued). Normally 200-400 ms: the next buffer is decoded long
+            // before what plays runs out. Under kDecodeBoostLeadUs with it not decoded (the decode thread starved: a
+            // frame with no wait in it), the decode thread is raised above this one to decode it now; under
+            // kDecodeMainLeadUs and still not (the thread in a disc read), this thread decodes it, as the last resort.
+            const uint64_t leadUs = (sv->playEndUs > nowUs) ? sv->playEndUs - nowUs : 0;
+            const bool urgent = (leadUs < kDecodeBoostLeadUs);
+
+            // Back at a loop's start (the I/O thread): decoding goes on. Still on its way: none this frame.
+            if (sv->decodeState == DECODE_NONE && sv->loopState == LOOP_DONE)
+                sv->loopState = LOOP_NONE;
+            const bool more = !sv->eof && sv->filled < sv->bufSize && sv->loopState == LOOP_NONE;
+
+            if (sv->decodeState == DECODE_NONE && more)
+                StreamRequestDecode(sv, urgent);
+            else if (sv->decodeState == DECODE_REQUESTED && urgent)
+                sv->decodeUrgent = true;
+            if (urgent && sv->decodeState == DECODE_REQUESTED)
+            {
+                StreamBoostDecode();             // (decoded by the time this returns, unless it's on the disc)
+                ++sBoosts;
+            }
+
+            if (sv->decodeState == DECODE_REQUESTED)
+            {
+                if (leadUs >= kDecodeMainLeadUs)
+                    continue;                    // (the decode thread's still: nothing to hand over yet)
+                if (!StreamTakeBack(sv))
+                {
+                    ++sTakeBackFails;
+                    continue;
+                }
+            }
+            if (leadUs < kDecodeMainLeadUs && !sv->eof && sv->filled < sv->bufSize && sv->loopState == LOOP_NONE &&
+                StreamDecode(sv, true) > 0)
+            {
+                ++sMainDecodes;
+            }
+        }
+        else
+        {
+            // No decode thread: a slice here every frame, as before. Back at a loop's start: decoding goes on.
+            const int32_t loopNow = sv->loopState;
+            if (loopNow == LOOP_DONE)
+                sv->loopState = LOOP_NONE;
+            if (!sv->eof && sv->filled < sv->bufSize && loopNow != LOOP_REQUESTED)
+                StreamDecodeSlice(sv, aboutDry, elapsed);
         }
 
         // Hand it over once it is full (or is all there is) and the voice has room for it -- or, at a loop's end with
-        // the start still on its way and the voice about to run dry, what there is of it.
+        // the start still on its way and the voice about to run dry, what there is of it. Only once ASND has it: it
+        // refuses one till its mixer has taken up the last ASND_SetVoice or ASND_AddVoice (21 ms, a mix), and says
+        // there's room when the voice has run dry with one queued. Thrown away then, that was 0.2 s of the music gone.
+        uint8_t* buf = sv->buf[sv->nextBuf];
         const bool loopWait = (sv->loopState == LOOP_REQUESTED);
         if (sv->filled > 0 && (sv->filled >= sv->bufSize || sv->eof || loopWait) && ASND_TestVoiceBufferReady(v))
         {
             DCFlushRange(buf, sv->bufSize);
-            ASND_AddVoice(v, buf, sv->filled);
-            sv->nextBuf = (sv->nextBuf + 1) % 3;
-            sv->filled = 0;
+            if (ASND_AddVoice(v, buf, sv->filled) == SND_OK)
+            {
+                StreamQueued(sv, sv->filled, nowUs);
+                sv->nextBuf = (sv->nextBuf + 1) % 3;
+                sv->filled = 0;
+            }
+            else
+                ++sRefused;                      // (tried again next frame)
         }
+
+        // The next buffer's decoding asked of the decode thread, to run while this thread waits on vsync. (Asked every
+        // frame till it's full: it stops short when the disc's next window is still being read.)
+        if (sAudioDecodeSem != LWP_SEM_NULL && sv->decodeState == DECODE_NONE && !sv->eof && sv->filled < sv->bufSize &&
+            sv->loopState == LOOP_NONE)
+        {
+            StreamRequestDecode(sv, false);
+        }
+    }
+
+    if ((sBoosts != 0 || sMainDecodes != 0 || sTakeBackFails != 0) && nowUs - sMainDecodeLoggedUs >= 1000000)
+    {
+        LogWarning("AUDIO decode thread behind: raised above the main thread %u time(s), decoded on the main thread %u "
+                   "time(s), %u wait(s) for it ran out; %u buffer(s) ASND took a frame late",
+                   sBoosts, sMainDecodes, sTakeBackFails, sRefused);
+        sBoosts = 0;
+        sMainDecodes = 0;
+        sTakeBackFails = 0;
+        sRefused = 0;
+        sMainDecodeLoggedUs = nowUs;
     }
 
     for (uint32_t i = 0; i < AUD_MAX_PCM_STREAMS; ++i)
@@ -1348,6 +1667,8 @@ void AUD_Play(
         sv->loop = loop;
         sv->eof = false;
         sv->nextBuf = 1;
+        sv->pitchHz = pitchHz;
+        sv->playEndUs = 0;
 
         // ~0.2s double buffers.
         uint32_t bytesPerSec = soundWave->GetSampleRate() * sv->channels * sv->bytesPerSample;
@@ -1395,6 +1716,9 @@ void AUD_Play(
             sv->buf[0], n0,
             spatial ? 0 : volumeInt, spatial ? 0 : volumeInt,
             StreamCallback);
+        StreamQueued(sv, n0, SYS_GetTimeMicroseconds());
+        if (sAudioDecodeSem != LWP_SEM_NULL && !sv->eof)
+            StreamRequestDecode(sv, false);   // (the second buffer, decoded while this frame waits on vsync)
         return;
     }
 
@@ -1480,7 +1804,7 @@ bool AUD_IsPlaying(uint32_t voiceIndex)
         StreamVoice* sv = VoiceStream(voiceIndex);
         if (sv->active && (sv->openState == OPEN_REQUESTED || sv->openState == OPEN_DONE))
             return true;   // (still being opened by the I/O thread: playing, as far as anyone asks)
-        if (sv->active && sv->eof && sv->filled == 0 && VoiceDrained(voiceIndex, sv->buf, 3))
+        if (sv->active && sv->decodeState == DECODE_NONE && sv->eof && sv->filled == 0 && VoiceDrained(voiceIndex, sv->buf, 3))
         {
             AUD_Stop(voiceIndex);
             return false;
@@ -1507,6 +1831,8 @@ void AUD_SetPitch(uint32_t voiceIndex, float pitch)
 {
     int32_t pitchHz = int32_t(pitch * sSampleRates[voiceIndex]);
     ASND_ChangePitchVoice(voiceIndex, pitchHz);
+    if (voiceIndex < AUDIO_MAX_VOICES)
+        VoiceStream(voiceIndex)->pitchHz = pitchHz;   // (a stream's reckoning of what ASND has left: StreamQueued)
 }
 
 uint8_t* AUD_AllocWaveBuffer(uint32_t size)

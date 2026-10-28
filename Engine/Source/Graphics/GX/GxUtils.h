@@ -45,6 +45,11 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
 // After BindMaterial, with the draw's normal matrix (as given to GX_LoadNrmMtxImm): loads the
 // sphere-map matrix (GX_TEXMTX2) when the bound material has a UV_MAP_ENVIRONMENT slot.
 void LoadEnvTexMtx(const Mtx normalMtx);
+// The sphere-map matrix LoadEnvTexMtx loads for that normal matrix, made but not loaded (the GPU-skinned rigid
+// vertices' own, each through its bone: Graphics_GX.cpp, DrawRigidBatches)
+void GxEnvTexMtx(const Mtx normalMtx, Mtx env);
+// The texture coordinates the last BindMaterial generates by the sphere map (bit n: GX_TEXCOORD0 + n; 0: none)
+uint32_t GxBoundEnvTexCoords();
 // Turns off indirect texturing (a TevMode::Warp material's) if any is on: GX_SetTevDirect on the
 // stages that used it and GX_SetNumIndStages(0). BindMaterial, the UI pass and Octave's own TEV
 // setups call it; code that sets up its own TEV stages during the 3D pass must call it too.
