@@ -1569,6 +1569,14 @@ static float sProjShadowHalf = 1.0f;
 static glm::vec3 sProjShadowCenter = { 0.0f, 0.0f, 0.0f };
 static float sProjShadowTop = 0.0f;
 static bool sProjShadowValid = false;
+// The shadow only on what's no higher than the caster's feet and this, and not on what faces down -- as the Vulkan
+// receiver (ProjShadowReceiver.frag): laid straight down, it landed on anything in the column, a block over a
+// character's head and the underside of what he stands on. GX has no shader: each test is a texture coordinate
+// generated from the receiver (its world height, its world normal's y) on a step texture -- black on one side of
+// its middle, white on the other, sampled nearest -- added over the shadow, so white where the test fails.
+static const float kProjShadowAboveFeet = 0.3f;
+static void* sProjShadowStep = nullptr;
+static GXTexObj sProjShadowStepObj;
 
 static void ProjShadowLoadMtx(const glm::mat4& m, Mtx out)
 {
@@ -1668,6 +1676,19 @@ void GFX_RenderProjectedShadowMap(const std::vector<SkeletalMesh3D*>& casters)
             return;
         GX_InitTexObj(&sProjShadowTexObj, sProjShadowTex, kProjShadowRes, kProjShadowRes, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
         GX_InitTexObjLOD(&sProjShadowTexObj, GX_LINEAR, GX_LINEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
+    }
+    if (sProjShadowStep == nullptr)
+    {
+        // 8 x 4 I8 (one tile, rows of 8): black left of s = 0.5, white from it
+        uint8_t* step = (uint8_t*)memalign(32, 32);
+        if (step == nullptr)
+            return;
+        for (uint32_t i = 0; i < 32; ++i)
+            step[i] = ((i % 8) < 4) ? 0 : 255;
+        DCFlushRange(step, 32);
+        sProjShadowStep = step;
+        GX_InitTexObj(&sProjShadowStepObj, step, 8, 4, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+        GX_InitTexObjLOD(&sProjShadowStepObj, GX_NEAR, GX_NEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
     }
 
     // The camera: over the first caster (the others -- what it wears, what it holds -- ride with it), looking
@@ -1778,12 +1799,23 @@ void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receiver
     ProjShadowLoadMtx(camera->GetViewMatrix(), view);
 
     GxResetIndirect();
-    GX_SetNumTexGens(1);
     GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_POS, GX_TEXMTX9);
+    GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_POS, GX_TEXMTX8);   // (its height: above the cut, white)
+    GX_SetTexCoordGen(GX_TEXCOORD2, GX_TG_MTX2x4, GX_TG_NRM, GX_TEXMTX7);   // (its normal: facing down, white)
     GX_LoadTexObj(&sProjShadowTexObj, GX_TEXMAP0);
-    GX_SetNumTevStages(1);
+    GX_LoadTexObj(&sProjShadowStepObj, GX_TEXMAP1);
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
     GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+    for (uint32_t i = 1; i <= 2; ++i)
+    {
+        const uint8_t stage = uint8_t(GX_TEVSTAGE0 + i);
+        GX_SetTevOrder(stage, GX_TEXCOORD0 + i, GX_TEXMAP1, GX_COLORNULL);
+        GX_SetTevColorIn(stage, GX_CC_TEXC, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);   // (what's there + the test)
+        GX_SetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+        GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+        GX_SetTevAlphaOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    }
+    const float cut = sProjShadowCenter.y + kProjShadowAboveFeet;   // (the caster's feet: its origin)
     gGxContext.mLighting.mEnabled = false;
     gGxContext.mLighting.mColorChannel = false;
     gGxContext.mLighting.mMaterialSrc = GX_SRC_REG;
@@ -1824,6 +1856,28 @@ void GFX_DrawProjectedShadowReceivers(const std::vector<StaticMesh3D*>& receiver
         GX_LoadPosMtxImm(modelView, GX_PNMTX0);
         c_guMtxConcat(texFromWorld, model, texMtx);
         GX_LoadTexMtxImm(texMtx, GX_TEXMTX9, GX_TG_MTX2x4);
+
+        // its world height less the cut, a metre to a texture's width, from the step's middle
+        Mtx heightMtx = { { model[1][0], model[1][1], model[1][2], model[1][3] - cut + 0.5f },
+                          { 0.0f, 0.0f, 0.0f, 0.5f },
+                          { 0.0f, 0.0f, 0.0f, 1.0f } };
+        GX_LoadTexMtxImm(heightMtx, GX_TEXMTX8, GX_TG_MTX2x4);
+        // a compact mesh has no normals: the height test alone
+        const bool normals = !res->mCompact;
+        if (normals)
+        {
+            // its world normal's y, made negative (down: past the middle, white); a wall's 0 a hair short of it
+            glm::mat3 nm = glm::transpose(glm::inverse(glm::mat3(comp->GetRenderTransform())));
+            glm::vec3 ny = glm::vec3(nm[0][1], nm[1][1], nm[2][1]);
+            const float len = glm::length(ny);
+            ny = (len > 1e-6f) ? ny / len : glm::vec3(0.0f, 1.0f, 0.0f);
+            Mtx downMtx = { { -ny.x, -ny.y, -ny.z, 0.49f },
+                            { 0.0f, 0.0f, 0.0f, 0.5f },
+                            { 0.0f, 0.0f, 0.0f, 1.0f } };
+            GX_LoadTexMtxImm(downMtx, GX_TEXMTX7, GX_TG_MTX2x4);
+        }
+        GX_SetNumTexGens(normals ? 3 : 2);
+        GX_SetNumTevStages(normals ? 3 : 2);
 
         if (hasColor)
         {
