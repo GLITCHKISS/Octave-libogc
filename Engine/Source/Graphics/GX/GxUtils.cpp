@@ -85,12 +85,20 @@ void SetupLights()
             gGxContext.mHasSpecLight = true;
         }
 
+        {
+            glm::vec4 dirVS = cameraComp->GetViewMatrix() * glm::vec4(lightData.mDirection, 0.0f);
+            gGxContext.mLightDirVS[gGxContext.mSceneNumLights] = glm::normalize(glm::vec3(dirVS));
+            gGxContext.mLightGxColor[gGxContext.mSceneNumLights] = gxLightColor;
+        }
+
         GX_LoadLightObj(&gxLight, GX_LIGHT0 << gGxContext.mSceneNumLights);
         gGxContext.mSceneLightMask |= (GX_LIGHT0 << gGxContext.mSceneNumLights);
         gGxContext.mLightData[gGxContext.mSceneNumLights] = lightData;
         gGxContext.mSceneNumLights++;
     }
 }
+
+static void LoadSpecTexMtx(const Mtx normalMtx, float k, const glm::vec3& h, uint32_t texMtx);
 
 void SetupLightMask(ShadingModel shadingModel, uint8_t lightingChannels, bool useBakedLight)
 {
@@ -123,6 +131,29 @@ void SetupLightMask(ShadingModel shadingModel, uint8_t lightingChannels, bool us
     }
 
     gGxContext.mLighting.mLightMask = lightMask;
+
+    // The sharp specular: a lobe for each of the (up to two) directional lights that light this draw -- the PC
+    // renderer sums every light's -- placed about that light's half vector with the view from the object.
+    if (gGxContext.mSpecTexBound)
+    {
+        glm::vec3 toCamera = -gGxContext.mObjectViewPos;
+        toCamera = (glm::dot(toCamera, toCamera) > 1e-8f) ? glm::normalize(toCamera) : glm::vec3(0.0f, 0.0f, 1.0f);
+        uint32_t lobe = 0;
+        for (uint32_t i = 0; i < gGxContext.mSceneNumLights && lobe < 2; ++i)
+        {
+            if (!(lightMask & (GX_LIGHT0 << i)) || gGxContext.mLightData[i].mType != LightType::Directional)
+                continue;
+            const glm::vec3 h = glm::normalize(-gGxContext.mLightDirVS[i] + toCamera);
+            LoadSpecTexMtx(gGxContext.mSpecNormalMtx, gGxContext.mSpecNormalScale, h, GX_TEXMTX5 + lobe * 3);
+            const GXColor& lc = gGxContext.mLightGxColor[i];
+            glm::vec3 k = glm::clamp(gGxContext.mSpecMatColor * glm::vec3(lc.r, lc.g, lc.b) / 255.0f, 0.0f, 1.0f);
+            GX_SetTevKColor(lobe == 0 ? GX_KCOLOR3 : GX_KCOLOR2,
+                            { uint8_t(k.r * 255.0f), uint8_t(k.g * 255.0f), uint8_t(k.b * 255.0f), 255 });
+            lobe++;
+        }
+        for (; lobe < 2; ++lobe)
+            GX_SetTevKColor(lobe == 0 ? GX_KCOLOR3 : GX_KCOLOR2, { 0, 0, 0, 255 });
+    }
 }
 
 void SetupLightingChannels()
@@ -283,10 +314,12 @@ static GXTexObj* GetSpecLobeTex(float shininess)
     return &lobeTex.mObj;
 }
 
-// The lobe texture's coordinates from the normal: (n_view - h) * scale + 0.5, h the half vector.
-static void LoadSpecTexMtx(const Mtx normalMtx, float k)
+// The lobe texture's coordinates from the normal: (n_view - h) * scale + 0.5, h the half vector of the light and
+// the view -- the view from the object to the camera, as the PC renderer's per-pixel V (the view straight down the
+// camera's axis put an object's highlight to one side, and wrong seen from elsewhere): the object's origin in view
+// space (gGxContext.mObjectViewPos, set by the draw before its model-view became the normal matrix).
+static void LoadSpecTexMtx(const Mtx normalMtx, float k, const glm::vec3& h, uint32_t texMtx)
 {
-    const glm::vec3& h = gGxContext.mSpecHalfVS;
     Mtx m;
     for (uint32_t c = 0; c < 3; ++c)
     {
@@ -297,7 +330,7 @@ static void LoadSpecTexMtx(const Mtx normalMtx, float k)
     m[0][3] = 0.5f - kSpecTexScale * h.x;
     m[1][3] = 0.5f - kSpecTexScale * h.y;
     m[2][3] = 1.0f;
-    GX_LoadTexMtxImm(m, GX_TEXMTX5, GX_TG_MTX3x4);
+    GX_LoadTexMtxImm(m, texMtx, GX_TG_MTX3x4);
 }
 
 void LoadEnvTexMtx(const Mtx normalMtx)
@@ -321,7 +354,8 @@ void LoadEnvTexMtx(const Mtx normalMtx)
 
     if (gGxContext.mSpecTexBound)
     {
-        LoadSpecTexMtx(normalMtx, k);
+        memcpy(gGxContext.mSpecNormalMtx, normalMtx, sizeof(Mtx));   // (placed by SetupLightMask, which knows
+        gGxContext.mSpecNormalScale = k;                             //  the draw's lights)
     }
     if (!gGxContext.mEnvMapBound)
     {
@@ -597,25 +631,29 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
     gGxContext.mSpecTexBound = false;
     const float specular = material->GetSpecular();
     GXTexObj* lobeTex = (specular > 0.0f && material->IsSharpSpecular() && !unlit && hasNormals &&
-                         gGxContext.mHasSpecLight && texIdx < 8) ? GetSpecLobeTex(material->GetShininess()) : nullptr;
+                         texIdx + 2 <= 8) ? GetSpecLobeTex(material->GetShininess()) : nullptr;
     if (lobeTex != nullptr)
     {
-        // per pixel: the lobe texture, its coordinates from the normal (GX_TEXMTX5, LoadEnvTexMtx), times
-        // specular x the material's colour x the light's, added
-        GX_SetTexCoordGen(GX_TEXCOORD0 + texIdx, GX_TG_MTX3x4, GX_TG_NRM, GX_TEXMTX5);
+        // per pixel, for up to two lights: the lobe texture, its coordinates from the normal (GX_TEXMTX5, 6),
+        // times specular x the material's colour x the light's (KCOLOR3, 2), added -- the lights, their
+        // matrices and colours set by SetupLightMask, which knows the draw's lighting channels
+        gGxContext.mSpecMatColor = glm::vec3(color) * specular;
         GX_LoadTexObj(lobeTex, GX_TEXMAP0 + texIdx);
-        GX_SetNumTexGens(texIdx + 1);
-
-        const GXColor& lc = gGxContext.mSpecColor;
-        glm::vec3 k = glm::clamp(glm::vec3(color) * specular * glm::vec3(lc.r, lc.g, lc.b) / 255.0f, 0.0f, 1.0f);
-        GX_SetTevKColor(GX_KCOLOR3, { uint8_t(k.r * 255.0f), uint8_t(k.g * 255.0f), uint8_t(k.b * 255.0f), 255 });
-        GX_SetTevKColorSel(tevStage, GX_TEV_KCSEL_K3);
-        GX_SetTevOrder(tevStage, GX_TEXCOORD0 + texIdx, GX_TEXMAP0 + texIdx, GX_COLORNULL);
-        GX_SetTevColorIn(tevStage, GX_CC_ZERO, GX_CC_TEXC, GX_CC_KONST, GX_CC_CPREV);
-        GX_SetTevAlphaIn(tevStage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
-        GX_SetTevColorOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-        GX_SetTevAlphaOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-        tevStage++;
+        GX_LoadTexObj(lobeTex, GX_TEXMAP0 + texIdx + 1);
+        for (uint32_t lobe = 0; lobe < 2; ++lobe)
+        {
+            const uint32_t slot = texIdx + lobe;
+            GX_SetTexCoordGen(GX_TEXCOORD0 + slot, GX_TG_MTX3x4, GX_TG_NRM, GX_TEXMTX5 + lobe * 3);
+            GX_SetTevKColor(lobe == 0 ? GX_KCOLOR3 : GX_KCOLOR2, { 0, 0, 0, 255 });
+            GX_SetTevKColorSel(tevStage, lobe == 0 ? GX_TEV_KCSEL_K3 : GX_TEV_KCSEL_K2);
+            GX_SetTevOrder(tevStage, GX_TEXCOORD0 + slot, GX_TEXMAP0 + slot, GX_COLORNULL);
+            GX_SetTevColorIn(tevStage, GX_CC_ZERO, GX_CC_TEXC, GX_CC_KONST, GX_CC_CPREV);
+            GX_SetTevAlphaIn(tevStage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+            GX_SetTevColorOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+            GX_SetTevAlphaOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+            tevStage++;
+        }
+        GX_SetNumTexGens(texIdx + 2);
         gGxContext.mSpecTexBound = true;
     }
     else if (specular > 0.0f && !unlit && !useVertexColor && hasNormals && gGxContext.mHasSpecLight &&

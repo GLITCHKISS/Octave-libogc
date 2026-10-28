@@ -1239,6 +1239,7 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverri
         GX_LoadPosMtxImm(modelView, GX_PNMTX0);
 
         Mtx modelViewInv;
+        gGxContext.mObjectViewPos = glm::vec3(modelView[0][3], modelView[1][3], modelView[2][3]);
         guMtxInverse(modelView, modelViewInv);
         guMtxTranspose(modelViewInv, modelView);
         GX_LoadNrmMtxImm(modelView, GX_PNMTX0);
@@ -1355,6 +1356,7 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
 
         Mtx modelViewInv;
         Mtx normalMtx;
+        gGxContext.mObjectViewPos = glm::vec3(modelView[0][3], modelView[1][3], modelView[2][3]);
         guMtxInverse(modelView, modelViewInv);
         guMtxTranspose(modelViewInv, normalMtx);
 
@@ -1513,6 +1515,7 @@ void GFX_DrawShadowMeshComp(ShadowMesh3D* shadowMeshComp)
         GX_LoadPosMtxImm(modelView, GX_PNMTX0);
 
         Mtx modelViewInv;
+        gGxContext.mObjectViewPos = glm::vec3(modelView[0][3], modelView[1][3], modelView[2][3]);
         guMtxInverse(modelView, modelViewInv);
         guMtxTranspose(modelViewInv, modelView);
         GX_LoadNrmMtxImm(modelView, GX_PNMTX0);
@@ -1913,6 +1916,7 @@ void GFX_DrawTextMeshComp(TextMesh3D* textMeshComp)
     GX_LoadPosMtxImm(modelView, GX_PNMTX0);
 
     Mtx modelViewInv;
+    gGxContext.mObjectViewPos = glm::vec3(modelView[0][3], modelView[1][3], modelView[2][3]);
     guMtxInverse(modelView, modelViewInv);
     guMtxTranspose(modelViewInv, modelView);
     GX_LoadNrmMtxImm(modelView, GX_PNMTX0);

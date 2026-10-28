@@ -69,6 +69,14 @@ struct GxContext
     GXColor mSpecColor = { 0, 0, 0, 255 };
     glm::vec3 mSpecHalfVS = glm::vec3(0.0f, 0.0f, 1.0f);   // (its half vector with the view, in view space)
     bool mSpecTexBound = false;                             // (the bound material samples the lobe texture)
+    glm::vec3 mObjectViewPos = glm::vec3(0.0f);             // (the object being drawn, its origin in view space)
+    // Each scene light's direction in view space and its colour (the sharp specular's: the lights that light
+    // the draw, by its lighting channels -- SetupLightMask), and the bound material's specular x its colour.
+    glm::vec3 mLightDirVS[MAX_LIGHTS_PER_DRAW];
+    GXColor mLightGxColor[MAX_LIGHTS_PER_DRAW];
+    glm::vec3 mSpecMatColor = glm::vec3(0.0f);
+    Mtx mSpecNormalMtx;
+    float mSpecNormalScale = 1.0f;
 
     // Fog
     bool mApplyFog = true;
