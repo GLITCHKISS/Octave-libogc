@@ -236,8 +236,8 @@ enum { OPEN_NONE = 0, OPEN_REQUESTED, OPEN_DONE, OPEN_FAILED };
 
 // A looping disc stream's way back to its start, done by the I/O thread as well. ov_pcm_seek reads pages at
 // scattered places in the file (each a disc read through DiscRead): on the main thread that was a 23-45 ms frame
-// at every loop of a streamed track (AudRead in the console perf log -- the dive's wind, the shell's water, the
-// Starman's theme). Now the main thread asks and stops decoding; AUD_Update goes on once it's back at the start.
+// at every loop of a streamed track (AudRead in the console perf log: wind, water and music
+// loops). Now the main thread asks and stops decoding; AUD_Update goes on once it's back at the start.
 enum { LOOP_NONE = 0, LOOP_REQUESTED, LOOP_DONE };
 
 // Compressed bytes left in the current window under which the main thread stops decoding for the frame while the
