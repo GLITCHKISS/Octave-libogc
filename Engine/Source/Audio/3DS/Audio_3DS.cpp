@@ -44,7 +44,8 @@ void AUD_Play(
     float pitch,
     bool loop,
     float startTime,
-    bool spatial)
+    bool spatial,
+    uint32_t maxFrames)
 {
     bool stereo = (soundWave->GetNumChannels() == 2);
     bool bit16 = (soundWave->GetBitsPerSample() == 16);
@@ -87,6 +88,14 @@ void AUD_Play(
     sWaveBufs[voiceIndex].data_vaddr = soundWave->GetWaveData();
     sWaveBufs[voiceIndex].nsamples = soundWave->GetNumSamples() / soundWave->GetNumChannels();
     sWaveBufs[voiceIndex].looping = loop;
+
+    // A scheduled stop within the sound's first pass: the buffer ends there, not looping. (One past a looping sound's
+    // first pass isn't done here: such a sound loops on, as without one.)
+    if (maxFrames != 0 && maxFrames <= sWaveBufs[voiceIndex].nsamples)
+    {
+        sWaveBufs[voiceIndex].nsamples = maxFrames;
+        sWaveBufs[voiceIndex].looping = false;
+    }
 
     ndspChnWaveBufAdd(voiceIndex, &sWaveBufs[voiceIndex]);
 #else

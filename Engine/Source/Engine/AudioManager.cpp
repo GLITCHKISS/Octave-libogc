@@ -175,7 +175,8 @@ void PlayAudio(
     AttenuationFunc attenFunc,
     int32_t audioClass,
     bool loop,
-    float startTime)
+    float startTime,
+    double stopAfter = 0.0)
 {
     OCT_ASSERT(sourceIndex < MAX_AUDIO_SOURCES);
     OCT_ASSERT(soundWave != nullptr);
@@ -208,6 +209,15 @@ void PlayAudio(
 
     bool spatial = sAudioSources[sourceIndex].IsSpatial();
 
+    // A scheduled stop: in the sound's own sample frames (its rate at pitch 1.0), to the nearest. (In double: a float's
+    // seconds are a frame out within a few minutes.)
+    uint32_t maxFrames = 0;
+    if (stopAfter > 0.0)
+    {
+        const double frames = stopAfter * double(soundWave->GetSampleRate()) + 0.5;
+        maxFrames = (frames >= 4294967295.0) ? 0xffffffffu : glm::max<uint32_t>(uint32_t(frames), 1u);
+    }
+
     AUD_Play(
         sourceIndex,
         soundWave,
@@ -215,7 +225,8 @@ void PlayAudio(
         pitch,
         loop,
         startTime,
-        spatial);
+        spatial,
+        maxFrames);
 }
 
 void StopAudio(uint32_t sourceIndex)
@@ -480,12 +491,13 @@ void AudioManager::PlaySound2D(
     float pitchMult,
     float startTime,
     bool loop,
-    int32_t priority)
+    int32_t priority,
+    double stopAfter)
 {
     MakeRoomForInstance(soundWave);
     uint32_t sourceIndex = FindAvailableAudioSourceIndex(priority);
 
-    if (soundWave != nullptr && 
+    if (soundWave != nullptr &&
         sourceIndex < MAX_AUDIO_SOURCES)
     {
         PlayAudio(
@@ -501,7 +513,8 @@ void AudioManager::PlaySound2D(
             AttenuationFunc::Count,
             soundWave->GetAudioClass(),
             loop,
-            startTime);
+            startTime,
+            stopAfter);
     }
 }
 
@@ -515,12 +528,13 @@ void AudioManager::PlaySound3D(
     float pitchMult,
     float startTime,
     bool loop,
-    int32_t priority)
+    int32_t priority,
+    double stopAfter)
 {
     MakeRoomForInstance(soundWave);
     uint32_t sourceIndex = FindAvailableAudioSourceIndex(priority);
 
-    if (soundWave != nullptr && 
+    if (soundWave != nullptr &&
         sourceIndex != MAX_AUDIO_SOURCES)
     {
         PlayAudio(
@@ -536,7 +550,8 @@ void AudioManager::PlaySound3D(
             attenFunc,
             soundWave->GetAudioClass(),
             loop,
-            startTime);
+            startTime,
+            stopAfter);
     }
 }
 

@@ -40,6 +40,68 @@ static inline int OvNoSeek(OggVorbis_File* vf) { (void)vf; return -1; }   // (a 
 
 static int32_t sSampleRates[AUDIO_MAX_VOICES] = {};
 
+// ---------------------------------------------------------------------------
+// Scheduled stops (AUD_Play's maxFrames)
+//
+// A stop from game code lands on libasnd's next mix: it mixes 1024 samples (~21 ms) at a time, so a stop on a beat let
+// up to a block of the next beat through (measured on hardware). With maxFrames the voice itself ends on that sample:
+// an ARAM voice's buffers end there (AramVoiceFill), a DSP-ADPCM voice's last pass does (ASND_SetVoiceAdpcmEx), a
+// sound in main memory's last buffer (MemVoiceCallback), a disc stream's PCM (StreamFill).
+// ---------------------------------------------------------------------------
+
+// The fallback for a loop too short for its passes to be queued a mix ahead (a DSP-ADPCM or main-memory voice's): it
+// loops as without a stop, and AUD_IsPlaying stops it once ASND has mixed that many of its frames -- at a mix's edge,
+// as a game timer's stop lands. 0: none.
+static uint32_t sCoarseStopFrames[AUDIO_MAX_VOICES] = {};
+static int32_t  sCoarseStopPitchHz[AUDIO_MAX_VOICES] = {};
+
+static void CoarseStopAt(uint32_t voice, uint32_t maxFrames, int32_t pitchHz)
+{
+    if (voice >= AUDIO_MAX_VOICES)
+        return;
+    sCoarseStopFrames[voice] = maxFrames;
+    sCoarseStopPitchHz[voice] = pitchHz;
+}
+
+static bool CoarseStopDue(uint32_t voice)
+{
+    if (voice >= AUDIO_MAX_VOICES || sCoarseStopFrames[voice] == 0)
+        return false;
+    // (ASND's count of the 48 kHz samples it has mixed the voice for, as its own frames at its pitch)
+    const uint64_t mixed = uint64_t(ASND_GetTickCounterVoice(int32_t(voice))) * uint32_t(glm::max(sCoarseStopPitchHz[voice], 1)) / 48000u;
+    return mixed >= sCoarseStopFrames[voice];
+}
+
+// A sound in main memory looping with a scheduled stop past its first pass (no ARAM for it, or no ARAM at all): each
+// pass the voice's next buffer, queued by MemVoiceCallback as libasnd takes the one before (the audio interrupt); the
+// last one cut at its byte. `left`: the bytes still to queue.
+struct MemVoice
+{
+    volatile bool active = false;
+    uint8_t* data = nullptr;
+    uint32_t size = 0;
+    uint32_t left = 0;
+};
+static MemVoice sMemVoices[AUDIO_MAX_VOICES];
+
+static void MemVoiceCallback(s32 voice)
+{
+    if (voice < 0 || voice >= AUDIO_MAX_VOICES)
+        return;
+    MemVoice& m = sMemVoices[voice];
+    if (!m.active || m.left == 0 || ASND_TestVoiceBufferReady(voice) != 1)
+        return;         // (nothing more, or the pass queued not taken yet: libasnd calls again)
+    const uint32_t n = glm::min(m.size, m.left);
+    if (ASND_AddVoice(voice, m.data, n) == SND_OK)
+        m.left -= n;
+}
+
+static void MemVoiceStop(uint32_t voice)
+{
+    if (voice < AUDIO_MAX_VOICES)
+        sMemVoices[voice].active = false;
+}
+
 #if PLATFORM_GAMECUBE
 // ---------------------------------------------------------------------------
 // DSP-ADPCM decoded on the CPU (GameCube: a sound cooked so, SoundWave's GameCube Codec)
@@ -246,6 +308,10 @@ struct StreamVoice
     int            bytesPerSample = 1;   // 1 = 8-bit unsigned, 2 = 16-bit LE
     bool           loop = false;
     bool           eof = false;
+    // A scheduled stop (AUD_Play's maxFrames): the PCM bytes still to decode, passes of a loop counted together; once
+    // they're out the stream ends there (StreamFill), its last buffer on that byte. Whoever decodes it owns it, as `eof`.
+    bool           limited = false;
+    uint32_t       limitLeft = 0;
     // A disc stream that is PCM already (SoundWave::GetDiscPcm, cooked uncompressed): copied from the disc window as it
     // is, no vf at all (vfOpen stays false: never opened, cleared or parked), its loop's start its first byte.
     bool           raw = false;
@@ -651,7 +717,7 @@ static bool StreamDeferLoop(StreamVoice* sv)
 }
 
 // Decode up to `want` bytes into dst. Returns bytes written (0 = ended, or a loop's start asked of the I/O thread).
-static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
+static uint32_t StreamFillAll(StreamVoice* sv, uint8_t* dst, uint32_t want)
 {
     uint32_t written = 0;
     int32_t errors = 0;
@@ -778,6 +844,23 @@ static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
         }
     }
     return written;
+}
+
+// StreamFillAll, and a scheduled stop's: no further than its bytes left, and once they're out the stream ends (eof).
+static uint32_t StreamFill(StreamVoice* sv, uint8_t* dst, uint32_t want)
+{
+    if (!sv->limited)
+        return StreamFillAll(sv, dst, want);
+    if (sv->limitLeft == 0)
+    {
+        sv->eof = true;
+        return 0;
+    }
+    const uint32_t n = StreamFillAll(sv, dst, glm::min(want, sv->limitLeft));
+    sv->limitLeft -= n;
+    if (sv->limitLeft == 0)
+        sv->eof = true;
+    return n;
 }
 
 // Near the end of the window with the next still being read: no decoding now (the I/O thread reads it while the main
@@ -1330,9 +1413,19 @@ struct AramVoice
     bool     loop = false;
     uint8_t* buf[2] = { nullptr, nullptr };
     int      next = 0;          // the buffer to fill next
+    // A scheduled stop (AUD_Play's maxFrames): the bytes still to hand to ASND, passes of a loop counted together. Its
+    // last buffer ends on that byte (a whole sample frame), padded with silence to 32 as any last piece.
+    bool     limited = false;
+    uint32_t left = 0;
 };
 
 static AramVoice sAramVoices[AUDIO_MAX_VOICES];
+
+// Nothing more to hand to ASND: played to its end (not looping), or to its scheduled stop.
+static bool AramVoiceDone(const AramVoice& v)
+{
+    return (v.limited && v.left == 0) || (!v.loop && v.pos >= v.size);
+}
 
 // A transfer between main memory and ARAM, a piece at a time with interrupts off. Main memory
 // and ARAM addresses 32-byte aligned; the length is rounded up to 32.
@@ -1469,12 +1562,21 @@ void AUD_GetAramStats(uint32_t& total, uint32_t& free, uint32_t& sounds)
 // ARAM read at any byte (AramDma's are 32-byte aligned at both ends): its 32-byte span into this, then the bytes
 // wanted out of it. (The audio interrupt's, and AramVoiceStartAt's with interrupts off: never two at once.)
 static uint8_t sAramScratch[kAramVoiceBuf + 64] __attribute__((aligned(32)));
+// Diagnostics (logged once a second by AUD_Update when any is nonzero): an ARAM voice found with nothing left to play
+// mid-sound (its refill came too late -- a stutter), a buffer ASND refused, the scratch above wanted by two at once.
+static volatile uint32_t sAramDry = 0, sAramRefusedAdd = 0, sAramScratchClash = 0;
+static volatile bool sAramScratchBusy = false;
+static bool VoiceDrained(uint32_t voice, uint8_t* const* bufs, int count);
 static void AramRead(uint8_t* dst, uint32_t aram, uint32_t len)
 {
+    if (sAramScratchBusy)
+        ++sAramScratchClash;
+    sAramScratchBusy = true;
     const uint32_t lo = aram & ~31u;
     const uint32_t skip = aram - lo;
     AramDma(AR_ARAMTOMRAM, sAramScratch, lo, skip + len);
     memcpy(dst, sAramScratch + skip, len);
+    sAramScratchBusy = false;
 }
 
 // A voice's next buffer filled from ARAM: its bytes, a multiple of 32 as libasnd wants (0: played out). Looping, always
@@ -1487,13 +1589,20 @@ static uint32_t AramVoiceFill(AramVoice& v, uint8_t* dst)
     bool copied = false;                    // (bytes written by the CPU: out of its cache before the DSP reads them)
     while (filled < kAramVoiceBuf)
     {
+        if (v.limited && v.left == 0)
+            break;                          // (its scheduled stop: the buffer ends on that byte)
         if (v.pos >= v.size)
         {
             if (!v.loop || v.size == 0)
                 break;
             v.pos = 0;
         }
-        const uint32_t n = glm::min(kAramVoiceBuf - filled, v.size - v.pos);
+        uint32_t n = glm::min(kAramVoiceBuf - filled, v.size - v.pos);
+        if (v.limited)
+        {
+            n = glm::min(n, v.left);
+            v.left -= n;
+        }
         const uint32_t at = v.aram + v.pos;
         if (filled == 0 && (at & 31u) == 0 && (n & 31u) == 0)
             AramDma(AR_ARAMTOMRAM, dst, at, n);     // (the usual case: straight in)
@@ -1519,7 +1628,7 @@ static uint32_t AramVoiceFill(AramVoice& v, uint8_t* dst)
 }
 
 // Reads the voice's next piece into its free buffer and queues it. Runs in the audio interrupt
-// (libasnd calls it while the voice has no buffer queued) and once from AramVoiceStart.
+// (libasnd calls it before each mix while the voice has no buffer queued).
 static void AramVoiceCallback(s32 voice)
 {
     if (voice < 0 || voice >= AUDIO_MAX_VOICES)
@@ -1527,20 +1636,26 @@ static void AramVoiceCallback(s32 voice)
     AramVoice& v = sAramVoices[voice];
     if (!v.active)
         return;
-    if (v.pos >= v.size && !v.loop)
-        return;         // played out: the voice runs dry and waits (AUD_IsPlaying is then false)
+    if (AramVoiceDone(v))
+        return;         // played out (or to its scheduled stop): the voice runs dry and waits (AUD_IsPlaying is then false)
+    if (VoiceDrained(uint32_t(voice), v.buf, 2))
+        ++sAramDry;     // (nothing of it left in ASND, more to come: the refill came too late)
 
     if (ASND_TestVoiceBufferReady(voice) != 1 || ASND_TestPointer(voice, v.buf[v.next]) == SND_BUSY)
         return;         // no room yet; libasnd calls again
 
-    const uint32_t pos0 = v.pos;
+    const uint32_t pos0 = v.pos, left0 = v.left;
     const uint32_t n = AramVoiceFill(v, v.buf[v.next]);
     if (n == 0)
         return;
     if (ASND_AddVoice(voice, v.buf[v.next], n) == SND_OK)
         v.next ^= 1;
     else
+    {
         v.pos = pos0;   // (refused: the same bytes again next time)
+        v.left = left0;
+        ++sAramRefusedAdd;
+    }
 }
 
 static void AramVoiceStop(uint32_t voice)
@@ -1550,36 +1665,43 @@ static void AramVoiceStop(uint32_t voice)
 }
 
 // A voice playing `size` bytes of PCM from ARAM at `aram`: a sound effect's (AramVoiceStart), or a streamed track's
-// copy (AramTrack).
+// copy (AramTrack). limitBytes: a scheduled stop, its bytes from the start (whole sample frames; 0: none).
 static void AramVoiceStartAt(uint32_t voice, uint32_t aram, uint32_t size, int32_t format, int32_t pitchHz, int32_t volL,
-                             int32_t volR, bool loop)
+                             int32_t volR, bool loop, uint32_t limitBytes = 0)
 {
     ASND_StopVoice(voice);
 
     AramVoice& v = sAramVoices[voice];
     v.active = false;
+
+    // The DSP may be mixing what this voice played before, reading its buffers as it goes: they're written only once
+    // it has given the voice back (stopped, it isn't sent again). At most one voice's mix (well under a millisecond);
+    // bounded all the same.
+    const uint64_t waitFromUs = SYS_GetTimeMicroseconds();
+    while (ASND_VoiceOnDsp(voice) && SYS_GetTimeMicroseconds() - waitFromUs < 3000) {}
+
     v.aram = aram;
     v.size = size;
     v.loop = loop;
+    v.limited = (limitBytes != 0);
+    v.left = limitBytes;
 
     v.pos = 0;
     const uint32_t n = AramVoiceFill(v, v.buf[0]);
     v.next = 1;
     v.active = true;
 
+    // The second buffer is queued by the first refill: libasnd calls AramVoiceCallback before each mix while the
+    // voice has nothing queued, so it's there before the voice's second mix, and buf[0] outlasts its first. (Queued
+    // here, it was refused: ASND_AddVoice turns a voice down till the DSP has taken its ASND_SetVoice.)
     ASND_SetVoice(voice, format, pitchHz, 0, v.buf[0], n, volL, volR, AramVoiceCallback);
-
-    // Queue the second buffer now, not when the first runs out. Interrupts off: the callback
-    // may also run from the audio interrupt.
-    uint32_t level;
-    _CPU_ISR_Disable(level);
-    AramVoiceCallback(voice);
-    _CPU_ISR_Restore(level);
 }
 
-static void AramVoiceStart(uint32_t voice, SoundWave* soundWave, int32_t format, int32_t pitchHz, int32_t volL, int32_t volR, bool loop)
+static void AramVoiceStart(uint32_t voice, SoundWave* soundWave, int32_t format, int32_t pitchHz, int32_t volL, int32_t volR, bool loop,
+                           uint32_t limitBytes)
 {
-    AramVoiceStartAt(voice, soundWave->GetAramAddress(), soundWave->GetWaveDataSize(), format, pitchHz, volL, volR, loop);
+    AramVoiceStartAt(voice, soundWave->GetAramAddress(), soundWave->GetWaveDataSize(), format, pitchHz, volL, volR, loop,
+                     limitBytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,9 +1718,10 @@ static bool sDspAdpcm = false;                      // the mixer with DSP-ADPCM 
 static uint32_t sAdpcmVoiceAram[AUDIO_MAX_VOICES];  // the ARAM a voice's DSP-ADPCM is playing from (0: none)
 
 // A voice playing a DSP-ADPCM sound from ARAM at `aram` (the channels' data one after the other, channelBytes each):
-// set going on the DSP, as a PCM one is (ASND_SetVoice). False: it couldn't be (the caller plays it otherwise).
+// set going on the DSP, as a PCM one is (ASND_SetVoice). maxFrames: a scheduled stop (0: none), ended by the voice on
+// that sample (ASND_SetVoiceAdpcmEx). False: it couldn't be (the caller plays it otherwise).
 static bool AdpcmVoiceStart(uint32_t voice, const SoundAdpcmInfo& a, uint32_t aram, int32_t pitchHz, int32_t volL,
-                            int32_t volR, bool loop)
+                            int32_t volR, bool loop, uint32_t maxFrames = 0)
 {
     if (!sDspAdpcm || aram == 0 || a.samples == 0 || a.channels < 1 || a.channels > 2 || voice >= AUDIO_MAX_VOICES)
         return false;
@@ -1618,8 +1741,16 @@ static bool AdpcmVoiceStart(uint32_t voice, const SoundAdpcmInfo& a, uint32_t ar
         ch[c].loop_yn2 = a.loopYn2[c];
         memcpy(ch[c].coefs, a.coefs[c], sizeof(ch[c].coefs));
     }
+    // A loop's pass too short for the voice to queue the next one a mix ahead (ASND_SetVoiceAdpcmEx: it has to outlast a
+    // mix; kept to 3 mixes at its pitch, room for the pitch to go up): it loops as without a stop, stopped from
+    // AUD_IsPlaying instead (CoarseStop: at a mix's edge, the ~21 ms a game timer's stop lands on).
+    if (maxFrames > a.samples && loop && uint64_t(a.samples) * 48000u < uint64_t(3u * 1024u) * uint32_t(glm::max(pitchHz, 1)))
+    {
+        CoarseStopAt(voice, maxFrames, pitchHz);
+        maxFrames = 0;
+    }
     sAdpcmVoiceAram[voice] = aram;
-    if (ASND_SetVoiceAdpcm(voice, a.channels, pitchHz, 0, ch, a.samples, 0, volL, volR, loop ? 1 : 0) != SND_OK)
+    if (ASND_SetVoiceAdpcmEx(voice, a.channels, pitchHz, 0, ch, a.samples, 0, volL, volR, loop ? 1 : 0, maxFrames) != SND_OK)
     {
         sAdpcmVoiceAram[voice] = 0;
         return false;
@@ -2537,6 +2668,19 @@ void AUD_Update()
         if (sPcmStreams[i].active)
             PcmFeed(sPcmStreams[i]);
     }
+
+#if PLATFORM_GAMECUBE
+    static uint64_t sAramLoggedUs = 0;
+    if ((sAramDry != 0 || sAramRefusedAdd != 0 || sAramScratchClash != 0) && nowUs - sAramLoggedUs >= 1000000)
+    {
+        LogWarning("AUDIO ARAM voices: ran dry %u time(s) (refill too late), %u buffer(s) refused, %u scratch clash(es)",
+                   unsigned(sAramDry), unsigned(sAramRefusedAdd), unsigned(sAramScratchClash));
+        sAramDry = 0;
+        sAramRefusedAdd = 0;
+        sAramScratchClash = 0;
+        sAramLoggedUs = nowUs;
+    }
+#endif
 }
 
 void AUD_Play(
@@ -2546,12 +2690,15 @@ void AUD_Play(
     float pitch,
     bool loop,
     float startTime,
-    bool spatial)
+    bool spatial,
+    uint32_t maxFrames)
 {
 #if PLATFORM_GAMECUBE
     AramVoiceStop(voiceIndex);      // whatever this voice played before
     AdpcmVoiceStop(voiceIndex);
 #endif
+    MemVoiceStop(voiceIndex);
+    CoarseStopAt(voiceIndex, 0, 0);
 
     //float startPercent = startTime / soundWave->GetDuration();
     //startPercent = glm::clamp(startPercent, 0.0f, 1.0f);
@@ -2576,6 +2723,14 @@ void AUD_Play(
         voiceFormat = bit16 ? VOICE_MONO_16BIT_LE : VOICE_MONO_8BIT_U;
     }
 
+    // A scheduled stop: maxFrames sample frames from its start, as bytes of the PCM it plays as (whole frames).
+    const uint32_t frameBytes = glm::max<uint32_t>(soundWave->GetNumChannels() * (bit16 ? 2u : 1u), 1u);
+    const uint32_t limitBytes = (maxFrames == 0) ? 0u :
+        uint32_t(glm::min<uint64_t>(uint64_t(maxFrames) * frameBytes, uint64_t(0xffffffffu / frameBytes) * frameBytes));
+    if (maxFrames != 0)
+        LogWarning("AUDIO %s: a scheduled stop after %u frames (%.4f s)%s", soundWave->GetName().c_str(), maxFrames,
+                   maxFrames / float(glm::max<uint32_t>(soundWave->GetSampleRate(), 1u)), loop ? ", looping" : "");
+
     // Streamed sound: decode-on-demand from the in-RAM compressed Vorbis rather
     // than playing a fully-decoded PCM buffer.
     const bool fromDisc = soundWave->GetStream() && soundWave->GetDiscSize() > 0;
@@ -2591,12 +2746,12 @@ void AUD_Play(
         if (track->onDsp)
         {
             if (!AdpcmVoiceStart(voiceIndex, track->adpcmInfo, track->aram, pitchHz,
-                                 spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop))
+                                 spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop, maxFrames))
                 LogError("SoundWave '%s': its DSP-ADPCM voice could not be set.", soundWave->GetName().c_str());
             return;
         }
         AramVoiceStartAt(voiceIndex, track->aram, track->pcmBytes, voiceFormat, pitchHz,
-                         spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop);
+                         spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop, limitBytes);
         return;
     }
 #endif
@@ -2712,6 +2867,8 @@ void AUD_Play(
         sv->bytesPerSample = bit16 ? 2 : 1;
         sv->loop = loop;
         sv->eof = false;
+        sv->limited = (limitBytes != 0);
+        sv->limitLeft = limitBytes;
         sv->nextBuf = 1;
         sv->pitchHz = pitchHz;
         sv->playEndUs = 0;
@@ -2773,7 +2930,7 @@ void AUD_Play(
     if (soundWave->GetAramAddress() != 0 && soundWave->IsAdpcm() && soundWave->GetAdpcmInfo().dsp)
     {
         if (!AdpcmVoiceStart(voiceIndex, soundWave->GetAdpcmInfo(), soundWave->GetAramAddress(), pitchHz,
-                             spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop))
+                             spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop, maxFrames))
         {
             LogError("SoundWave '%s': its DSP-ADPCM voice could not be set.", soundWave->GetName().c_str());
         }
@@ -2782,10 +2939,37 @@ void AUD_Play(
     if (soundWave->GetAramAddress() != 0)
     {
         AramVoiceStart(voiceIndex, soundWave, voiceFormat, pitchHz,
-                       spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop);
+                       spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, loop, limitBytes);
         return;
     }
 #endif
+
+    // In main memory with a scheduled stop. Within its first pass (or not looping): a voice of that many bytes, which ends
+    // by itself. Looping past it: each pass after the first queued as the voice's next buffer (MemVoiceCallback), the last
+    // cut at its byte -- unless a pass is too short to queue a mix ahead (it loops on, stopped at a mix's edge instead).
+    const uint32_t waveBytes = soundWave->GetWaveDataSize() - soundWave->GetWaveDataSize() % frameBytes;
+    if (limitBytes != 0 && (!loop || limitBytes <= waveBytes) && waveBytes > 0)
+    {
+        ASND_SetVoice(voiceIndex, voiceFormat, pitchHz, 0, soundWave->GetWaveData(), glm::min(limitBytes, waveBytes),
+                      spatial ? 0 : volumeInt, spatial ? 0 : volumeInt, nullptr);
+        return;
+    }
+    if (limitBytes != 0 && loop && waveBytes > 0 && voiceIndex < AUDIO_MAX_VOICES)
+    {
+        const uint64_t passFrames = waveBytes / frameBytes;
+        if (passFrames * 48000u >= uint64_t(3u * 1024u) * uint32_t(glm::max(pitchHz, 1)))
+        {
+            MemVoice& m = sMemVoices[voiceIndex];
+            m.data = soundWave->GetWaveData();
+            m.size = waveBytes;
+            m.left = limitBytes - waveBytes;
+            m.active = true;
+            ASND_SetVoice(voiceIndex, voiceFormat, pitchHz, 0, m.data, waveBytes, spatial ? 0 : volumeInt,
+                          spatial ? 0 : volumeInt, MemVoiceCallback);
+            return;
+        }
+        CoarseStopAt(voiceIndex, maxFrames, pitchHz);   // (then on as an endless loop, below)
+    }
 
     if (loop)
     {
@@ -2820,6 +3004,8 @@ void AUD_Stop(uint32_t voiceIndex)
     AramVoiceStop(voiceIndex);
     AdpcmVoiceStop(voiceIndex);
 #endif
+    MemVoiceStop(voiceIndex);
+    CoarseStopAt(voiceIndex, 0, 0);
     ASND_StopVoice(voiceIndex);
 
     if (voiceIndex < AUDIO_MAX_VOICES)
@@ -2852,12 +3038,20 @@ bool AUD_IsPlaying(uint32_t voiceIndex)
         // played once and then no more).
 #if PLATFORM_GAMECUBE
         AramVoice& av = sAramVoices[voiceIndex];
-        if (av.active && !av.loop && av.pos >= av.size && VoiceDrained(voiceIndex, av.buf, 2))
+        if (av.active && AramVoiceDone(av) && VoiceDrained(voiceIndex, av.buf, 2))
         {
             AUD_Stop(voiceIndex);
             return false;
         }
 #endif
+        // A sound in main memory's last pass played (a callback set: libasnd never ends the voice itself), or a scheduled
+        // stop that's the main thread's (CoarseStopDue).
+        MemVoice& mv = sMemVoices[voiceIndex];
+        if ((mv.active && mv.left == 0 && VoiceDrained(voiceIndex, &mv.data, 1)) || CoarseStopDue(voiceIndex))
+        {
+            AUD_Stop(voiceIndex);
+            return false;
+        }
         StreamVoice* sv = VoiceStream(voiceIndex);
         if (sv->active && (sv->openState == OPEN_REQUESTED || sv->openState == OPEN_DONE))
             return true;   // (still being opened by the I/O thread: playing, as far as anyone asks)
@@ -2889,7 +3083,10 @@ void AUD_SetPitch(uint32_t voiceIndex, float pitch)
     int32_t pitchHz = int32_t(pitch * sSampleRates[voiceIndex]);
     ASND_ChangePitchVoice(voiceIndex, pitchHz);
     if (voiceIndex < AUDIO_MAX_VOICES)
+    {
         VoiceStream(voiceIndex)->pitchHz = pitchHz;   // (a stream's reckoning of what ASND has left: StreamQueued)
+        sCoarseStopPitchHz[voiceIndex] = pitchHz;     // (and a coarse stop's of what it has mixed)
+    }
 }
 
 uint8_t* AUD_AllocWaveBuffer(uint32_t size)

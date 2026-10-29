@@ -25,10 +25,12 @@ int Audio_Lua::PlaySound2D(lua_State* L)
     if (!lua_isnone(L, 4)) { startTime = CHECK_NUMBER(L, 4); }
     if (!lua_isnone(L, 5)) { loop = CHECK_BOOLEAN(L, 5); }
     if (!lua_isnone(L, 6)) { priority = (int32_t) CHECK_INTEGER(L, 6); }
+    double stopAfter = 0.0;     // (a scheduled stop, in seconds of the sound: 0 or nil, none)
+    if (!lua_isnoneornil(L, 7)) { stopAfter = CHECK_NUMBER(L, 7); }
 
     if (soundWave != nullptr)
     {
-        AudioManager::PlaySound2D(soundWave, volume, pitch, startTime, loop, priority);
+        AudioManager::PlaySound2D(soundWave, volume, pitch, startTime, loop, priority, stopAfter);
     }
 
     return 0;
@@ -52,6 +54,8 @@ int Audio_Lua::PlaySound3D(lua_State* L)
     if (!lua_isnone(L, 8)) { startTime = CHECK_NUMBER(L, 8); }
     if (!lua_isnone(L, 9)) { loop = CHECK_BOOLEAN(L, 9); }
     if (!lua_isnone(L, 10)) { priority = (int32_t)CHECK_INTEGER(L, 10); }
+    double stopAfter = 0.0;     // (a scheduled stop, in seconds of the sound: 0 or nil, none)
+    if (!lua_isnoneornil(L, 11)) { stopAfter = CHECK_NUMBER(L, 11); }
 
     if (soundWave != nullptr)
     {
@@ -65,7 +69,8 @@ int Audio_Lua::PlaySound3D(lua_State* L)
             pitch,
             startTime,
             loop,
-            priority);
+            priority,
+            stopAfter);
     }
 
     return 0;

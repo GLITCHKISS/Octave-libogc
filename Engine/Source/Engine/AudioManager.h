@@ -13,13 +13,18 @@ public:
     static void Shutdown();
     static void Update(float deltaTime);
 
+    // stopAfter (seconds, 0: none): a scheduled stop. The sound ends by itself once it has played that much of its own
+    // audio from where it started: stopAfter * its sample rate sample frames (the same frames at any pitch, so at another
+    // pitch a different time). Looping, it loops till then. It ends on that very sample, which a stop from game code
+    // can't do: that lands on the platform's next mix (GameCube: ~21 ms blocks). Then IsSoundPlaying is false.
     static void PlaySound2D(
         SoundWave* soundWave,
         float volumeMult = 1.0f,
         float pitchMult = 1.0f,
         float startTime = 0.0f,
         bool loop = false,
-        int32_t priority = 0);
+        int32_t priority = 0,
+        double stopAfter = 0.0);
 
     static void PlaySound3D(
         SoundWave* soundWave,
@@ -31,7 +36,8 @@ public:
         float pitchMult = 1.0f,
         float startTime = 0.0f,
         bool loop = false,
-        int32_t priority = 0);
+        int32_t priority = 0,
+        double stopAfter = 0.0);
 
     // A playing sound's volume and pitch; its priority too if one is given (>= 0), else it keeps
     // the one it was played with.

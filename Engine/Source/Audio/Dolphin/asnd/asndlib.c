@@ -137,6 +137,31 @@ typedef struct
 
 static u32 adpcm_ucode = 0;   // the microcode uploaded has DSP-ADPCM voices (ASND_InitEx)
 static t_adpcm_voice adpcm_voice[MAX_SND_VOICES];
+
+/* Octave: a DSP-ADPCM voice's scheduled end (ASND_SetVoiceAdpcmEx's stop_frames), past its first pass of a loop: the
+   voice doesn't loop (no VOICE_SETLOOP), each pass of the loop is its second buffer in turn, and the last one ends on the
+   sample. The microcode's change of buffer goes on into the second buffer (the loop's accelerator state, as a loop's)
+   and clears it; the pass after it is queued here as the voice comes back from that mix (adpcm_queue_pass), so the
+   DSP has it a whole mix before it's needed. `passes`: the passes still to queue after the one queued; the last ends
+   at last_end. (A pass shorter than a mix would end the voice early: ASND_SetVoiceAdpcmEx's caller keeps them longer.) */
+typedef struct
+{
+	u32 passes;
+	u32 loop_start, loop_end, last_end;
+} t_adpcm_stop;
+static t_adpcm_stop adpcm_stop[MAX_SND_VOICES];
+
+/* The next pass queued once the DSP has taken the one before (its second buffer cleared at the change of buffer).
+   In the DSP request interrupt, the voice just back from its mix: nothing else touches it till it's sent again. */
+static void adpcm_queue_pass(s32 v)
+{
+	t_sound_data *s = &sound_data[v];
+	if(!(s->flags>>16) || !(s->flags & VOICE_ADPCM)) { adpcm_stop[v].passes=0; return; }   // (ended, or set anew)
+	if(s->start_addr2 || !s->start_addr) return;   // (the pass queued not taken yet; or played out)
+	s->start_addr2 = adpcm_stop[v].loop_start;
+	s->end_addr2 = (adpcm_stop[v].passes==1) ? adpcm_stop[v].last_end : adpcm_stop[v].loop_end;
+	adpcm_stop[v].passes--;
+}
 static t_adpcm_voice adpcm_voice_dma ATTRIBUTE_ALIGN(32);
 static s16 mute_buf[SND_BUFFERSIZE] ATTRIBUTE_ALIGN(32);
 static s16 audio_buf[2][SND_BUFFERSIZE] ATTRIBUTE_ALIGN(32);
@@ -190,6 +215,12 @@ static void __dsp_requestcallback(dsptask_t *task)
 		//sound_data[snd_chan].out_buf= (void *) MEM_VIRTUAL_TO_PHYSICAL((void *) audio_buf[curr_audio_buf]);
 		sound_data_dma=sound_data[snd_chan];
 	}
+	else if(!(sound_data[snd_chan].flags>>16))
+	{
+		/* Octave: stopped (ASND_StopVoice) while the DSP mixed it, or idle: the DSP's copy back is dropped. Taken, it
+		   brought back the stopped voice's buffer addresses (ASND_TestPointer then found them busy) and, for voice 0
+		   (sent every mix), had the DSP read them again. */
+	}
 	else
 	{
 
@@ -238,7 +269,10 @@ static void __dsp_requestcallback(dsptask_t *task)
 		if(!sound_data[snd_chan].cb && (!sound_data_dma.start_addr && !sound_data_dma.start_addr2)) sound_data[snd_chan].flags=0;
 		sound_data_dma.flags=sound_data[snd_chan].flags & ~(VOICE_UPDATE | VOICE_VOLUPDATE | VOICE_UPDATEADD);
 		sound_data[snd_chan]=sound_data_dma;
-		if(adpcm_ucode && (sound_data_dma.flags & VOICE_ADPCM)) adpcm_voice[snd_chan]=adpcm_voice_dma;   // Octave
+		if(adpcm_ucode && (sound_data_dma.flags & VOICE_ADPCM)) {   // Octave
+			adpcm_voice[snd_chan]=adpcm_voice_dma;
+			if(adpcm_stop[snd_chan].passes) adpcm_queue_pass(snd_chan);   // (a scheduled end's next pass)
+		}
 	}
 
 	if(sound_data[snd_chan].flags>>16)
@@ -260,6 +294,14 @@ static void __dsp_requestcallback(dsptask_t *task)
 		while(DSP_CheckMailTo());
 		return;
 	}
+
+	/* Octave: a voice set (VOICE_UPDATE) is taken by the DSP here, as it is sent: the flag is cleared now. Before, it
+	   was cleared only by the look-ahead below, one voice ahead, for the voice it found next; a voice set after that
+	   look-ahead had passed it (set while the DSP mixed the voice before it, or found idle by it) went to the DSP with
+	   the flag still on, and when it came back the flag said "set again while on the DSP": its first mix was thrown
+	   away and the voice sent from its start once more -- its first 1024 samples played twice. */
+	if(sound_data[snd_chan].flags & VOICE_UPDATE)
+		sound_data[snd_chan].flags &=~(VOICE_UPDATE | VOICE_VOLUPDATE | VOICE_PAUSE | VOICE_UPDATEADD);
 
 	sound_data_dma=sound_data[snd_chan];
 
@@ -430,6 +472,7 @@ void ASND_InitEx(s32 adpcm)
 
 		adpcm_ucode = adpcm ? 1 : 0;   // Octave
 		memset(adpcm_voice, 0, sizeof(adpcm_voice));
+		memset(adpcm_stop, 0, sizeof(adpcm_stop));
 
 		dsp_task.prio = 255;
 		if(adpcm_ucode) {   // Octave
@@ -551,7 +594,14 @@ s32 ASND_HasAdpcm(void)
 s32 ASND_SetVoiceAdpcm(s32 voice, s32 channels, s32 pitch, s32 delay, const ASND_AdpcmChannel *ch, u32 frames,
 	u32 loop_frame, s32 volume_l, s32 volume_r, s32 loop)
 {
+	return ASND_SetVoiceAdpcmEx(voice, channels, pitch, delay, ch, frames, loop_frame, volume_l, volume_r, loop, 0);
+}
+
+s32 ASND_SetVoiceAdpcmEx(s32 voice, s32 channels, s32 pitch, s32 delay, const ASND_AdpcmChannel *ch, u32 frames,
+	u32 loop_frame, s32 volume_l, s32 volume_r, s32 loop, u32 stop_frames)
+{
 	u32 level, c, step, start;
+	u32 end1, start2, end2, passes, last;
 	t_adpcm_voice v;
 
 	if(!adpcm_ucode) return SND_INVALID; // no microcode for it
@@ -587,6 +637,30 @@ s32 ASND_SetVoiceAdpcm(s32 voice, s32 channels, s32 pitch, s32 delay, const ASND
 
 	start = ADPCM_VIRTUAL_BASE;
 
+	// The buffers (addresses as its 16-bit PCM's would be): the first pass, and the loop's if it loops. A scheduled
+	// end (stop_frames): within the first pass, or not looping, the first buffer ends there; past it, no VOICE_SETLOOP,
+	// the second buffer the next pass (the last one cut at its sample) and the rest queued as each is taken
+	// (adpcm_stop, adpcm_queue_pass).
+	end1 = start+frames*step;
+	start2 = loop ? start+loop_frame*step : 0;
+	end2 = loop ? start+frames*step : 0;
+	passes = 0;
+	last = 0;
+	if(stop_frames) {
+		if(!loop || stop_frames<=frames) {
+			if(stop_frames<frames) end1 = start+stop_frames*step;
+			start2 = end2 = 0;
+			loop = 0;
+		} else {
+			const u32 pass = frames-loop_frame;          // (a loop's frames: from loop_frame to the end)
+			const u32 rest = stop_frames-frames;         // (after the first pass)
+			passes = (rest-1)/pass;                      // (whole passes before the last one)
+			last = rest-passes*pass;                     // (the last one's frames: 1..pass)
+			if(passes==0) end2 = start2+last*step;
+			loop = 0;                                    // (no VOICE_SETLOOP: each pass a buffer of its own)
+		}
+	}
+
 	_CPU_ISR_Disable(level);
 
 	sound_data[voice].left=0;
@@ -601,15 +675,15 @@ s32 ASND_SetVoiceAdpcm(s32 voice, s32 channels, s32 pitch, s32 delay, const ASND
 	sound_data[voice].volume_r= volume_r;
 
 	sound_data[voice].backup_addr=sound_data[voice].start_addr=start;
-	sound_data[voice].end_addr=start+frames*step;
+	sound_data[voice].end_addr=end1;
 
-	if(loop) {
-		sound_data[voice].start_addr2=start+loop_frame*step;
-		sound_data[voice].end_addr2=start+frames*step;
-	} else {
-		sound_data[voice].start_addr2=0;
-		sound_data[voice].end_addr2=0;
-	}
+	sound_data[voice].start_addr2=start2;
+	sound_data[voice].end_addr2=end2;
+
+	adpcm_stop[voice].passes=passes;
+	adpcm_stop[voice].loop_start=start2;
+	adpcm_stop[voice].loop_end=start+frames*step;
+	adpcm_stop[voice].last_end=start2+last*step;
 
 	sound_data[voice].volume2_l= volume_l;
 	sound_data[voice].volume2_r= volume_r;
@@ -837,6 +911,23 @@ u32 ASND_GetTimerVoice(s32 voice)
 	if(voice<0 || voice>=MAX_SND_VOICES) return 0; // invalid voice
 
 	return (sound_data[voice].tick_counter * SND_BUFFERSIZE/4)/48;
+}
+
+/*------------------------------------------------------------------------------------------------------------------------------------------------------*/
+
+// Octave: whether the DSP has the voice right now (sent for this mix and not back yet). Its buffers may be being read.
+s32 ASND_VoiceOnDsp(s32 voice)
+{
+	u32 level;
+	s32 ret;
+
+	if(voice<0 || voice>=MAX_SND_VOICES) return 0;
+
+	_CPU_ISR_Disable(level);
+	ret = (!dsp_complete && !DSP_DI_HANDLER && snd_chan==voice) ? 1 : 0;
+	_CPU_ISR_Restore(level);
+
+	return ret;
 }
 
 /*------------------------------------------------------------------------------------------------------------------------------------------------------*/

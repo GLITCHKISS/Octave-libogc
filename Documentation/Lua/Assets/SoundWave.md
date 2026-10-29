@@ -30,6 +30,9 @@ the sound's PCM (or Vorbis): the property does nothing there.
 - By script: `Tools/octkit.py`'s `set_sound_gc_codec(path, 'adpcm')` sets it in a source `.oct`: the byte after Max
   Instances, at 38 + the name's length (asset version 20; an older asset gains the byte).
 
+- A scheduled stop (`Audio.PlaySound2D`'s `stopAfter`) works on every GameCube voice: a DSP-ADPCM sound's ends on the
+  sample whether the CPU or the DSP decodes it.
+
 ---
 ### GetVolumeMultiplier
 Get the volume multiplier.

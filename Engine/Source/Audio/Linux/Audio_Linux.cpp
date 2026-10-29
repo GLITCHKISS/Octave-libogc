@@ -29,6 +29,8 @@ struct SoundVoice
     uint32_t mBytesPerSample = 2;
     bool mLoop = false;
     bool mActive = false;
+    uint32_t mMaxFrames = 0;    // a scheduled stop: the voice ends at this many source frames played (0: none)
+    double mPlayed = 0.0;       // source frames played since it started (loops not wrapped)
 };
 
 static SoundVoice sVoices[AUDIO_MAX_VOICES];
@@ -149,6 +151,12 @@ void AUD_Update()
                     int16_t srcSampleL[2] = { 0, 0 };
                     int16_t srcSampleR[2] = { 0, 0 };
 
+                    // A scheduled stop: nothing from its frame on (each of the two frames, by how far it is played).
+                    const double playedHere = voice.mPlayed + double(dstFrame) * srcDeltaFrame;
+                    if (voice.mMaxFrames != 0 && playedHere >= double(voice.mMaxFrames))
+                        break;
+                    const bool lastFrame = (voice.mMaxFrames != 0 && playedHere + 1.0 >= double(voice.mMaxFrames));
+
                     if (voice.mLoop)
                     {
                         if (srcFrames[0] >= int32_t(voice.mSrcFrames))
@@ -162,7 +170,7 @@ void AUD_Update()
                     {
                         int32_t frameIndex = srcFrames[f];
 
-                        if (frameIndex >= int32_t(voice.mSrcFrames))
+                        if (frameIndex >= int32_t(voice.mSrcFrames) || (f == 1 && lastFrame))
                         {
                             srcSampleL[f] = 0;
                             srcSampleR[f] = 0;
@@ -222,10 +230,17 @@ void AUD_Update()
                 // otherwise let the curFrame exceed the *voice.mSrcFrames* count so we can determine that it is finished playing.
 
                 voice.mCurFrame += (frames * srcDeltaFrame);
+                voice.mPlayed += double(frames) * srcDeltaFrame;
 
                 if (voice.mLoop)
                 {
                     voice.mCurFrame = fmod(voice.mCurFrame, (float) voice.mSrcFrames);
+                }
+
+                if (voice.mMaxFrames != 0 && voice.mPlayed >= double(voice.mMaxFrames))
+                {
+                    voice.mLoop = false;                        // its scheduled stop: played out (AUD_IsPlaying)
+                    voice.mCurFrame = float(voice.mSrcFrames);
                 }
             }
         }
@@ -253,9 +268,13 @@ void AUD_Play(
     float pitch,
     bool loop,
     float startTime,
-    bool spatial)
+    bool spatial,
+    uint32_t maxFrames)
 {
     OCT_ASSERT(!sVoices[voiceIndex].mActive);
+
+    sVoices[voiceIndex].mMaxFrames = maxFrames;
+    sVoices[voiceIndex].mPlayed = 0.0;
 
     sVoices[voiceIndex].mActive = true;
     sVoices[voiceIndex].mBytesPerSample = soundWave->GetBitsPerSample() / 8;

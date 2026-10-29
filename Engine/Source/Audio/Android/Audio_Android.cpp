@@ -27,6 +27,22 @@ static SLPitchItf sPitches[AUDIO_MAX_VOICES] = { 0 };
 static bool sLoop[AUDIO_MAX_VOICES] = { };
 static void* sSoundData[AUDIO_MAX_VOICES] = { };
 static uint32_t sSoundSizes[AUDIO_MAX_VOICES] = { };
+// A scheduled stop (AUD_Play's maxFrames): the bytes still to enqueue, passes counted together; the last pass enqueued
+// cut at its frame.
+static bool sLimited[AUDIO_MAX_VOICES] = { };
+static uint32_t sBytesLeft[AUDIO_MAX_VOICES] = { };
+
+// The next pass's bytes (all of the sound, or what's left of a scheduled stop's), taken off what's left.
+static uint32_t NextPassBytes(int32_t index)
+{
+    uint32_t n = sSoundSizes[index];
+    if (sLimited[index])
+    {
+        n = glm::min(n, sBytesLeft[index]);
+        sBytesLeft[index] -= n;
+    }
+    return n;
+}
 
 
 static void QueueCallback(SLBufferQueueItf caller, void *pContext)
@@ -35,14 +51,14 @@ static void QueueCallback(SLBufferQueueItf caller, void *pContext)
 
     if (index >= 0 && index < AUDIO_MAX_VOICES)
     {
-        if (sLoop[index])
+        if (sLoop[index] && (!sLimited[index] || sBytesLeft[index] > 0))
         {
             // Resubmit the same sound buffer
             (*(sBufferQueues[index]))->Clear(sBufferQueues[index]);
 
             (*(sBufferQueues[index]))->Enqueue(sBufferQueues[index],
                 sSoundData[index],
-                sSoundSizes[index]);
+                NextPassBytes(index));
         }
     }
     else
@@ -300,7 +316,8 @@ void AUD_Play(
     float pitch,
     bool loop,
     float startTime,
-    bool spatial)
+    bool spatial,
+    uint32_t maxFrames)
 {
     SLresult result;
     SLuint32 playerState;
@@ -328,11 +345,14 @@ void AUD_Play(
         sLoop[voiceIndex] = loop;
         sSoundData[voiceIndex] = soundWave->GetWaveData();
         sSoundSizes[voiceIndex] = soundWave->GetWaveDataSize();
+        const uint32_t frameBytes = glm::max<uint32_t>(soundWave->GetNumChannels() * (soundWave->GetBitsPerSample() / 8), 1u);
+        sLimited[voiceIndex] = (maxFrames != 0);
+        sBytesLeft[voiceIndex] = uint32_t(glm::min<uint64_t>(uint64_t(maxFrames) * frameBytes, 0xffffffffu));
 
         // Add the new sound buffer to queue
         result = (*(sBufferQueues[voiceIndex]))->Enqueue(sBufferQueues[voiceIndex],
             soundWave->GetWaveData(),
-            soundWave->GetWaveDataSize());
+            NextPassBytes(voiceIndex));
 
         if (result != SL_RESULT_SUCCESS)
         {
@@ -352,6 +372,8 @@ void AUD_Stop(uint32_t voiceIndex)
     sLoop[voiceIndex] = false;
     sSoundData[voiceIndex] = nullptr;
     sSoundSizes[voiceIndex] = 0;
+    sLimited[voiceIndex] = false;
+    sBytesLeft[voiceIndex] = 0;
 
     if (result != SL_RESULT_SUCCESS)
     {

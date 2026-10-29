@@ -410,6 +410,19 @@ s32 ASND_HasAdpcm(void);
 s32 ASND_SetVoiceAdpcm(s32 voice, s32 channels, s32 pitch, s32 delay, const ASND_AdpcmChannel *ch, u32 frames,
 	u32 loop_frame, s32 volume_l, s32 volume_r, s32 loop);
 
+/* The same, with a scheduled end (stop_frames != 0): the voice ends by itself on its stop_frames'th sample (each
+   channel's) from its start, its passes of the loop counted together -- not at a mix's edge, as ASND_StopVoice from
+   the CPU does. Within its first pass, or not looping, its buffer just ends there. Past it, each pass after the first
+   is the voice's second buffer, the next queued in the DSP's request interrupt as each is taken: a pass of the loop
+   has to last more than a mix (1024 samples at 48 kHz, so 1024 * pitch / 48000 of its samples), or the voice ends early.
+   0: as ASND_SetVoiceAdpcm. Then, ended, it's unused (ASND_StatusVoice), as a voice that played out. */
+s32 ASND_SetVoiceAdpcmEx(s32 voice, s32 channels, s32 pitch, s32 delay, const ASND_AdpcmChannel *ch, u32 frames,
+	u32 loop_frame, s32 volume_l, s32 volume_r, s32 loop, u32 stop_frames);
+
+/* 1 while the DSP has the voice: sent for the mix running and not back yet (its buffers may be being read). A voice
+   stopped (ASND_StopVoice) is never sent again, so once this is 0 its buffers can be written. */
+s32 ASND_VoiceOnDsp(s32 voice);
+
 #ifdef __cplusplus
   }
 #endif

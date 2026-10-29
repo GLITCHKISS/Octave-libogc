@@ -17,6 +17,9 @@ void AUD_Initialize();
 void AUD_Shutdown();
 void AUD_Update();
 
+// maxFrames: a scheduled stop (0: none). The voice ends by itself once it has played that many of the sound's sample
+// frames from where it started (looping, its passes counted together), on that very sample: not when game code stops
+// it, which only lands on the platform's next mix. AUD_IsPlaying is false from then on.
 void AUD_Play(
     uint32_t voiceIndex,
     SoundWave* soundWave,
@@ -24,7 +27,8 @@ void AUD_Play(
     float pitch,
     bool loop,
     float startTime,
-    bool spatial);
+    bool spatial,
+    uint32_t maxFrames = 0);
 
 void AUD_Stop(uint32_t voiceIndex);
 bool AUD_IsPlaying(uint32_t voiceIndex);

@@ -366,6 +366,17 @@ breaks). It needs DSP LLE, as libasnd games want anyway. `DspAdpcm=0` (the
 default) uploads libogc's stock mixer, byte for byte, and decodes the same
 sounds on the CPU.
 
+**Do** stop music on a beat with a scheduled duration, not a game timer: a
+game-timer stop lands on libasnd's ~21 ms mix blocks. `Audio.PlaySound2D(sound,
+volume, pitch, 0, true, 0, seconds)` (the last argument, `stopAfter`) has the
+voice itself end on that sample, looping till then. Measured on hardware, a
+looping track stopped from a 10.07 s Lua timer at the end of a bar had mixed
+10.069 s of itself, and sometimes the next beat's first ~20 ms got through.
+With the duration, Dolphin's dump ends on the bar's last sample on every voice
+path (ARAM PCM, DSP-ADPCM, disc streams). A loop shorter than about three mix
+blocks at its pitch (~64 ms at pitch 1) on a DSP-ADPCM or main-memory voice
+can't queue its passes ahead: it's stopped at a block's edge instead.
+
 **Don't** hand libasnd a buffer whose size isn't a multiple of 32 bytes, nor
 a short odd piece at a loop's end: the loop seam hitched. Fill a looping
 voice's buffers whole, the track's end then its start in the same buffer.
@@ -618,8 +629,9 @@ addresses that only that build can name.
 `deltaTime` makes a game's outcome depend on frame times: a hitch is one long
 step, and a body can tunnel through a wall or rubber-band back. With a fixed
 rate, scripts, nodes, timers and physics always get 1/60, as many ticks a frame
-as the time passed calls for (vsync jitter snapped, at most 4 a frame, a press
-seen by a frame's first tick only): the same inputs give the same game. On
+as the time passed calls for (a tick 2 ms early allowed for vsync jitter, the
+time itself never rounded, at most 4 a frame, a press seen by a frame's first
+tick only): the same inputs give the same game. On
 hardware at 60 it ran one tick a frame, as before.
 
 - A `Widget` subclass must override `GetDrawData`, or its `Render` never runs.

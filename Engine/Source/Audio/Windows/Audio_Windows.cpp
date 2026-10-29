@@ -19,6 +19,61 @@ static IXAudio2SourceVoice* sSourceVoices[AUDIO_MAX_VOICES] = { };
 static XAUDIO2_BUFFER sSourceBuffers[AUDIO_MAX_VOICES] = { };
 static uint8_t* sStereoConvertedBuffers[AUDIO_MAX_VOICES] = { };
 
+// A looping voice with a scheduled stop (AUD_Play's maxFrames): its passes of the whole sound still to submit, in buffers
+// that each play it up to 255 times (LoopCount 254), then the last pass's frames (its tail, a buffer of its own that
+// ends the stream). Submitted a few buffers at a time (SubmitLimitedPasses, again from AUD_Update): XAudio2 queues 64
+// at most, and a short sound looped a long time needs more.
+struct LimitedLoop
+{
+    uint32_t fullPasses = 0;
+    uint32_t tailFrames = 0;
+    bool     pending = false;
+};
+static LimitedLoop sLimitedLoops[AUDIO_MAX_VOICES] = { };
+static const uint32_t kLimitedQueue = 16;
+
+static void SubmitLimitedPasses(uint32_t voiceIndex)
+{
+    LimitedLoop& l = sLimitedLoops[voiceIndex];
+    IXAudio2SourceVoice* voice = sSourceVoices[voiceIndex];
+    if (!l.pending || voice == nullptr)
+        return;
+
+    XAUDIO2_VOICE_STATE state;
+    voice->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    uint32_t queued = state.BuffersQueued;
+    while (l.pending && queued < kLimitedQueue)
+    {
+        XAUDIO2_BUFFER b = sSourceBuffers[voiceIndex];   // (the sound's data, as the first buffer has it)
+        b.PlayBegin = 0;
+        b.LoopBegin = 0;
+        b.LoopLength = 0;
+        if (l.fullPasses > 0)
+        {
+            const uint32_t plays = glm::min<uint32_t>(l.fullPasses, XAUDIO2_MAX_LOOP_COUNT + 1);
+            b.PlayLength = 0;                            // (the whole sound)
+            b.LoopCount = plays - 1;
+            l.fullPasses -= plays;
+            b.Flags = (l.fullPasses == 0 && l.tailFrames == 0) ? XAUDIO2_END_OF_STREAM : 0;
+        }
+        else
+        {
+            b.PlayLength = l.tailFrames;                 // (the last pass: ends on its frame)
+            b.LoopCount = 0;
+            b.Flags = XAUDIO2_END_OF_STREAM;
+            l.tailFrames = 0;
+        }
+        l.pending = (l.fullPasses > 0 || l.tailFrames > 0);
+        if (voice->SubmitSourceBuffer(&b) < 0)
+        {
+            LogError("XAudio2: a scheduled stop's buffer was refused; the sound ends early");
+            l = LimitedLoop();
+            break;
+        }
+        ++queued;
+    }
+}
+
 // Push-PCM streams (AUD_OpenStream). Each submitted chunk is a heap copy that
 // XAudio2 references until it has played; OnBufferEnd (on the XAudio2 thread)
 // hands it back so the main thread can free it.
@@ -130,6 +185,11 @@ void AUD_Shutdown()
 
 void AUD_Update()
 {
+    for (uint32_t v = 0; v < AUDIO_MAX_VOICES; ++v)
+    {
+        SubmitLimitedPasses(v);   // (a looping voice with a scheduled stop: its passes kept queued)
+    }
+
     for (uint32_t i = 0; i < AUD_MAX_PCM_STREAMS; ++i)
     {
         if (sPcmStreams[i].mVoice != nullptr)
@@ -146,7 +206,8 @@ void AUD_Play(
     float pitch,
     bool loop,
     float startTime,
-    bool spatial)
+    bool spatial,
+    uint32_t maxFrames)
 {
     OCT_ASSERT(sSourceVoices[voiceIndex] == nullptr);
 
@@ -185,6 +246,30 @@ void AUD_Play(
     sSourceBuffers[voiceIndex].LoopLength = 0;
     sSourceBuffers[voiceIndex].LoopCount = loop ? XAUDIO2_LOOP_INFINITE : 0;
 
+    // A scheduled stop: the voice ends on that frame. Within the first pass (or not looping): this buffer's PlayLength.
+    // Looping past it: this buffer plays the first pass only, and the passes after it follow in buffers of their own
+    // (SubmitLimitedPasses), gapless, the last one cut at its frame.
+    sLimitedLoops[voiceIndex] = LimitedLoop();
+    // (In sample frames, as PlayBegin and PlayLength are: GetNumSamples counts each channel's samples.)
+    const uint32_t numFrames = soundWave->GetWaveDataSize() / glm::max<uint32_t>(soundWave->GetBlockAlign(), 1u);
+    if (maxFrames != 0 && numFrames > startingSample)
+    {
+        const uint32_t firstPass = numFrames - startingSample;
+        sSourceBuffers[voiceIndex].LoopCount = 0;
+        if (!loop || maxFrames <= firstPass)
+        {
+            sSourceBuffers[voiceIndex].PlayLength = glm::min(maxFrames, firstPass);
+        }
+        else
+        {
+            sSourceBuffers[voiceIndex].Flags = 0;   // (more follows)
+            const uint32_t rest = maxFrames - firstPass;
+            sLimitedLoops[voiceIndex].fullPasses = rest / numFrames;
+            sLimitedLoops[voiceIndex].tailFrames = rest % numFrames;
+            sLimitedLoops[voiceIndex].pending = true;
+        }
+    }
+
     WAVEFORMATEX waveFormat = {};
     waveFormat.wFormatTag = WAVE_FORMAT_PCM;
     waveFormat.nChannels = soundWave->GetNumChannels();
@@ -207,6 +292,7 @@ void AUD_Play(
     if (sXAudio2->CreateSourceVoice(&sSourceVoices[voiceIndex], &waveFormat) >= 0)
     {
         sSourceVoices[voiceIndex]->SubmitSourceBuffer(&sSourceBuffers[voiceIndex]);
+        SubmitLimitedPasses(voiceIndex);
 
         // Spatial sounds will update their volume every frame.
         sSourceVoices[voiceIndex]->SetVolume(spatial ? 0.0f : volume);
@@ -227,6 +313,7 @@ void AUD_Stop(uint32_t voiceIndex)
     sSourceVoices[voiceIndex]->Stop();
     sSourceVoices[voiceIndex]->DestroyVoice();
     sSourceVoices[voiceIndex] = nullptr;
+    sLimitedLoops[voiceIndex] = LimitedLoop();
 
     if (sStereoConvertedBuffers[voiceIndex] != nullptr)
     {
