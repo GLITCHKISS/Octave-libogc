@@ -614,6 +614,14 @@ addresses that only that build can name.
 
 ## Octave engine gotchas
 
+**Do** consider `FixedTickRate=60` in Config.ini (off by default). Variable
+`deltaTime` makes a game's outcome depend on frame times: a hitch is one long
+step, and a body can tunnel through a wall or rubber-band back. With a fixed
+rate, scripts, nodes, timers and physics always get 1/60, as many ticks a frame
+as the time passed calls for (vsync jitter snapped, at most 4 a frame, a press
+seen by a frame's first tick only): the same inputs give the same game. On
+hardware at 60 it ran one tick a frame, as before.
+
 - A `Widget` subclass must override `GetDrawData`, or its `Render` never runs.
 - `Primitive3D` bodies that were simulated once keep their mass and inertia
   when physics is switched on again (`SetMass` skips an unchanged value). Warm

@@ -326,6 +326,14 @@ struct EngineConfig
     // decoded on the CPU into ARAM as PCM as they load. In Dolphin the changed mixer needs DSP LLE (HLE doesn't know
     // it). Config.ini: DspAdpcm=1.
     bool mDspAdpcm = false;
+    // The game's logic ticked at a fixed rate (ticks a second; 0, the default: once a frame by the frame's own time).
+    // Scripts, nodes, timers and physics then always get the same deltaTime (1 / the rate), as many ticks a frame as
+    // the time passed calls for -- the same inputs give the same game every run, and a hitch is two even ticks, not one
+    // long one (a long step can carry a body through a wall or rubber-band it back). Frame times near a whole number
+    // of ticks are snapped to it (vsync jitter would otherwise give 0 ticks one frame, 2 the next); past
+    // kMaxFixedTicks a frame the backlog is dropped (the game slows rather than spiral). A frame with no tick due (a
+    // display faster than the rate) updates the world once with no time, as a pause does. Config.ini: FixedTickRate=60.
+    uint32_t mFixedTickRate = 0;
 
     int32_t mLqMaxTextureSize = 0;
     // Steps every console texture down by (factor - 1) halvings at cook time: 2 takes 512 to 256

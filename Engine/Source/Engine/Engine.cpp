@@ -27,6 +27,7 @@
 #include "System/System.h"
 #include "Graphics/Graphics.h"
 #include "Input/Input.h"
+#include "Input/InputUtils.h"
 #include "Audio/Audio.h"
 
 #if PLATFORM_WINDOWS
@@ -71,6 +72,9 @@ static EngineConfig sEngineConfig;
 
 static std::vector<World*> sWorlds;
 static Clock sClock;
+// FixedTickRate: the game time not yet ticked (a tick's worth or more runs a tick), and the most ticks one frame runs
+static float sFixedTickAccum = 0.0f;
+static const uint32_t kMaxFixedTicks = 4;
 
 // Default scene names to try when no explicit scene is specified
 static std::vector<std::string> sDefaultSceneNames = {
@@ -818,20 +822,68 @@ bool Update()
         gameDeltaTime = 0.016f;
     }
 
+    const uint32_t fixedTickRate = sEngineConfig.mFixedTickRate;
     sEngineState.mRealDeltaTime = realDeltaTime;
     sEngineState.mGameDeltaTime = gameDeltaTime;
-    sEngineState.mGameElapsedTime += gameDeltaTime;
+    if (fixedTickRate == 0)
+        sEngineState.mGameElapsedTime += gameDeltaTime;   // (fixed ticks: a tick's time each tick, below)
     sEngineState.mRealElapsedTime += realDeltaTime;
 
 #if OCT_UI_EXTRAS
     Button::StaticUpdate();
 #endif
 
-    GetTimerManager()->Update(gameDeltaTime);
-
-    for (uint32_t i = 0; i < sWorlds.size(); ++i)
+    if (fixedTickRate == 0)
     {
-        sWorlds[i]->Update(gameDeltaTime);
+        GetTimerManager()->Update(gameDeltaTime);
+
+        for (uint32_t i = 0; i < sWorlds.size(); ++i)
+        {
+            sWorlds[i]->Update(gameDeltaTime);
+        }
+    }
+    else
+    {
+        // The game ticked at a fixed rate (Config.ini FixedTickRate, EngineConfig::mFixedTickRate): as many ticks of
+        // the same deltaTime as the time passed calls for.
+        const float step = 1.0f / float(fixedTickRate);
+        if (gameDeltaTime > 0.0f)
+        {
+            float dt = gameDeltaTime;
+            const float whole = glm::floor(dt / step + 0.5f);
+            if (whole >= 1.0f && glm::abs(dt - whole * step) < 0.002f)
+                dt = whole * step;                  // (vsync's jitter: a 16.5 or 16.9 ms frame at 60 is one tick)
+            sFixedTickAccum += dt;
+        }
+
+        uint32_t ticks = 0;
+        while (sFixedTickAccum >= step - 1e-5f && ticks < kMaxFixedTicks)
+        {
+            if (ticks > 0)
+                InputAdvanceTick();                 // (a press is seen by the frame's first tick alone)
+            sEngineState.mGameDeltaTime = step;
+            sEngineState.mGameElapsedTime += step;
+            GetTimerManager()->Update(step);
+            for (uint32_t i = 0; i < sWorlds.size(); ++i)
+            {
+                sWorlds[i]->Update(step);
+            }
+            sFixedTickAccum -= step;
+            ++ticks;
+        }
+        if (ticks == kMaxFixedTicks && sFixedTickAccum >= step)
+            sFixedTickAccum = 0.0f;                 // (too far behind: the rest dropped, the game slowed, not spiraled)
+
+        if (ticks == 0)
+        {
+            // no tick due (paused, or a display faster than the rate): the world updated with no time, as a pause
+            sEngineState.mGameDeltaTime = 0.0f;
+            GetTimerManager()->Update(0.0f);
+            for (uint32_t i = 0; i < sWorlds.size(); ++i)
+            {
+                sWorlds[i]->Update(0.0f);
+            }
+        }
     }
 
     NetworkManager::Get()->PostTickUpdate(realDeltaTime);
@@ -1320,6 +1372,7 @@ void WriteEngineConfig(std::string path)
         fprintf(configIni, "CookQuantizedMeshes=%d\n", sEngineConfig.mCookQuantizedMeshes);
         fprintf(configIni, "GameCubeSoundCodec=%d\n", sEngineConfig.mGameCubeSoundCodec);
         fprintf(configIni, "DspAdpcm=%d\n", sEngineConfig.mDspAdpcm);
+        fprintf(configIni, "FixedTickRate=%u\n", sEngineConfig.mFixedTickRate);
 
         fclose(configIni);
         configIni = nullptr;
@@ -1458,6 +1511,8 @@ void ReadEngineConfig(std::string path)
                 sEngineConfig.mGameCubeSoundCodec = atoi(value);
             else if (keyStr == "DspAdpcm")
                 sEngineConfig.mDspAdpcm = strToBool(value);
+            else if (keyStr == "FixedTickRate")
+                sEngineConfig.mFixedTickRate = uint32_t(glm::clamp(atoi(value), 0, 1000));
 
             strcpy(key, "");
             strcpy(value, "");
