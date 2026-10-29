@@ -75,6 +75,10 @@ static Clock sClock;
 // FixedTickRate: the game time not yet ticked (a tick's worth or more runs a tick), and the most ticks one frame runs
 static float sFixedTickAccum = 0.0f;
 static const uint32_t kMaxFixedTicks = 4;
+// A tick runs this much early (vsync's jitter: a 16.5 ms frame at 60 is still a tick, its shortfall owed to the next).
+// The time itself is never rounded: rounding each 16.683 ms frame of a 59.94 Hz TV down to a 60 Hz tick lost 0.1% --
+// game time fell behind real time (and the audio).
+static const float kFixedTickSlack = 0.002f;
 
 // Default scene names to try when no explicit scene is specified
 static std::vector<std::string> sDefaultSceneNames = {
@@ -848,16 +852,11 @@ bool Update()
         // the same deltaTime as the time passed calls for.
         const float step = 1.0f / float(fixedTickRate);
         if (gameDeltaTime > 0.0f)
-        {
-            float dt = gameDeltaTime;
-            const float whole = glm::floor(dt / step + 0.5f);
-            if (whole >= 1.0f && glm::abs(dt - whole * step) < 0.002f)
-                dt = whole * step;                  // (vsync's jitter: a 16.5 or 16.9 ms frame at 60 is one tick)
-            sFixedTickAccum += dt;
-        }
+            sFixedTickAccum += gameDeltaTime;      // (the time as it passed: a 59.94 Hz TV gets an extra tick every
+                                                    //  ~17 s, so game time keeps pace with real time and the audio)
 
         uint32_t ticks = 0;
-        while (sFixedTickAccum >= step - 1e-5f && ticks < kMaxFixedTicks)
+        while (sFixedTickAccum >= step - kFixedTickSlack && ticks < kMaxFixedTicks)
         {
             if (ticks > 0)
                 InputAdvanceTick();                 // (a press is seen by the frame's first tick alone)
@@ -873,6 +872,8 @@ bool Update()
         }
         if (ticks == kMaxFixedTicks && sFixedTickAccum >= step)
             sFixedTickAccum = 0.0f;                 // (too far behind: the rest dropped, the game slowed, not spiraled)
+        if (sFixedTickAccum < -step)
+            sFixedTickAccum = 0.0f;                 // (a pause's time, never owed)
 
         if (ticks == 0)
         {
