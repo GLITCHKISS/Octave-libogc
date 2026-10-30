@@ -1017,6 +1017,32 @@ bool StaticMesh::SetVertexData(const float* xyz, const uint32_t* rgba, uint32_t 
     return true;
 }
 
+bool StaticMesh::UpdateVertexResource()
+{
+    if (mVertices == nullptr || mNumVertices == 0 || !IsLoaded())
+    {
+        return false;
+    }
+
+#if API_GX && !EDITOR
+    StaticMeshResource* resource = GetResource();
+    if (resource->mCompact || resource->mQuantized)
+    {
+        return false;                           // (the GPU reads arrays of its own, made at load)
+    }
+    DCFlushRange(mVertices, mNumVertices * GetVertexSize());
+    GX_InvVtxCache();
+#else
+    if (mIndices == nullptr)
+    {
+        return false;
+    }
+    GFX_DestroyStaticMeshResource(this);
+    GFX_CreateStaticMeshResource(this, mHasVertexColor, mNumVertices, mVertices, mNumIndices, mIndices);
+#endif
+    return true;
+}
+
 bool StaticMesh::QuantizeFracs(const Vertex* v, uint32_t n, int& posFrac, int& uvFrac)
 {
     if (v == nullptr || n == 0)

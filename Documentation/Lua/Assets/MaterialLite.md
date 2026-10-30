@@ -149,9 +149,9 @@ Sig: `refract = MaterialLite:IsRefract()`
  - Ret: `boolean refract` Is a refraction material
 ---
 ### SetRefract
-Make the material show what is behind it (GameCube only). Its texture slot 0 is replaced by a copy of the frame taken before the translucent draws, sampled at each pixel's own place on the screen, and warped by the material's `TevMode.Warp` slot if it has one (its strength is the emission value). Use a translucent blend mode so it draws after the copy, with a sort priority below the materials drawn over it. Not saved with the asset: set it at runtime. Other platforms do not draw the material.
+Make the material show what is behind it (GameCube and Vulkan). Its texture slot 0 is replaced by a copy of the frame taken before the translucent draws, sampled at each pixel's own place on the screen, and warped by the material's `TevMode.Warp` slot if it has one (its strength is the emission value). Use a translucent blend mode so it draws after the copy, with a sort priority below the materials drawn over it. Not saved with the asset: set it at runtime. The 3DS does not draw the material.
 
-The copy is taken only on frames where a refraction material is drawn: half the screen's size, RGB565 (about 169 KB, made the first time).
+The copy is taken only on frames where a refraction material is drawn, at half the screen's size. On GameCube it is RGB565 (about 169 KB, made the first time); on Vulkan the forward pass is ended, the scene colour blitted to a half-size image, and the pass resumed.
 
 Sig: `MaterialLite:SetRefract(refract)`
  - Arg: `boolean refract` Make it a refraction material

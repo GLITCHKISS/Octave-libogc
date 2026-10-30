@@ -104,6 +104,13 @@ public:
     // mesh files store them). The bounds follow. On GX the arrays the display list reads are
     // written in place; elsewhere the GPU buffers are made again (they are small).
     bool SetVertexData(const float* xyz, const uint32_t* rgba, uint32_t count);
+
+    // After a program has written the vertices in place (GetVertices / GetColorVertices, the same
+    // number of them): the GPU's copy brought up to date. On GX the arrays the GPU reads are those
+    // ones, so they're flushed from the CPU's cache (not a compact or quantized mesh: false);
+    // elsewhere the GPU buffers are made again (the old ones let go once no frame uses them). The
+    // bounds are left as they were.
+    bool UpdateVertexResource();
     uint32_t GetVertexSize() const;
 
     static bool HandlePropChange(Datum* datum, uint32_t index, const void* newValue);

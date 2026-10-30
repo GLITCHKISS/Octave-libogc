@@ -261,7 +261,7 @@ float GFX_GetLightBakeProgress()
 
 void GFX_CopySceneColor()
 {
-    // (Refraction materials aren't drawn here: see GFX_DrawStaticMeshComp.)
+    GetVulkanContext()->CopySceneColor();
 }
 
 void GFX_EnableMaterials(bool enable)
@@ -365,11 +365,6 @@ void GFX_UpdateStaticMeshCompResourceColors(StaticMesh3D* staticMeshComp)
 
 void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverride)
 {
-    // A refraction material shows a copy of the frame, which only the GameCube renderer takes: not drawn here.
-    MaterialLite* lite = Material::AsLite(staticMeshComp->GetMaterial());
-    if (lite != nullptr && lite->IsRefract())
-        return;
-
     DrawStaticMeshComp(staticMeshComp, meshOverride);
 }
 

@@ -991,7 +991,8 @@ void WriteMaterialLiteUniformData(MaterialData& outData, MaterialLite* material)
     outData.mMaskCutoff = material->GetMaskCutoff();
     outData.mShininess = material->GetShininess();
     outData.mFresnelEnabled = static_cast<uint32_t>(material->IsFresnelEnabled()) |
-                              (material->IsFresnelAlpha() ? 2u : 0u);   // (bit 1: its Fresnel as its opacity)
+                              (material->IsFresnelAlpha() ? 2u : 0u) |  // (bit 1: its Fresnel as its opacity)
+                              ((material->IsRefract() && GetVulkanContext()->GetSceneCopyImage() != nullptr) ? 4u : 0u);   // (bit 2: slot 0 the scene copy)
     outData.mVertexColorMode = static_cast<uint32_t>(material->GetVertexColorMode());
     outData.mApplyFog = static_cast<uint32_t>(material->ShouldApplyFog());
     outData.mEmission = material->GetEmission();
@@ -1411,9 +1412,13 @@ void BindMaterialDescriptorSet(Material* material)
             }
         }
 
+        // A refraction material's slot 0: the copy of the scene drawn so far (VulkanContext::CopySceneColor), when
+        // taken this frame
+        Image* sceneCopy = matLite->IsRefract() ? GetVulkanContext()->GetSceneCopyImage() : nullptr;
+
         DescriptorSet::Begin("Lite Material DS")
             .WriteUniformBuffer(MD_UNIFORM_BUFFER, uniformBlock)
-            .WriteImage(MD_TEXTURE_START + 0, textures[0]->GetResource()->mImage)
+            .WriteImage(MD_TEXTURE_START + 0, sceneCopy ? sceneCopy : textures[0]->GetResource()->mImage)
             .WriteImage(MD_TEXTURE_START + 1, textures[1]->GetResource()->mImage)
             .WriteImage(MD_TEXTURE_START + 2, textures[2]->GetResource()->mImage)
             .WriteImage(MD_TEXTURE_START + 3, textures[3]->GetResource()->mImage)

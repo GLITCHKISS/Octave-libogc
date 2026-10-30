@@ -89,10 +89,10 @@ void main()
     // A warp slot offsets every other slot's coordinates (it is not drawn itself: its TEV mode is
     // above TEV_MODE_PASS, so BlendTextureEnv skips it).
     uint warpSlot = WarpSlot(material);
+    vec2 warp = vec2(0.0);
     if (warpSlot != 0)
     {
         vec2 warpUv = WarpSlotUv(material, warpSlot, texCoord0, texCoord1, texCoordEnv);
-        vec2 warp;
         if (warpSlot == 1)
             warp = WarpOffset(sampler1, warpUv, material.mEmission);
         else if (warpSlot == 2)
@@ -105,12 +105,23 @@ void main()
         texCoordEnv += warp;
     }
 
+    // A refraction material (bit 2): slot 0 is a copy of the scene drawn so far at half size, looked up at this
+    // pixel's own place on the screen, warped with the rest (the GameCube's projected EFB copy)
+    vec2 slot0Uv0 = texCoord0, slot0Uv1 = texCoord1, slot0UvEnv = texCoordEnv;
+    if ((material.mFresnelEnabled & 4u) != 0)
+    {
+        vec2 screenUv = gl_FragCoord.xy / (2.0 * vec2(textureSize(sampler0, 0))) + warp;
+        slot0Uv0 = screenUv;
+        slot0Uv1 = screenUv;
+        slot0UvEnv = screenUv;
+    }
+
     uint shadingModel = material.mShadingModel;
 
     vec4 diffuse = vec4(1,1,1,1);
     gMipShift = (material.mMipBiasFollowsHeight > 0.5) ? log2(max(global.mSceneViewport.w, 1.0) / 548.0) : 0.0;
 
-    diffuse = BlendTextureEnv(material, diffuse, 0, sampler0, texCoord0, texCoord1, texCoordEnv, inColor.r, material.mTevModes[0], material.mVertexColorMode);
+    diffuse = BlendTextureEnv(material, diffuse, 0, sampler0, slot0Uv0, slot0Uv1, slot0UvEnv, inColor.r, material.mTevModes[0], material.mVertexColorMode);
     diffuse = BlendTextureEnv(material, diffuse, 1, sampler1, texCoord0, texCoord1, texCoordEnv, inColor.g, material.mTevModes[1], material.mVertexColorMode);
     diffuse = BlendTextureEnv(material, diffuse, 2, sampler2, texCoord0, texCoord1, texCoordEnv, inColor.b, material.mTevModes[2], material.mVertexColorMode);
     diffuse = BlendTextureEnv(material, diffuse, 3, sampler3, texCoord0, texCoord1, texCoordEnv, 0.0, material.mTevModes[3], material.mVertexColorMode);

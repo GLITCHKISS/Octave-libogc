@@ -75,6 +75,7 @@ public:
     void BeginVkRenderPass(const RenderPassSetup& rpSetup, bool insertBarrier, glm::vec4 clearColor = {});
     void EndRenderPass();
     void EndVkRenderPass();
+    void CopySceneColor();
     void CommitPipeline();
     void DrawLines(const std::vector<Line>& lines);
     void DrawFullscreen();
@@ -94,6 +95,7 @@ public:
     VkFormat GetSwapchainFormat();
     VkFormat GetSceneColorFormat();
     Image* GetSceneColorImage();
+    Image* GetSceneCopyImage();
     Image* GetSwapchainImage();
 
     Pipeline* GetBoundPipeline();
@@ -268,6 +270,8 @@ private:
     Image* mShadowMapImage = nullptr;
     Image* mSceneColorImage = nullptr;
     VkFormat mSceneColorImageFormat;
+    Image* mSceneCopyImage = nullptr;       // (refraction: the scene colour at half size, see CopySceneColor)
+    bool mSceneCopyValid = false;           // (taken this frame)
     Image* mDepthImage = nullptr;
     VkFormat mDepthImageFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
 

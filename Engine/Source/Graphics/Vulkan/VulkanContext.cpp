@@ -285,6 +285,8 @@ void VulkanContext::BeginFrame()
         RecreateSwapchain(false);
     }
 
+    mSceneCopyValid = false;
+
     VkResult result = vkAcquireNextImageKHR(mDevice, mSwapchain, std::numeric_limits<uint64_t>::max(), mImageAvailableSemaphore[mFrameIndex], VK_NULL_HANDLE, &mSwapchainImageIndex);
 
     if (result == VK_ERROR_OUT_OF_DATE_KHR)
@@ -638,6 +640,79 @@ void VulkanContext::EndVkRenderPass()
     vkCmdEndRenderPass(mCommandBuffers[mFrameIndex]);
 }
 
+void VulkanContext::CopySceneColor()
+{
+    // Refraction materials show the scene drawn so far, as the GameCube copies its EFB. There's no copying inside a
+    // render pass, so the forward pass is ended, the scene colour copied (at half size, each texel the average of
+    // 2x2: the GameCube's box-filtered half-size copy, the same soft look), and the pass begun again, keeping what it
+    // drew. Both images are left as they were: shader read only.
+    if (mCurrentRenderPassId != RenderPassId::Forward || mSceneCopyImage == nullptr)
+        return;
+
+    VkCommandBuffer cb = mCommandBuffers[mFrameIndex];
+    EndVkRenderPass();
+
+    VkImageMemoryBarrier barriers[2] = {};
+    for (VkImageMemoryBarrier& b : barriers)
+    {
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange.levelCount = 1;
+        b.subresourceRange.layerCount = 1;
+    }
+    barriers[0].image = mSceneColorImage->Get();
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[1].image = mSceneCopyImage->Get();
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;     // (all of it overwritten)
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 2, barriers);
+
+    // (from exactly twice the copy's size, so a pixel's place on the screen over twice the copy's size is its place in it)
+    VkImageBlit blit = {};
+    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.srcOffsets[1] = { int32_t(mSceneCopyImage->GetWidth() * 2), int32_t(mSceneCopyImage->GetHeight() * 2), 1 };
+    blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.dstOffsets[1] = { int32_t(mSceneCopyImage->GetWidth()), int32_t(mSceneCopyImage->GetHeight()), 1 };
+    vkCmdBlitImage(cb,
+        mSceneColorImage->Get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        mSceneCopyImage->Get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blit, VK_FILTER_LINEAR);
+
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 2, barriers);
+
+    RenderPassSetup rpSetup;
+    rpSetup.mDepthImage = mDepthImage;
+    rpSetup.mColorImages[0] = mSceneColorImage;
+    rpSetup.mLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    rpSetup.mStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    rpSetup.mDepthLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    rpSetup.mDebugName = "Forward (after scene copy)";
+    BeginVkRenderPass(rpSetup, true);
+
+    mSceneCopyValid = true;
+}
+
 void VulkanContext::CommitPipeline()
 {
     mBoundPipeline = mPipelineCache.Resolve(mPipelineState);
@@ -739,6 +814,13 @@ void VulkanContext::DestroySwapchain()
 
     GetDestroyQueue()->Destroy(mSceneColorImage);
     mSceneColorImage = nullptr;
+
+    if (mSceneCopyImage != nullptr)
+    {
+        GetDestroyQueue()->Destroy(mSceneCopyImage);
+        mSceneCopyImage = nullptr;
+    }
+    mSceneCopyValid = false;
 
     for (uint32_t i = 0; i < mExtSwapchainImages.size(); ++i)
     {
@@ -1435,7 +1517,7 @@ void VulkanContext::CreateSceneColorImage()
     VkImageLayout layout;
     
     format = mSceneColorImageFormat;
-    usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     //aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
@@ -1451,6 +1533,26 @@ void VulkanContext::CreateSceneColorImage()
     mSceneColorImage = new Image(imageDesc, samplerDesc, "Scene Color");
 
     mSceneColorImage->Transition(layout);
+
+    // Refraction's copy of it (CopySceneColor), at half size: made by a filtered blit, so only where the format allows
+    VkFormatProperties formatProps = {};
+    vkGetPhysicalDeviceFormatProperties(mPhysicalDevice, format, &formatProps);
+    const VkFormatFeatureFlags blitFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    if ((formatProps.optimalTilingFeatures & blitFeatures) == blitFeatures)
+    {
+        ImageDesc copyDesc;
+        copyDesc.mWidth = glm::max(mSceneWidth / 2, 1u);
+        copyDesc.mHeight = glm::max(mSceneHeight / 2, 1u);
+        copyDesc.mFormat = format;
+        copyDesc.mUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+
+        mSceneCopyImage = new Image(copyDesc, samplerDesc, "Scene Copy");
+        mSceneCopyImage->Transition(layout);
+    }
+    else
+    {
+        LogWarning("The scene colour format can't be blitted: refraction materials draw their own texture instead.");
+    }
 
     DeviceWaitIdle();
 }
@@ -1536,6 +1638,11 @@ VkFormat VulkanContext::GetSceneColorFormat()
 Image* VulkanContext::GetSceneColorImage()
 {
     return mSceneColorImage;
+}
+
+Image* VulkanContext::GetSceneCopyImage()
+{
+    return mSceneCopyValid ? mSceneCopyImage : nullptr;
 }
 
 Image* VulkanContext::GetSwapchainImage()
