@@ -1828,6 +1828,17 @@ void Renderer::Render(World* world, int32_t screenIndex)
                             GFX_DrawProjectedShadowReceivers(shadowReceivers);
                         }
 
+                        // A refraction material among them shows what's behind it: the frame copied first.
+                        for (const DrawData& draw : mTranslucentDraws)
+                        {
+                            MaterialLite* lite = Material::AsLite(draw.mMaterial);
+                            if (lite != nullptr && lite->IsRefract())
+                            {
+                                GFX_CopySceneColor();
+                                break;
+                            }
+                        }
+
                         RenderDraws(mTranslucentDraws);
 
                         RenderDebugDraws(mDebugDraws);

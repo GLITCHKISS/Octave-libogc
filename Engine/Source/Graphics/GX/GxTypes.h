@@ -98,6 +98,14 @@ struct GxContext
     // TEV stages BindMaterial left reading the indirect (warp) stage, one bit per stage. Non-zero
     // also means GX_SetNumIndStages(1) is in effect. GxResetIndirect() turns it all off.
     uint32_t mIndirectTevMask = 0;
+
+    // The frame copied for refraction materials (GFX_CopySceneColor): half the EFB's size, RGB565,
+    // its buffer made on first use. Valid from the copy to the frame's end.
+    void* mSceneTexBuf = nullptr;
+    GXTexObj mSceneTexObj;
+    uint16_t mSceneTexWidth = 0;
+    uint16_t mSceneTexHeight = 0;
+    bool mSceneTexValid = false;
 };
 
 #endif

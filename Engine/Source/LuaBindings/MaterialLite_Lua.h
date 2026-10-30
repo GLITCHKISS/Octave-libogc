@@ -40,6 +40,8 @@ struct MaterialLite_Lua
     static int SetEmission(lua_State* L);
     static int GetWrapLighting(lua_State* L);
     static int SetWrapLighting(lua_State* L);
+    static int IsRefract(lua_State* L);
+    static int SetRefract(lua_State* L);
     static int GetSpecular(lua_State* L);
     static int SetSpecular(lua_State* L);
     static int GetOpacity(lua_State* L);

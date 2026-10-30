@@ -238,6 +238,24 @@ int MaterialLite_Lua::SetWrapLighting(lua_State* L)
     return 0;
 }
 
+int MaterialLite_Lua::IsRefract(lua_State* L)
+{
+    MaterialLite* mat = CHECK_MATERIAL_LITE(L, 1);
+
+    lua_pushboolean(L, mat->IsRefract());
+    return 1;
+}
+
+int MaterialLite_Lua::SetRefract(lua_State* L)
+{
+    MaterialLite* mat = CHECK_MATERIAL_LITE(L, 1);
+    bool value = CHECK_BOOLEAN(L, 2);
+
+    mat->SetRefract(value);
+
+    return 0;
+}
+
 int MaterialLite_Lua::GetSpecular(lua_State* L)
 {
     MaterialLite* mat = CHECK_MATERIAL_LITE(L, 1);
@@ -416,6 +434,8 @@ void MaterialLite_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, GetWrapLighting);
 
     REGISTER_TABLE_FUNC(L, mtIndex, SetWrapLighting);
+    REGISTER_TABLE_FUNC(L, mtIndex, IsRefract);
+    REGISTER_TABLE_FUNC(L, mtIndex, SetRefract);
 
     REGISTER_TABLE_FUNC(L, mtIndex, GetSpecular);
 

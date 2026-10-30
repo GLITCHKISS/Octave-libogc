@@ -449,6 +449,26 @@ static void LoadWarpIndMtx(uint8_t indMtx, float strength, uint16_t width, uint1
     GX_SetIndTexMatrix(indMtx, mtx, int8_t(exp));
 }
 
+void GxLoadScreenTexMtx(const glm::mat4& world)
+{
+    // Model-space position -> (u * w, v * w, w): the standard view-projection's clip space (y down), biased to 0..1;
+    // GX divides S and T by the third row's result (a 3x4 texgen matrix), so u, v are the pixel's place on the screen.
+    Camera3D* camera = gGxContext.mWorld ? gGxContext.mWorld->GetActiveCamera() : nullptr;
+    if (camera == nullptr)
+    {
+        return;
+    }
+    const glm::mat4 m = camera->GetStandardViewProjectionMatrix() * world;
+    Mtx t;
+    for (uint32_t c = 0; c < 4; ++c)
+    {
+        t[0][c] = 0.5f * m[c][0] + 0.5f * m[c][3];
+        t[1][c] = 0.5f * m[c][1] + 0.5f * m[c][3];
+        t[2][c] = m[c][3];
+    }
+    GX_LoadTexMtxImm(t, GX_TEXMTX9, GX_MTX3x4);
+}
+
 void GxResetIndirect()
 {
     uint32_t mask = gGxContext.mIndirectTevMask;
@@ -546,14 +566,25 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
             tevMode != TevMode::Count &&
             texture != nullptr)
         {
-            SetupSlotTexGen(texIdx, uvMap, hasNormals);
-            GX_LoadTexObj(&texture->GetResource()->mGxTexObj, GX_TEXMAP0 + texIdx);
+            GXTexObj* texObj = &texture->GetResource()->mGxTexObj;
+            if (i == 0 && material->IsRefract() && gGxContext.mSceneTexValid)
+            {
+                // A refraction material's slot 0: the frame copied before the translucent draws, at the pixel's own
+                // place on the screen -- its position through GX_TEXMTX9 (GxLoadScreenTexMtx, per draw), projected.
+                texObj = &gGxContext.mSceneTexObj;
+                GX_SetTexCoordGen(GX_TEXCOORD0 + texIdx, GX_TG_MTX3x4, GX_TG_POS, GX_TEXMTX9);
+            }
+            else
+            {
+                SetupSlotTexGen(texIdx, uvMap, hasNormals);
+            }
+            GX_LoadTexObj(texObj, GX_TEXMAP0 + texIdx);
 
             tevStage = ConfigTev(tevStage, texIdx, tevMode, vertexColorBlend);
 
             // ConfigTev's last stage is the one that samples the texture.
             warpedStages[numWarped] = tevStage - 1;
-            warpedTexObjs[numWarped] = &texture->GetResource()->mGxTexObj;
+            warpedTexObjs[numWarped] = texObj;
             numWarped++;
 
             texIdx++;

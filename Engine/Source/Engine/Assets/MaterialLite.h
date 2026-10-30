@@ -156,10 +156,18 @@ public:
     float GetWarpStrength() const { return GetEmission(); }
     void SetWarpStrength(float strength) { SetEmission(strength); }
 
+    // Screen refraction (GameCube): texture slot 0 shows what was drawn behind the surface -- a copy
+    // of the frame taken before the translucent draws -- at each pixel's own place on the screen,
+    // warped by the Warp slot if there is one. Set at runtime, not saved with the asset. Other
+    // platforms don't draw the material (they have no copy of the frame).
+    bool IsRefract() const { return mRefract; }
+    void SetRefract(bool refract) { mRefract = refract; }
+
     static bool HandlePropChange(Datum* datum, uint32_t index, const void* newValue);
 
 protected:
 
     // Properties
     MaterialLiteParams mLiteParams;
+    bool mRefract = false;
 };

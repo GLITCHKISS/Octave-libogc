@@ -320,6 +320,7 @@ void GFX_Shutdown()
 void GFX_BeginFrame()
 {
     SystemState* systemState = &GetEngineState()->mSystem;
+    gGxContext.mSceneTexValid = false;  // (the frame copy, GFX_CopySceneColor: this frame's taken anew)
     GxInvalidateTexMtxCache();          // (BindMaterial's UV matrices loaded fresh each frame: GxUtils.cpp)
 
     if (sFrameInFlight)
@@ -684,6 +685,39 @@ float GFX_GetLightBakeProgress()
 void GFX_EnableMaterials(bool enable)
 {
 
+}
+
+void GFX_CopySceneColor()
+{
+    // The frame so far (the opaque draws, before the translucent ones), halved by the copy's box filter into an
+    // RGB565 texture: refraction materials show it, warped (BindMaterial). 320 x 264 is 169 KB, made once.
+    GXRModeObj* rmode = &GetEngineState()->mSystem.mGxRmode;
+    const uint16_t w = uint16_t(rmode->fbWidth / 2);
+    const uint16_t h = uint16_t(rmode->efbHeight / 2);
+    if (gGxContext.mSceneTexBuf == nullptr || w != gGxContext.mSceneTexWidth || h != gGxContext.mSceneTexHeight)
+    {
+        free(gGxContext.mSceneTexBuf);
+        gGxContext.mSceneTexBuf = memalign(32, GX_GetTexBufferSize(w, h, GX_TF_RGB565, GX_FALSE, 0));
+        gGxContext.mSceneTexWidth = w;
+        gGxContext.mSceneTexHeight = h;
+        if (gGxContext.mSceneTexBuf == nullptr)
+        {
+            return;
+        }
+    }
+
+    // (No anti-aliasing or vertical filter on this copy -- the display copy's -- then back for the frame's.)
+    GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+    GX_SetTexCopySrc(0, 0, rmode->fbWidth, rmode->efbHeight);
+    GX_SetTexCopyDst(w, h, GX_TF_RGB565, GX_TRUE);
+    GX_CopyTex(gGxContext.mSceneTexBuf, GX_FALSE);
+    GX_PixModeSync();
+    GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE, rmode->vfilter);
+
+    GX_InitTexObj(&gGxContext.mSceneTexObj, gGxContext.mSceneTexBuf, w, h, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GX_InitTexObjLOD(&gGxContext.mSceneTexObj, GX_LINEAR, GX_LINEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
+    GX_InvalidateTexAll();
+    gGxContext.mSceneTexValid = true;
 }
 
 void GFX_BeginGpuTimestamp(const char* name)
@@ -1832,6 +1866,10 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverri
         c_guMtxConcat(view, model, modelView);
 
         GX_LoadPosMtxImm(modelView, GX_PNMTX0);
+        if (material->IsRefract())
+        {
+            GxLoadScreenTexMtx(staticMeshComp->GetRenderTransform());
+        }
 
         gGxContext.mObjectViewPos = glm::vec3(modelView[0][3], modelView[1][3], modelView[2][3]);
         if (GxDrawReadsNormals(material))

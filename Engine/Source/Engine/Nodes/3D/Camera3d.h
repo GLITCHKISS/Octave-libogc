@@ -31,6 +31,8 @@ public:
     const glm::mat4& GetViewProjectionMatrix();
     const glm::mat4& GetViewMatrix();
     const glm::mat4& GetProjectionMatrix();
+    // A standard view-projection (y down the screen), as the world-to-screen conversions use, on every platform.
+    const glm::mat4& GetStandardViewProjectionMatrix() const { return mStandardViewProjectionMatrix; }
 
     void ComputeMatrices();
 

@@ -66,6 +66,9 @@ bool GFX_IsLightBakeInProgress();
 float GFX_GetLightBakeProgress();
 
 void GFX_EnableMaterials(bool enable);
+// Copies the frame so far for refraction materials (MaterialLite::IsRefract) to show what's behind
+// them; the renderer calls it before the translucent draws when one is among them. GameCube only.
+void GFX_CopySceneColor();
 
 void GFX_BeginGpuTimestamp(const char* name);
 void GFX_EndGpuTimestamp(const char* name);

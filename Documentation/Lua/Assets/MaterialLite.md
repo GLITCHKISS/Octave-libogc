@@ -142,6 +142,20 @@ On a material with a `TevMode.Warp` slot, this value is instead the warp strengt
 Sig: `MaterialLite:SetEmission(emission)`
  - Arg: `number emission` Emission intensity
 ---
+### IsRefract
+Check whether the material is a refraction material (see SetRefract).
+
+Sig: `refract = MaterialLite:IsRefract()`
+ - Ret: `boolean refract` Is a refraction material
+---
+### SetRefract
+Make the material show what is behind it (GameCube only). Its texture slot 0 is replaced by a copy of the frame taken before the translucent draws, sampled at each pixel's own place on the screen, and warped by the material's `TevMode.Warp` slot if it has one (its strength is the emission value). Use a translucent blend mode so it draws after the copy, with a sort priority below the materials drawn over it. Not saved with the asset: set it at runtime. Other platforms do not draw the material.
+
+The copy is taken only on frames where a refraction material is drawn: half the screen's size, RGB565 (about 169 KB, made the first time).
+
+Sig: `MaterialLite:SetRefract(refract)`
+ - Arg: `boolean refract` Make it a refraction material
+---
 ### GetWrapLighting
 Get the wrap lighting intensity. This is only supported on Vulkan platforms.
 

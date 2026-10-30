@@ -503,6 +503,11 @@ void GFX_EnableMaterials(bool enable)
 
 }
 
+void GFX_CopySceneColor()
+{
+    // (Refraction materials aren't drawn here: see GFX_DrawStaticMeshComp.)
+}
+
 void GFX_BeginGpuTimestamp(const char* name)
 {
 
@@ -740,6 +745,11 @@ void GFX_UpdateStaticMeshCompResourceColors(StaticMesh3D* staticMeshComp)
 
 void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverride)
 {
+    // A refraction material shows a copy of the frame, which only the GameCube renderer takes: not drawn here.
+    MaterialLite* refractLite = Material::AsLite(staticMeshComp->GetMaterial());
+    if (refractLite != nullptr && refractLite->IsRefract())
+        return;
+
     StaticMeshCompResource* meshCompResource = staticMeshComp->GetResource();
     StaticMesh* mesh = meshOverride ? meshOverride : staticMeshComp->GetStaticMesh();
 

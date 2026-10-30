@@ -54,6 +54,9 @@ uint32_t GxBoundEnvTexCoords();
 // stages that used it and GX_SetNumIndStages(0). BindMaterial, the UI pass and Octave's own TEV
 // setups call it; code that sets up its own TEV stages during the 3D pass must call it too.
 void GxResetIndirect();
+
+// A refraction material's screen-space texgen matrix (GX_TEXMTX9) for a draw's world transform: see BindMaterial.
+void GxLoadScreenTexMtx(const glm::mat4& world);
 void BindStaticMesh(StaticMesh* staticMesh, uint32_t* instanceColors);
 void BindSkeletalMesh(SkeletalMesh* skeletalMesh);
 
