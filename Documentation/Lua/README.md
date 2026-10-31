@@ -65,4 +65,5 @@
 * [Rect](Misc/Rect.md)
 * [Stream](Misc/Stream.md)
 * [Vector](Misc/Vector.md)
+* [WaveGrid](Misc/WaveGrid.md)
 * [World](Misc/World.md)

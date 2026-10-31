@@ -1185,6 +1185,7 @@ void SYS_Log(LogSeverity severity, const char* format, va_list arg)
 {
     vprintf(format, arg);
     printf("\n");
+    fflush(stdout);         // (else a log written to a file or pipe is lost when the editor closes)
 
     // Also print to visual studio
     char msg[1024];

@@ -744,6 +744,7 @@
     <ClCompile Include="Source\Engine\ScriptFunc.cpp" />
     <ClCompile Include="Source\Engine\ScriptUtils.cpp" />
     <ClCompile Include="Source\Engine\Signals.cpp" />
+    <ClCompile Include="Source\Engine\WaveGrid.cpp" />
     <ClCompile Include="Source\Engine\SmartPointer.cpp" />
     <ClCompile Include="Source\Engine\stb_implementation.cpp" />
     <ClCompile Include="Source\Engine\Stream.cpp" />
@@ -836,6 +837,7 @@
     <ClCompile Include="Source\LuaBindings\Script_Lua.cpp" />
     <ClCompile Include="Source\LuaBindings\ShadowMesh3d_Lua.cpp" />
     <ClCompile Include="Source\LuaBindings\Signal_Lua.cpp" />
+    <ClCompile Include="Source\LuaBindings\WaveGrid_Lua.cpp" />
     <ClCompile Include="Source\LuaBindings\SkeletalMesh3d_Lua.cpp" />
     <ClCompile Include="Source\LuaBindings\SkeletalMesh_Lua.cpp" />
     <ClCompile Include="Source\LuaBindings\SoundWave_Lua.cpp" />
@@ -1106,6 +1108,8 @@
     <ClInclude Include="Source\LuaBindings\Script_Lua.h" />
     <ClInclude Include="Source\LuaBindings\ShadowMesh3d_Lua.h" />
     <ClInclude Include="Source\LuaBindings\Signal_Lua.h" />
+    <ClInclude Include="Source\LuaBindings\WaveGrid_Lua.h" />
+    <ClInclude Include="Source\Engine\WaveGrid.h" />
     <ClInclude Include="Source\LuaBindings\SkeletalMesh3d_Lua.h" />
     <ClInclude Include="Source\LuaBindings\SkeletalMesh_Lua.h" />
     <ClInclude Include="Source\LuaBindings\SoundWave_Lua.h" />

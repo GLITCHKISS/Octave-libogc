@@ -92,6 +92,7 @@
 #include "LuaBindings/PolyRect_Lua.h"
 #endif
 #include "LuaBindings/Signal_Lua.h"
+#include "LuaBindings/WaveGrid_Lua.h"
 #include "LuaBindings/Stream_Lua.h"
 #include "LuaBindings/TimerManager_Lua.h"
 #include "LuaBindings/Property_Lua.h"
@@ -120,6 +121,7 @@ void BindLuaInterface()
     AssetManager_Lua::Bind();
     Stream_Lua::Bind();
     Signal_Lua::Bind();
+    WaveGrid_Lua::Bind();
     TimerManager_Lua::Bind();
     Property_Lua::Bind();
 
