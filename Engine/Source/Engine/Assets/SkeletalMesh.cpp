@@ -157,12 +157,15 @@ void SkeletalMesh::LoadStream(Stream& stream, Platform platform)
         }
     }
 
+    // (the second texture coordinate stored from ASSET_VERSION_SKELETAL_UV1: a material slot on UV map 1 reads it --
+    //  before, every vertex's was 0, 0)
+    const bool hasUv1 = stream.GetAssetVersion() >= ASSET_VERSION_SKELETAL_UV1;
     mVertices.resize(mNumVertices);
     for (uint32_t i = 0; i < mNumVertices; ++i)
     {
         mVertices[i].mPosition = stream.ReadVec3();
         mVertices[i].mTexcoord0 = stream.ReadVec2();
-        mVertices[i].mTexcoord1 = { 0.0f, 0.0f };// stream.ReadVec2();
+        mVertices[i].mTexcoord1 = hasUv1 ? stream.ReadVec2() : glm::vec2(0.0f, 0.0f);
         mVertices[i].mNormal = stream.ReadVec3();
         mVertices[i].mBoneIndices[0] = stream.ReadUint8();
         mVertices[i].mBoneIndices[1] = stream.ReadUint8();
@@ -363,7 +366,7 @@ void SkeletalMesh::SaveStream(Stream& stream, Platform platform)
     {
         stream.WriteVec3(mVertices[i].mPosition);
         stream.WriteVec2(mVertices[i].mTexcoord0);
-        //stream.WriteVec2(mVertices[i].mTexcoord1);
+        stream.WriteVec2(mVertices[i].mTexcoord1);
         stream.WriteVec3(mVertices[i].mNormal);
         stream.WriteUint8(mVertices[i].mBoneIndices[0]);
         stream.WriteUint8(mVertices[i].mBoneIndices[1]);
