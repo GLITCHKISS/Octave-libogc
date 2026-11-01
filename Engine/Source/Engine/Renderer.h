@@ -63,6 +63,10 @@ public:
     // merely made visible before a load never gets drawn, because nothing renders until the load
     // has already finished. Anything doing slow work in steps calls this between them.
     void DrawLoadingFrame(float progress, const char* message = nullptr);
+
+    // While on, each loading frame also ticks world 0 (by the time since the last one) and the loading screen's
+    // backdrop is left off, so a loading scene (EngineConfig::mLoadingScene) moves and shows behind it.
+    void SetLoadingWorldTick(bool tick);
     bool IsConsoleEnabled();
 
     void DirtyAllWidgets();
@@ -219,6 +223,9 @@ private:
     SharedPtr<StatsOverlay> mStatsWidget;
     SharedPtr<Console> mConsoleWidget;
     SharedPtr<LoadingScreen> mLoadingScreenWidget;
+    bool mLoadingWorldTick = false;
+    uint64_t mLoadingTickTime = 0;
+    bool mInLoadingFrame = false;
 
     // "Powered by Octave" boot splash (packaged games only).
     SharedPtr<Quad> mSplashWidget;

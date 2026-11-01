@@ -365,6 +365,16 @@ struct EngineConfig
     // startup loading screen is up before any game code has run and so cannot be set from there.
     std::string mLoadingScreenLogo;
 
+    // A scene shown live behind the loading screen while the default scene loads (Config.ini "LoadingScene"): loaded
+    // and spawned first, then ticked and drawn with every loading frame, until the default scene replaces it. Its
+    // backdrop is left off so it shows; the bar and text are drawn over it. Unset by default.
+    std::string mLoadingScene;
+
+    // The loading screen's message and progress bar (Config.ini "LoadingScreenShowText", "LoadingScreenShowBar"):
+    // both on by default; off for a screen that's only a loading scene or a logo.
+    bool mLoadingScreenShowText = true;
+    bool mLoadingScreenShowBar = true;
+
     // Editor viewport navigation and clipping. Saved so they survive a restart: the useful value
     // depends on the scale of the scene being worked on, so it is a per-project setting rather than
     // something to set again every session. These affect the editor's own camera only.

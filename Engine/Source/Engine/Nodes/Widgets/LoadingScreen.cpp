@@ -118,6 +118,22 @@ void LoadingScreen::SetLogo(Texture* texture)
                      heightFrac);
 }
 
+void LoadingScreen::SetTextVisible(bool visible)
+{
+    if (mText != nullptr)
+    {
+        mText->SetVisible(visible);
+    }
+}
+
+void LoadingScreen::SetBackdropVisible(bool visible)
+{
+    if (mBackdrop != nullptr)
+    {
+        mBackdrop->SetVisible(visible);
+    }
+}
+
 void LoadingScreen::SetBarVisible(bool visible)
 {
     if (mBar != nullptr)

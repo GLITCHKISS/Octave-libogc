@@ -53,6 +53,41 @@ Textures must be power-of-two on console — GX addresses them that way — so a
 fail to import. Pad it rather than stretch it: padding one axis only keeps the artwork spanning the
 full width of the quad at its own proportions, with transparent margin on the other axis.
 
+## A loading scene
+
+Something moving while the game loads, drawn by the game's own renderer -- a spinning model with its real
+materials, particles, anything a scene can hold:
+
+```ini
+LoadingScene=SC_Loading
+```
+
+At startup that scene is loaded and spawned first (a small one: its own load draws no frames), ticked
+once so its nodes' `Start` runs then, and from there each loading frame ticks the world by the time
+since the last frame (at most 0.25 s) and draws it, behind the screen's bar and text -- the black
+backdrop is left off. When the default scene has loaded it replaces the loading scene, whose nodes are
+destroyed with it.
+
+Things to know:
+
+- It only moves when a loading frame is drawn (every few assets while the pump is on), so its motion
+  is as smooth as the load allows. Scripts that cap their own time step should allow a bigger one.
+- Its scripts run inside a load. Have them load what they need in `Start` (or have it in the scene),
+  not every tick, and start nothing that should outlive the scene -- a looping sound keeps playing
+  after its node is gone.
+- It needs its own camera.
+
+## Without the text or the bar
+
+For a screen that's only a loading scene, or only a logo:
+
+```ini
+LoadingScreenShowText=0
+LoadingScreenShowBar=0
+```
+
+Both are on by default.
+
 ## A custom message
 
 The engine says `"Loading..."` throughout its own startup load. A project overrides it per call:

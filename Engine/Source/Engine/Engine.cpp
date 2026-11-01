@@ -673,6 +673,30 @@ bool Initialize()
     Renderer::Get()->EnableLoadingScreen(true);
     Renderer::Get()->SetLoadingMessage("Loading...");
     Renderer::Get()->SetLoadingProgress(0.0f);
+
+    if (Renderer::Get()->GetLoadingScreenWidget() != nullptr)
+    {
+        Renderer::Get()->GetLoadingScreenWidget()->SetTextVisible(sEngineConfig.mLoadingScreenShowText);
+        Renderer::Get()->GetLoadingScreenWidget()->SetBarVisible(sEngineConfig.mLoadingScreenShowBar);
+    }
+
+    // A project's own loading scene, live behind the screen: spawned now (before the pump is on, so its own small
+    // load draws no frames), ticked once so its nodes start here rather than inside a loading frame, then ticked and
+    // drawn with each loading frame (Renderer::DrawLoadingFrame) until the default scene replaces it below.
+    if (sEngineConfig.mLoadingScene != "")
+    {
+        if (LoadAsset<Scene>(sEngineConfig.mLoadingScene) != nullptr)
+        {
+            GetWorld(0)->LoadScene(sEngineConfig.mLoadingScene.c_str(), true);
+            GetWorld(0)->Update(0.0f);
+            Renderer::Get()->SetLoadingWorldTick(true);
+        }
+        else
+        {
+            LogWarning("Loading scene not found: %s", sEngineConfig.mLoadingScene.c_str());
+        }
+    }
+
     AssetManager::Get()->EnableLoadProgressPump(true);
 
     Scene* defaultScene = nullptr;
@@ -715,7 +739,9 @@ bool Initialize()
         }
     }
 
-    // Then spawn it on world 0
+    // Then spawn it on world 0 (in place of a loading scene, if there was one)
+    Renderer::Get()->SetLoadingWorldTick(false);
+
     if (defaultScene != nullptr)
     {
         GetWorld(0)->LoadScene(defaultScene->GetName().c_str(), true);
@@ -1360,6 +1386,9 @@ void WriteEngineConfig(std::string path)
 
         fprintf(configIni, "EditorInterfaceScale=%f\n", sEngineConfig.mEditorInterfaceScale);
         fprintf(configIni, "LoadingScreenLogo=%s\n", sEngineConfig.mLoadingScreenLogo.c_str());
+        fprintf(configIni, "LoadingScene=%s\n", sEngineConfig.mLoadingScene.c_str());
+        fprintf(configIni, "LoadingScreenShowText=%d\n", sEngineConfig.mLoadingScreenShowText);
+        fprintf(configIni, "LoadingScreenShowBar=%d\n", sEngineConfig.mLoadingScreenShowBar);
         fprintf(configIni, "EditorNavSpeed=%f\n", sEngineConfig.mEditorNavSpeed);
         fprintf(configIni, "EditorNearClip=%f\n", sEngineConfig.mEditorNearClip);
         fprintf(configIni, "EditorFarClip=%f\n", sEngineConfig.mEditorFarClip);
@@ -1486,6 +1515,12 @@ void ReadEngineConfig(std::string path)
                 sEngineConfig.mEditorInterfaceScale = (float)atof(value);
             else if (keyStr == "LoadingScreenLogo")
                 sEngineConfig.mLoadingScreenLogo = value;
+            else if (keyStr == "LoadingScene")
+                sEngineConfig.mLoadingScene = value;
+            else if (keyStr == "LoadingScreenShowText")
+                sEngineConfig.mLoadingScreenShowText = strToBool(value);
+            else if (keyStr == "LoadingScreenShowBar")
+                sEngineConfig.mLoadingScreenShowBar = strToBool(value);
             else if (keyStr == "EditorNavSpeed")
                 sEngineConfig.mEditorNavSpeed = (float)atof(value);
             else if (keyStr == "EditorNearClip")

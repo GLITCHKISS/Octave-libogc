@@ -662,12 +662,26 @@ LoadingScreen* Renderer::GetLoadingScreenWidget()
     return mLoadingScreenWidget.Get();
 }
 
+void Renderer::SetLoadingWorldTick(bool tick)
+{
+    mLoadingWorldTick = tick;
+    mLoadingTickTime = 0;
+
+    if (mLoadingScreenWidget != nullptr)
+    {
+        mLoadingScreenWidget->SetBackdropVisible(!tick);
+    }
+}
+
 void Renderer::DrawLoadingFrame(float progress, const char* message)
 {
-    if (mLoadingScreenWidget == nullptr)
+    // (not from inside one: a loading scene's tick that loads something would come back here)
+    if (mLoadingScreenWidget == nullptr || mInLoadingFrame)
     {
         return;
     }
+
+    mInLoadingFrame = true;
 
     mLoadingScreenWidget->SetVisible(true);
 
@@ -680,12 +694,27 @@ void Renderer::DrawLoadingFrame(float progress, const char* message)
 
     World* world = GetWorld(0);
 
+    // A loading scene moved on by the time since the last loading frame (capped: a long stall between two is not
+    // a jump), so it keeps time however often the loader draws one.
+    if (world != nullptr && mLoadingWorldTick)
+    {
+        // (a frame of its own: the world ticks each node once a frame number, and the engine loop that counts them
+        //  isn't running during a load -- without this every node was skipped after the first loading frame)
+        GetEngineState()->mFrameNumber++;
+        const uint64_t now = SYS_GetTimeMicroseconds();
+        float dt = (mLoadingTickTime != 0) ? float(double(now - mLoadingTickTime) / 1000000.0) : 0.0f;
+        mLoadingTickTime = now;
+        world->Update(glm::min(dt, 0.25f));
+    }
+
     if (world != nullptr)
     {
         // Same approach as the splash intro: drive a frame directly rather than waiting for the
         // engine loop, which is not running while a synchronous load is in progress.
         Render(world, 0);
     }
+
+    mInLoadingFrame = false;
 }
 
 void Renderer::DirtyAllWidgets()

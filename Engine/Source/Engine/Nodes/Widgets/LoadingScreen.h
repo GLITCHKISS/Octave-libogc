@@ -45,6 +45,12 @@ public:
     // Hides the bar for work whose length is not known up front, leaving just the message.
     void SetBarVisible(bool visible);
 
+    // Its message line.
+    void SetTextVisible(bool visible);
+
+    // Its black backdrop: off to show a loading scene behind it (Renderer::SetLoadingWorldTick).
+    void SetBackdropVisible(bool visible);
+
     // An image above the bar, usually the game's logo. Sized from the texture's own proportions
     // and the screen's, so a wide logo is not stretched into a square one. Null removes it.
     void SetLogo(class Texture* texture);
