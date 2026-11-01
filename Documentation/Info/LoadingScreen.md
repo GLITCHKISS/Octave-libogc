@@ -62,16 +62,33 @@ materials, particles, anything a scene can hold:
 LoadingScene=SC_Loading
 ```
 
-At startup that scene is loaded and spawned first (a small one: its own load draws no frames), ticked
-once so its nodes' `Start` runs then, and from there each loading frame ticks the world by the time
-since the last frame (at most 0.25 s) and draws it, behind the screen's bar and text -- the black
-backdrop is left off. When the default scene has loaded it replaces the loading scene, whose nodes are
-destroyed with it.
+At startup that scene is loaded and spawned first (a small one: its own load draws no frames) and
+ticked once so its nodes' `Start` runs then. The default scene is then read on the asset loader's own
+thread, with everything it references, while the main thread keeps drawing: each frame it finishes a
+few milliseconds of what the loader has read, ticks the world by the time since the last frame (at
+most 0.25 s) and draws it, behind the screen's bar and text -- the black backdrop is left off -- at the
+display's rate. The disc reads and the drawing overlap, so the loading scene moves smoothly and adds
+little to the load. (If the background load fails, the scene is loaded the ordinary way.)
+
+Once loaded, the default scene is made off the world, the loading scene still drawn every so often as
+it goes (`Renderer::LoadingHeartbeat`). Then `OctPostInitialize` runs with the loading scene still up:
+assets the game loads there draw frames as they come in, and a wait made for loading screens
+(`AUD_WaitForTracks`) keeps drawing. Only at the first frame does the default scene take the loading
+scene's place, the loading scene's nodes destroyed with it, and the screen comes down.
+
+So with a loading scene, `OctPostInitialize` finds world 0 still holding the loading scene, not the
+default one. Find the game's nodes from the first frame on.
 
 Things to know:
 
-- It only moves when a loading frame is drawn (every few assets while the pump is on), so its motion
-  is as smooth as the load allows. Scripts that cap their own time step should allow a bigger one.
+- A long stall in the loader (a big asset finishing on the main thread) can still hold a frame up.
+  Scripts that cap their own time step should allow a bigger one.
+- The first frame still runs every node's `Start` at once, after the screen is down. Have the
+  default scene's scripts find their assets loaded already -- in the scene, or loaded in
+  `OctPostInitialize` -- not read off the disc in `Start`.
+- Long work of a project's own on the loading screen can keep it moving the same way: call
+  `Renderer::Get()->LoadingHeartbeat()` between steps (it draws only when one is due, and only while
+  a loading scene is up).
 - Its scripts run inside a load. Have them load what they need in `Start` (or have it in the scene),
   not every tick, and start nothing that should outlive the scene -- a looping sound keeps playing
   after its node is gone.

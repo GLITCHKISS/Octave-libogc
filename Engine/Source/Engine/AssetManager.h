@@ -25,7 +25,8 @@ struct AsyncLoadRequest
     const EmbeddedFile* mEmbeddedData = nullptr;
     TypeId mType = INVALID_TYPE_ID;
     Asset* mAsset = nullptr;
-    int32_t mRequeueCount = 0;
+    int32_t mRequeueCount = 0;      // requeues with nothing in flight (see UpdateEndLoadQueue)
+    uint32_t mFinishedSeen = 0;     // AssetManager::mAsyncFinished at its last requeue
     bool mFailed = false;           // the file could not be read: there is no asset to hand over
 };
 
@@ -160,6 +161,12 @@ public:
     // restart: the bar starts again from empty (false: it carries on from where the last pump left it)
     void EnableLoadProgressPump(bool enable, bool restart = true);
 
+    // Finishes up to `maxLoads` assets the async loader thread has read (each Create()d here, on this thread),
+    // and says how many it finished: 0 when none in the queue is ready (one still waiting on its dependencies
+    // is passed over, not stopped at). Update finishes up to 3 a frame; this lets a caller
+    // finish them one at a time against its own time budget (the startup loading scene).
+    uint32_t FinishAsyncLoads(uint32_t maxLoads);
+
 protected:
 
     static ThreadFuncRet AsyncLoadThreadFunc(void* in);
@@ -167,7 +174,7 @@ protected:
     static AssetManager* sInstance;
     AssetManager();
 
-    void UpdateEndLoadQueue();
+    uint32_t UpdateEndLoadQueue(uint32_t maxIterations = 3);
 
     std::unordered_map<std::string, AssetStub*> mAssetMap;      // Name-based lookup (first wins)
     std::unordered_map<std::string, AssetStub*> mAssetPathMap;  // Path-based lookup (e.g., "Models/SM_Plane")
@@ -181,6 +188,8 @@ protected:
     bool mDestructing = false;
     std::deque<AsyncLoadRequest*> mBeginLoadQueue;
     std::deque<AsyncLoadRequest*> mEndLoadQueue;
+    bool mAsyncThreadBusy = false;  // the loader thread is reading a request (popped, not yet handed over)
+    uint32_t mAsyncFinished = 0;    // loads finished on the main thread, ever (progress, for the requeue limit)
     ThreadObject* mAsyncLoadThread = {};
     MutexObject* mMutex = {};
 

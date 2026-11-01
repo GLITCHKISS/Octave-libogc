@@ -11,6 +11,7 @@
 
 #include "System/System.h"
 #include "Engine.h"
+#include "Renderer.h"
 
 #include <gccore.h>
 #if PLATFORM_GAMECUBE
@@ -2319,6 +2320,10 @@ void AUD_WaitForTracks(uint32_t timeoutMs)
         LWP_MutexUnlock(sTrackMutex);
         if (!busy || SYS_GetTimeMicroseconds() - fromUs > uint64_t(timeoutMs) * 1000u)
             break;
+        // (a loading scene kept moving meanwhile: a loading frame every so often, its wait for the display the track
+        //  thread's time as the sleep is)
+        if (Renderer::Get() != nullptr)
+            Renderer::Get()->LoadingHeartbeat();
         usleep(2000);
     }
     sTrackRush = false;

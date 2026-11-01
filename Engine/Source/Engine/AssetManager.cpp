@@ -1775,6 +1775,7 @@ ThreadFuncRet AssetManager::AsyncLoadThreadFunc(void* in)
         {
             request = am.mBeginLoadQueue.front();
             am.mBeginLoadQueue.pop_front();
+            am.mAsyncThreadBusy = true;
         }
         SYS_UnlockMutex(am.mMutex);
 
@@ -1828,6 +1829,7 @@ ThreadFuncRet AssetManager::AsyncLoadThreadFunc(void* in)
             {
                 SCOPED_LOCK(am.mMutex);
                 am.mEndLoadQueue.push_back(request);
+                am.mAsyncThreadBusy = false;
             }
         }
         else
@@ -1840,12 +1842,31 @@ ThreadFuncRet AssetManager::AsyncLoadThreadFunc(void* in)
     THREAD_RETURN();
 }
 
-void AssetManager::UpdateEndLoadQueue()
+uint32_t AssetManager::FinishAsyncLoads(uint32_t maxLoads)
+{
+    // Once round the queue at most: one still waiting on its dependencies goes to the back and the next is
+    // tried, so 0 means nothing in it is ready -- not just the one at the front.
+    size_t attempts = 0;
+    {
+        SCOPED_LOCK(mMutex);
+        attempts = mEndLoadQueue.size();
+    }
+
+    uint32_t finished = 0;
+    while (finished < maxLoads && attempts-- > 0)
+    {
+        finished += UpdateEndLoadQueue(1);
+    }
+
+    return finished;
+}
+
+uint32_t AssetManager::UpdateEndLoadQueue(uint32_t maxIterations)
 {
     SCOPED_LOCK(mMutex);
 
-    const uint32_t maxIterations = 3;
     uint32_t numIterations = 0;
+    uint32_t numFinished = 0;
 
     bool handled = false;
 
@@ -1956,9 +1977,23 @@ void AssetManager::UpdateEndLoadQueue()
                 // Still waiting on some dependent assets, so push this on the back of the queue
                 // This might happen several times before the dependent assests make their way to the front
                 // of the mEndLoadQueue.
-                LogWarning("Async load for %s is still waiting on dependencies", loadRequest->mName.c_str());
+                // Only a requeue with nothing in flight counts towards the limit: the loader thread idle,
+                // nothing waiting for it, and no load finished since this one's last requeue -- a cycle,
+                // which nothing will ever resolve. A request waiting on many loads that are going ahead
+                // (a whole scene, read in the background) was forced through synchronously after 30 quick
+                // requeues, stalling the frames it was meant to keep drawing.
                 mEndLoadQueue.push_back(loadRequest);
-                loadRequest->mRequeueCount++;
+                const bool inFlight = mAsyncThreadBusy || !mBeginLoadQueue.empty() || (mAsyncFinished != loadRequest->mFinishedSeen);
+                loadRequest->mFinishedSeen = mAsyncFinished;
+                if (inFlight)
+                {
+                    loadRequest->mRequeueCount = 0;
+                }
+                else
+                {
+                    loadRequest->mRequeueCount++;
+                    LogWarning("Async load for %s is still waiting on dependencies, none loading", loadRequest->mName.c_str());
+                }
 
                 if (loadRequest->mRequeueCount >= ASYNC_REQUEUE_LIMIT)
                 {
@@ -1967,7 +2002,10 @@ void AssetManager::UpdateEndLoadQueue()
                 }
             }
         }
+        if (handled) { ++numFinished; ++mAsyncFinished; }
     } while (handled && numIterations < maxIterations);
+
+    return numFinished;
 }
 
 #if EDITOR

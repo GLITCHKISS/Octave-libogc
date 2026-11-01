@@ -433,6 +433,49 @@ static int Octave_os_time(lua_State* L)
 }
 #endif
 
+#if !EDITOR
+// The default scene made on a loading screen (Initialize), not yet spawned.
+static NodePtr sStartupRoot;
+static bool sStartupPending = false;
+
+// The startup load done: the default scene made on a loading screen put in the loading scene's place (Initialize
+// left it for the first frame), and the screen taken down.
+static void FinishStartupLoad()
+{
+    sStartupPending = false;
+
+    if (sStartupRoot != nullptr)
+    {
+        Renderer::Get()->SetLoadingWorldTick(false);
+        GetWorld(0)->DestroyRootNode();
+        GetWorld(0)->SetRootNode(sStartupRoot.Get());
+        sStartupRoot = nullptr;
+    }
+
+    // The scene is up, so stop pumping frames from the asset loader and take the screen down.
+    // Anything loaded from here on is the game's business, and a game that wants a loading screen
+    // of its own can put one up itself.
+    AssetManager::Get()->EnableLoadProgressPump(false);
+    Renderer::Get()->EnableLoadingScreen(false);
+
+    // And give the logo's memory back.
+    //
+    // It is only ever seen during the load, but it was staying resident for the whole session --
+    // several hundred kilobytes of texture doing nothing, on a machine where a game can be close
+    // enough to the ceiling for that to matter. The splash is already freed the same way once it
+    // has been shown.
+    if (sEngineConfig.mLoadingScreenLogo != "")
+    {
+        if (Renderer::Get()->GetLoadingScreenWidget() != nullptr)
+        {
+            Renderer::Get()->GetLoadingScreenWidget()->SetLogo(nullptr);
+        }
+
+        UnloadAsset(sEngineConfig.mLoadingScreenLogo);
+    }
+}
+#endif
+
 bool Initialize()
 {
     InitializeLog();
@@ -683,6 +726,7 @@ bool Initialize()
     // A project's own loading scene, live behind the screen: spawned now (before the pump is on, so its own small
     // load draws no frames), ticked once so its nodes start here rather than inside a loading frame, then ticked and
     // drawn with each loading frame (Renderer::DrawLoadingFrame) until the default scene replaces it below.
+    bool loadingSceneUp = false;
     if (sEngineConfig.mLoadingScene != "")
     {
         if (LoadAsset<Scene>(sEngineConfig.mLoadingScene) != nullptr)
@@ -690,6 +734,7 @@ bool Initialize()
             GetWorld(0)->LoadScene(sEngineConfig.mLoadingScene.c_str(), true);
             GetWorld(0)->Update(0.0f);
             Renderer::Get()->SetLoadingWorldTick(true);
+            loadingSceneUp = true;
         }
         else
         {
@@ -701,8 +746,66 @@ bool Initialize()
 
     Scene* defaultScene = nullptr;
 
+    // With a loading scene up, the default scene is read on the asset loader's own thread (with everything it
+    // references) while this one keeps drawing the loading scene at the display's rate: the disc reads and the
+    // drawing overlap, instead of every loading frame adding its drawing and a wait for the display to the load,
+    // and the loading scene moves smoothly rather than in steps of a few assets. If that load fails, the
+    // synchronous one below is still there.
+    if (loadingSceneUp)
+    {
+        std::string sceneName = sEngineConfig.mDefaultScene;
+        if (sceneName == "" || FetchAssetStub(sceneName) == nullptr)
+        {
+            sceneName = "";
+            for (const std::string& name : GetDefaultSceneNames())
+            {
+                if (FetchAssetStub(name) != nullptr) { sceneName = name; break; }
+            }
+        }
+
+        if (sceneName != "")
+        {
+            AssetManager::Get()->EnableLoadProgressPump(false);     // (frames drawn here, not by the loader)
+            AssetRef sceneRef;
+            AsyncLoadAsset(sceneName, &sceneRef);
+            const uint64_t start = SYS_GetTimeMicroseconds();
+
+            while (sceneRef.Get() == nullptr && sceneRef.GetLoadRequest() != nullptr)
+            {
+                // Finish what the loader thread has read, one asset at a time (each is Create()d on this thread,
+                // and a big one can take a while), for up to kFinishBudget a frame -- and no longer than there's
+                // something ready: no waiting about here, where this thread's priority would keep the loader
+                // from the CPU (disc and SD reads busy-wait). Then a loading frame: its wait for the display is
+                // the loader's time to read.
+                const uint64_t kFinishBudget = 25000;
+                const uint64_t frameStart = SYS_GetTimeMicroseconds();
+                while (sceneRef.Get() == nullptr &&
+                       SYS_GetTimeMicroseconds() - frameStart < kFinishBudget &&
+                       AssetManager::Get()->FinishAsyncLoads(1) > 0)
+                {
+                }
+
+                const float seconds = float(double(SYS_GetTimeMicroseconds() - start) / 1000000.0);
+                Renderer::Get()->DrawLoadingFrame(seconds / (seconds + 4.0f));
+
+                if (seconds > 300.0f)
+                {
+                    LogWarning("Background load of %s still not done after 5 minutes: loading it here", sceneName.c_str());
+                    break;
+                }
+            }
+
+            defaultScene = sceneRef.Get<Scene>();
+            if (defaultScene == nullptr)
+            {
+                LogWarning("Background load of %s failed: loading it here", sceneName.c_str());
+            }
+            AssetManager::Get()->EnableLoadProgressPump(true);
+        }
+    }
+
     // If a given default scene was provided via config, load that one.
-    if (sEngineConfig.mDefaultScene != "")
+    if (defaultScene == nullptr && sEngineConfig.mDefaultScene != "")
     {
         defaultScene = LoadAsset<Scene>(sEngineConfig.mDefaultScene.c_str());
 
@@ -739,38 +842,31 @@ bool Initialize()
         }
     }
 
-    // Then spawn it on world 0 (in place of a loading scene, if there was one)
-    Renderer::Get()->SetLoadingWorldTick(false);
-
-    if (defaultScene != nullptr)
+    // Then spawn it on world 0, in place of a loading scene if there was one. With one up, the default scene is made
+    // here off the world, loading frames drawn as it goes (Renderer::LoadingHeartbeat), and put in its place at the
+    // first frame (FinishStartupLoad) -- after OctPostInitialize, which runs with the loading scene still moving (the
+    // loader drawing frames as it loads, waits heartbeating). Spawned straight in, then the game's own startup work
+    // (its sounds, ARAM tracks), then the first frame: seconds of a frozen picture on the GameCube between the load
+    // and the game.
+    if (defaultScene != nullptr && loadingSceneUp)
     {
-        GetWorld(0)->LoadScene(defaultScene->GetName().c_str(), true);
+        sStartupRoot = defaultScene->Instantiate();
+        sStartupPending = true;
     }
     else
     {
-        LogWarning("No default scene found.");
-    }
+        Renderer::Get()->SetLoadingWorldTick(false);
 
-    // The scene is up, so stop pumping frames from the asset loader and take the screen down.
-    // Anything loaded from here on is the game's business, and a game that wants a loading screen
-    // of its own can put one up itself.
-    AssetManager::Get()->EnableLoadProgressPump(false);
-    Renderer::Get()->EnableLoadingScreen(false);
-
-    // And give the logo's memory back.
-    //
-    // It is only ever seen during the load, but it was staying resident for the whole session --
-    // several hundred kilobytes of texture doing nothing, on a machine where a game can be close
-    // enough to the ceiling for that to matter. The splash is already freed the same way once it
-    // has been shown.
-    if (sEngineConfig.mLoadingScreenLogo != "")
-    {
-        if (Renderer::Get()->GetLoadingScreenWidget() != nullptr)
+        if (defaultScene != nullptr)
         {
-            Renderer::Get()->GetLoadingScreenWidget()->SetLogo(nullptr);
+            GetWorld(0)->LoadScene(defaultScene->GetName().c_str(), true);
+        }
+        else
+        {
+            LogWarning("No default scene found.");
         }
 
-        UnloadAsset(sEngineConfig.mLoadingScreenLogo);
+        FinishStartupLoad();
     }
 
 #endif
@@ -801,6 +897,13 @@ bool Update()
         SYS_Update();
         return !sEngineState.mQuit;
     }
+
+#if !EDITOR
+    if (sStartupPending)
+    {
+        FinishStartupLoad();        // (the default scene, made on the loading screen: in its place now)
+    }
+#endif
 
     sEngineState.mFrameNumber++;
     GetProfiler()->BeginFrame();

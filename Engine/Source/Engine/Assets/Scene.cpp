@@ -2,6 +2,7 @@
 #include "EngineFeatures.h"
 
 #include "World.h"
+#include "Renderer.h"
 #include "Log.h"
 #include "Engine.h"
 #include "Script.h"
@@ -351,6 +352,12 @@ NodePtr Scene::Instantiate()
 
         for (uint32_t i = 0; i < mNodeDefs.size(); ++i)
         {
+            // (a big scene spawned on a loading screen -- the startup's default scene: its loading scene kept moving)
+            if (Renderer::Get() != nullptr)
+            {
+                Renderer::Get()->LoadingHeartbeat();
+            }
+
             NodePtr nodePtr;
             NodePtr parent = (i > 0 && nodeList.size() > mNodeDefs[i].mParentIndex) ? nodeList[mNodeDefs[i].mParentIndex] : nullptr;
 

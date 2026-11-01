@@ -67,6 +67,13 @@ public:
     // While on, each loading frame also ticks world 0 (by the time since the last one) and the loading screen's
     // backdrop is left off, so a loading scene (EngineConfig::mLoadingScene) moves and shows behind it.
     void SetLoadingWorldTick(bool tick);
+
+    // A loading frame now (DrawLoadingFrame, at the last progress) if a loading scene is up (SetLoadingWorldTick)
+    // and it's been a while since the last one: for long work on the main thread that isn't an asset load (the
+    // loader draws its own frames) -- a big scene spawned, a game's startup (OctPostInitialize), a wait -- so the
+    // loading scene keeps moving through it. Not from inside a world's tick.
+    void LoadingHeartbeat();
+
     bool IsConsoleEnabled();
 
     void DirtyAllWidgets();
@@ -225,6 +232,8 @@ private:
     SharedPtr<LoadingScreen> mLoadingScreenWidget;
     bool mLoadingWorldTick = false;
     uint64_t mLoadingTickTime = 0;
+    uint64_t mLoadingFrameTime = 0;     // when the last loading frame was done (LoadingHeartbeat)
+    float mLoadingProgress = 0.0f;      // its progress
     bool mInLoadingFrame = false;
 
     // "Powered by Octave" boot splash (packaged games only).

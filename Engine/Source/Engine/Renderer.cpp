@@ -673,6 +673,21 @@ void Renderer::SetLoadingWorldTick(bool tick)
     }
 }
 
+void Renderer::LoadingHeartbeat()
+{
+    if (!mLoadingWorldTick || mInLoadingFrame || mLoadingScreenWidget == nullptr)
+    {
+        return;
+    }
+
+    // (25 a second at most: each frame's drawing and its wait for the display come out of the work it breaks into)
+    const uint64_t kHeartbeatUs = 40000;
+    if (SYS_GetTimeMicroseconds() - mLoadingFrameTime >= kHeartbeatUs)
+    {
+        DrawLoadingFrame(mLoadingProgress);
+    }
+}
+
 void Renderer::DrawLoadingFrame(float progress, const char* message)
 {
     // (not from inside one: a loading scene's tick that loads something would come back here)
@@ -691,6 +706,7 @@ void Renderer::DrawLoadingFrame(float progress, const char* message)
     }
 
     mLoadingScreenWidget->SetProgress(progress);
+    mLoadingProgress = progress;
 
     World* world = GetWorld(0);
 
@@ -714,6 +730,7 @@ void Renderer::DrawLoadingFrame(float progress, const char* message)
         Render(world, 0);
     }
 
+    mLoadingFrameTime = SYS_GetTimeMicroseconds();
     mInLoadingFrame = false;
 }
 
