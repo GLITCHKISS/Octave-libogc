@@ -217,12 +217,41 @@ void WaveGrid::Update(float dt)
         cosT[w] = cosf(wv.mTime);
         sinT[w] = sinf(wv.mTime);
     }
+    // (the usual counts written out, no loop over the waves inside the loop over the points: on the GameCube that
+    //  loop's counting and indexing cost about as much as the sums -- ~0.07 ms a frame over a couple of thousand points)
     const float* sp = mSpatial.data();
-    for (uint32_t i = 0; i < n; ++i, sp += nw * 2)
+    float* height = mHeight.data();
+    switch (waves)
     {
-        float h = 0.0f;
-        for (uint32_t w = 0; w < waves; ++w) h += sp[w * 2] * cosT[w] - sp[w * 2 + 1] * sinT[w];
-        mHeight[i] = h;
+    case 0:
+        for (uint32_t i = 0; i < n; ++i) height[i] = 0.0f;
+        break;
+    case 1:
+        for (uint32_t i = 0; i < n; ++i, sp += 2)
+            height[i] = sp[0] * cosT[0] - sp[1] * sinT[0];
+        break;
+    case 2:
+        for (uint32_t i = 0; i < n; ++i, sp += 4)
+            height[i] = sp[0] * cosT[0] - sp[1] * sinT[0] + sp[2] * cosT[1] - sp[3] * sinT[1];
+        break;
+    case 3:
+        for (uint32_t i = 0; i < n; ++i, sp += 6)
+            height[i] = sp[0] * cosT[0] - sp[1] * sinT[0] + sp[2] * cosT[1] - sp[3] * sinT[1] +
+                        sp[4] * cosT[2] - sp[5] * sinT[2];
+        break;
+    case 4:
+        for (uint32_t i = 0; i < n; ++i, sp += 8)
+            height[i] = sp[0] * cosT[0] - sp[1] * sinT[0] + sp[2] * cosT[1] - sp[3] * sinT[1] +
+                        sp[4] * cosT[2] - sp[5] * sinT[2] + sp[6] * cosT[3] - sp[7] * sinT[3];
+        break;
+    default:
+        for (uint32_t i = 0; i < n; ++i, sp += nw * 2)
+        {
+            float h = 0.0f;
+            for (uint32_t w = 0; w < waves; ++w) h += sp[w * 2] * cosT[w] - sp[w * 2 + 1] * sinT[w];
+            height[i] = h;
+        }
+        break;
     }
 
     // the rings: each over the points it can reach (the square round it), those within its train of its middle
