@@ -5,6 +5,7 @@
 
 #include "Engine.h"
 #include "Log.h"
+#include "System/System.h"
 
 // GAME CONTROLLERS THROUGH SDL2. XInput sees only Xbox-style pads; SDL's game controller layer
 // also reads Nintendo Switch Pro controllers and Joy-Cons, PlayStation pads and most others, and
@@ -35,10 +36,27 @@ namespace
         decltype(&SDL_GameControllerUpdate) Update = nullptr;
         decltype(&SDL_GameControllerGetButton) GetButton = nullptr;
         decltype(&SDL_GameControllerGetAxis) GetAxis = nullptr;
+        decltype(&SDL_GameControllerRumble) Rumble = nullptr; // optional (older SDL2s have none)
     };
 
     SdlApi sSdl;
     SDL_GameController* sPads[INPUT_MAX_GAMEPADS] = {};
+
+    // XInput has no rumble duration, so when it runs the motors the time they stop is kept here
+    // (0 = not rumbling) and INP_Update zeroes them once it passes. SDL times its own rumble.
+    uint64_t sXinputRumbleEndUs[INPUT_MAX_GAMEPADS] = {};
+
+    float RumbleClamp(float v)
+    {
+        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    }
+
+    void XinputStopRumble(int32_t i)
+    {
+        XINPUT_VIBRATION vibration = {};
+        XInputSetState(i, &vibration);
+        sXinputRumbleEndUs[i] = 0;
+    }
 
     template <typename T>
     bool LoadFn(T& fn, const char* name)
@@ -90,6 +108,9 @@ namespace
             return;
         }
         sSdl.mReady = true;
+
+        // Rumble came in SDL 2.0.9: without it the pads still read, they just don't rumble
+        LoadFn(sSdl.Rumble, "SDL_GameControllerRumble");
         LogDebug("Game controllers through SDL2");
     }
 
@@ -222,6 +243,15 @@ void INP_Initialize()
 
 void INP_Shutdown()
 {
+    // (Closing an SDL controller stops its rumble; XInput's motors are stopped by hand.)
+    for (int32_t i = 0; i < XUSER_MAX_COUNT && i < INPUT_MAX_GAMEPADS; ++i)
+    {
+        if (sXinputRumbleEndUs[i] != 0)
+        {
+            XinputStopRumble(i);
+        }
+    }
+
     SdlStop();
     InputShutdown();
 }
@@ -238,6 +268,15 @@ void INP_Update()
         SdlUpdate(input);
         InputPostUpdate();
         return;
+    }
+
+    uint64_t nowUs = SYS_GetTimeMicroseconds();
+    for (int32_t i = 0; i < XUSER_MAX_COUNT && i < INPUT_MAX_GAMEPADS; ++i)
+    {
+        if (sXinputRumbleEndUs[i] != 0 && nowUs >= sXinputRumbleEndUs[i])
+        {
+            XinputStopRumble(i);
+        }
     }
 
     for (int32_t i = 0; i < XUSER_MAX_COUNT && i < INPUT_MAX_GAMEPADS; i++)
@@ -361,6 +400,51 @@ const char* INP_ShowSoftKeyboard(bool show)
 bool INP_IsSoftKeyboardShown()
 {
     return false;
+}
+
+void INP_SetGamepadRumble(float low, float high, float seconds, int32_t gamepadIndex)
+{
+    if (gamepadIndex < 0 || gamepadIndex >= INPUT_MAX_GAMEPADS)
+    {
+        return;
+    }
+
+    low = RumbleClamp(low);
+    high = RumbleClamp(high);
+    bool stop = !(seconds > 0.0f) || (low <= 0.0f && high <= 0.0f);
+    uint16_t lowSpeed = stop ? 0 : (uint16_t)(low * 65535.0f + 0.5f);
+    uint16_t highSpeed = stop ? 0 : (uint16_t)(high * 65535.0f + 0.5f);
+
+    if (sSdl.mReady)
+    {
+        // SDL stops it when the time runs out (a duration of 0 would mean "forever", so a
+        // stop sends zero strengths, and a rumble at least 1 ms)
+        if (sSdl.Rumble != nullptr && sPads[gamepadIndex] != nullptr)
+        {
+            float ms = seconds * 1000.0f + 0.5f;
+            uint32_t durationMs = stop ? 0 : (ms < 1.0f ? 1 : (ms > 65535.0f ? 65535 : (uint32_t)ms));
+            sSdl.Rumble(sPads[gamepadIndex], lowSpeed, highSpeed, durationMs);
+        }
+        return;
+    }
+
+    if (gamepadIndex >= XUSER_MAX_COUNT)
+    {
+        return;
+    }
+
+    if (stop)
+    {
+        XinputStopRumble(gamepadIndex);
+        return;
+    }
+
+    // Left is the heavy motor, right the light one
+    XINPUT_VIBRATION vibration = {};
+    vibration.wLeftMotorSpeed = lowSpeed;
+    vibration.wRightMotorSpeed = highSpeed;
+    XInputSetState(gamepadIndex, &vibration);
+    sXinputRumbleEndUs[gamepadIndex] = SYS_GetTimeMicroseconds() + (uint64_t)(seconds * 1000000.0);
 }
 
 

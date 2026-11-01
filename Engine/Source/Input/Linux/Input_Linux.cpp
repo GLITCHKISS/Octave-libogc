@@ -254,4 +254,9 @@ bool INP_IsSoftKeyboardShown()
     return false;
 }
 
+void INP_SetGamepadRumble(float low, float high, float seconds, int32_t gamepadIndex)
+{
+    // No rumble on this platform yet
+}
+
 #endif

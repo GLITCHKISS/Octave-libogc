@@ -227,6 +227,17 @@ Sig: `connected = Input.IsGamepadConnected(index=1)`
  - Arg: `integer index` Gamepad index/port
  - Ret: `boolean connected` Is gamepad connected
 ---
+### Rumble
+Rumble a gamepad for a number of seconds. A new call replaces the current rumble, so calling it every frame with a short duration keeps a continuous rumble going (and its strength can change from frame to frame). `Input.Rumble(0, 0, 0, index)` stops it.
+
+On Windows the two motors are set separately (through SDL2, or XInput without it). The GameCube pad (and the Wiimote) has a single motor that is only on or off, so there the stronger of the two strengths is used and approximated by pulsing the motor. Does nothing on Linux, Android and 3DS.
+
+Sig: `Input.Rumble(low, high, seconds, index=1)`
+ - Arg: `number low` Strength of the heavy low-frequency motor (0 to 1)
+ - Arg: `number high` Strength of the light high-frequency buzz (0 to 1)
+ - Arg: `number seconds` How long to rumble for
+ - Arg: `integer index` Gamepad index/port
+---
 ### ShowCursor
 Show/hide the mouse cursor.
 

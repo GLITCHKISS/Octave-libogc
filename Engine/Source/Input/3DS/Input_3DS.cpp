@@ -164,5 +164,10 @@ bool INP_IsSoftKeyboardShown()
     return false;
 }
 
+void INP_SetGamepadRumble(float low, float high, float seconds, int32_t gamepadIndex)
+{
+    // No rumble motor on the 3DS
+}
+
 
 #endif

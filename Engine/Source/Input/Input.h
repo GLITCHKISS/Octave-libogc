@@ -65,6 +65,12 @@ void INP_GetGamepadGyro(float& x, float& y, float& z, int32_t gamepadIndex);
 void INP_GetGamepadAcceleration(float& x, float& y, float& z, int32_t gamepadIndex);
 void INP_GetGamepadOrientation(float& pitch, float& yaw, float& roll, int32_t gamepadIndex);
 
+// Rumble a gamepad: low is the heavy low-frequency motor, high the light high-frequency buzz (both
+// 0..1), for the given seconds. A new call replaces the current one, so a short call every frame
+// keeps a continuous rumble going; (0, 0, 0) stops it. (The GameCube motor is on/off only, so its
+// strength is faked by pulsing.)
+void INP_SetGamepadRumble(float low, float high, float seconds, int32_t gamepadIndex = 0);
+
 bool INP_IsCursorLocked();
 bool INP_IsCursorTrapped();
 bool INP_IsCursorShown();

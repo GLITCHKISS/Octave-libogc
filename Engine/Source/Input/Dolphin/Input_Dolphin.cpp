@@ -6,10 +6,87 @@
 #include "Engine.h"
 #include "Log.h"
 #include "Maths.h"
+#include "System/System.h"
 
 #if PLATFORM_WII
 #include <wiiuse/wpad.h>
 #endif
+
+namespace
+{
+    // RUMBLE. The GameCube pad's motor (and the Wiimote's) is only on or off, so a strength is
+    // faked by pulsing it: each frame the strength is added to an accumulator and the motor runs
+    // on the frames it tips over 1 (0.5 = every other frame, 1 = always on). The motor is only
+    // told when it changes between on and off.
+    struct RumbleState
+    {
+        float mStrength = 0.0f;
+        float mAccum = 0.0f;
+        uint64_t mEndUs = 0; // 0 = not rumbling
+        bool mMotorOn = false;
+        bool mOnWiimote = false; // (the device the motor was started on, on Wii)
+    };
+
+    RumbleState sRumble[INPUT_MAX_GAMEPADS];
+
+    void SetMotor(int32_t i, bool on)
+    {
+        RumbleState& r = sRumble[i];
+        if (on == r.mMotorOn)
+        {
+            return;
+        }
+        r.mMotorOn = on;
+
+#if PLATFORM_WII
+        // A Wiimote or classic controller rumbles through the Wiimote, a GameCube pad by itself
+        if (on)
+        {
+            r.mOnWiimote = (GetEngineState()->mInput.mGamepads[i].mType != GamepadType::GameCube);
+        }
+        if (r.mOnWiimote)
+        {
+            WPAD_Rumble(WPAD_CHAN_0 + i, on ? 1 : 0);
+            return;
+        }
+#endif
+
+        PAD_ControlMotor(i, on ? PAD_MOTOR_RUMBLE : PAD_MOTOR_STOP);
+    }
+
+    void StopRumble(int32_t i)
+    {
+        SetMotor(i, false);
+        sRumble[i] = RumbleState();
+    }
+
+    void UpdateRumble()
+    {
+        uint64_t nowUs = SYS_GetTimeMicroseconds();
+        for (int32_t i = 0; i < INPUT_MAX_GAMEPADS; ++i)
+        {
+            RumbleState& r = sRumble[i];
+            if (r.mEndUs == 0)
+            {
+                continue;
+            }
+            if (nowUs >= r.mEndUs)
+            {
+                StopRumble(i);
+                continue;
+            }
+
+            r.mAccum += r.mStrength;
+            bool on = false;
+            if (r.mAccum >= 1.0f)
+            {
+                on = true;
+                r.mAccum -= 1.0f;
+            }
+            SetMotor(i, on);
+        }
+    }
+}
 
 void INP_Initialize()
 {
@@ -36,6 +113,15 @@ void INP_Initialize()
 
 void INP_Shutdown()
 {
+    for (int32_t i = 0; i < INPUT_MAX_GAMEPADS; ++i)
+    {
+        PAD_ControlMotor(i, PAD_MOTOR_STOP);
+#if PLATFORM_WII
+        WPAD_Rumble(WPAD_CHAN_0 + i, 0);
+#endif
+        sRumble[i] = RumbleState();
+    }
+
     InputShutdown();
 }
 
@@ -212,6 +298,9 @@ void INP_Update()
         input.mGamepads[i].mAxes[GAMEPAD_AXIS_RTRIGGER] = pads[i].triggerR / 255.0f;
     }
 
+    // (After the pads are read, so on Wii each one's type is known.)
+    UpdateRumble();
+
     InputPostUpdate();
 }
 
@@ -243,6 +332,27 @@ const char* INP_ShowSoftKeyboard(bool show)
 bool INP_IsSoftKeyboardShown()
 {
     return false;
+}
+
+void INP_SetGamepadRumble(float low, float high, float seconds, int32_t gamepadIndex)
+{
+    if (gamepadIndex < 0 || gamepadIndex >= INPUT_MAX_GAMEPADS)
+    {
+        return;
+    }
+
+    // One motor: the stronger of the two strengths drives it
+    float strength = glm::max(glm::clamp(low, 0.0f, 1.0f), glm::clamp(high, 0.0f, 1.0f));
+    if (!(seconds > 0.0f) || strength <= 0.0f)
+    {
+        StopRumble(gamepadIndex);
+        return;
+    }
+
+    // The accumulator is kept, so calling this every frame keeps the pulsing even
+    RumbleState& r = sRumble[gamepadIndex];
+    r.mStrength = strength;
+    r.mEndUs = SYS_GetTimeMicroseconds() + (uint64_t)(seconds * 1000000.0f);
 }
 
 

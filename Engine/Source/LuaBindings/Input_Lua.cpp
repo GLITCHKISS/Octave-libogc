@@ -359,6 +359,20 @@ int Input_Lua::GetGamepadOrientation(lua_State* L)
     return Vector_Lua::Create(L, glm::vec3(pitch, yaw, roll));
 }
 
+int Input_Lua::Rumble(lua_State* L)
+{
+    float low = CHECK_NUMBER(L, 1);
+    float high = CHECK_NUMBER(L, 2);
+    float seconds = CHECK_NUMBER(L, 3);
+
+    int index = 0;
+    if (!lua_isnone(L, 4)) { index = CHECK_INDEX(L, 4); }
+
+    INP_SetGamepadRumble(low, high, seconds, index);
+
+    return 0;
+}
+
 int Input_Lua::ShowCursor(lua_State* L)
 {
     bool show = CHECK_BOOLEAN(L, 1);
@@ -526,6 +540,8 @@ void Input_Lua::Bind()
     REGISTER_TABLE_FUNC(L, tableIdx, GetGamepadAcceleration);
 
     REGISTER_TABLE_FUNC(L, tableIdx, GetGamepadOrientation);
+
+    REGISTER_TABLE_FUNC(L, tableIdx, Rumble);
 
     REGISTER_TABLE_FUNC(L, tableIdx, ShowCursor);
     REGISTER_TABLE_FUNC(L, tableIdx, TrapCursor);
