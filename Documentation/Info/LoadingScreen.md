@@ -94,6 +94,19 @@ Things to know:
   after its node is gone.
 - It needs its own camera.
 
+## Loading a scene later
+
+A script can load another scene behind the same loading scene -- a title screen starting a level:
+
+```lua
+Engine.LoadSceneWithLoadingScreen("SC_Level1")
+```
+
+At the start of the next frame the loading scene replaces the current one, whatever nothing holds any more is
+unloaded (the old scene's assets), and the new scene is read in the background, made and put in, as at startup.
+Assets a game loaded itself and means to keep -- sounds preloaded in `OctPostInitialize` -- must be held with an
+`AssetRef`, or they go too.
+
 ## Without the text or the bar
 
 For a screen that's only a loading scene, or only a logo:

@@ -200,6 +200,14 @@ int Engine_Lua::GetTimeDilation(lua_State* L)
     return 1;
 }
 
+int Engine_Lua::LoadSceneWithLoadingScreen(lua_State* L)
+{
+    const char* name = CHECK_STRING(L, 1);
+
+    ::LoadSceneWithLoadingScreen(name);
+    return 0;
+}
+
 int Engine_Lua::GarbageCollect(lua_State* L)
 {
     ::GarbageCollect();
@@ -259,6 +267,8 @@ void Engine_Lua::Bind()
     REGISTER_TABLE_FUNC(L, tableIdx, GetTimeDilation);
 
     REGISTER_TABLE_FUNC(L, tableIdx, GarbageCollect);
+
+    REGISTER_TABLE_FUNC(L, tableIdx, LoadSceneWithLoadingScreen);
 
     lua_setglobal(L, "Engine");
 

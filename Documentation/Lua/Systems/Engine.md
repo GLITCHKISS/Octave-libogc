@@ -140,3 +140,16 @@ Garbage collect scripts AND reference sweep assets. This is a slow process and m
 Sig: `Engine.GarbageCollect()`
 
 ---
+### LoadSceneWithLoadingScreen
+Load a scene in place of world 0's behind the loading screen, the way the default scene loads at startup: the
+project's loading scene (`LoadingScene` in Config.ini) is put up in place of the current scene, assets nothing holds
+any more are unloaded, and the new scene is read in the background while the loading scene keeps moving. It happens
+at the start of the next frame, so it can be called from a script's tick. Without a loading scene the scene loads the
+ordinary way with the loading screen up. In the editor it loads as `World:LoadScene` does.
+
+Assets a game loads itself and wants to keep across scenes must be held (a reference kept), or they are unloaded too.
+
+Sig: `Engine.LoadSceneWithLoadingScreen(name)`
+ - Arg: `string name` Scene name
+
+---

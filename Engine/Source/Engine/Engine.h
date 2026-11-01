@@ -67,6 +67,11 @@ float GetTimeDilation();
 
 void GarbageCollect();
 
+// The scene loaded in place of world 0's behind the loading screen, as the default one is at startup: the project's
+// loading scene (EngineConfig::mLoadingScene) up while it's read in the background. At the start of the next frame,
+// so a script can ask from its tick. In the editor, loaded as World::LoadScene does.
+void LoadSceneWithLoadingScreen(const char* sceneName);
+
 void GatherGlobalProperties(std::vector<Property>& props);
 
 void SetScreenOrientation(ScreenOrientation mode);

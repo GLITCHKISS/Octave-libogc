@@ -29,6 +29,7 @@ struct Engine_Lua
     static int SetTimeDilation(lua_State* L);
     static int GetTimeDilation(lua_State* L);
     static int GarbageCollect(lua_State* L);
+    static int LoadSceneWithLoadingScreen(lua_State* L);
 
     static void Bind();
 };
