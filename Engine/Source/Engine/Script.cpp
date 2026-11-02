@@ -89,6 +89,10 @@ Script::Script(Node* owner)
 
 Script::~Script()
 {
+    // Its node destroyed: the script instance's fields cleared as it goes (mClearOnDestroy). A global function the
+    // script left behind -- a closure over its instance -- otherwise kept every node and asset the instance held
+    // (and through the nodes, a whole scene's meshes and textures) after the scene was gone.
+    mClearOnDestroy = true;
     StopScript();
 }
 
@@ -1902,7 +1906,26 @@ void Script::DestroyScriptInstance()
             OCT_ASSERT(lua_istable(L, -1));
             lua_setfield(L, uvIdx, OCT_CLASS_TABLE_KEY);
 
-            lua_pop(L, 1); // Pop userdata
+            if (mClearOnDestroy)
+            {
+                // every field of the instance cleared but its class (clearing a field while traversing is allowed)
+                lua_pushnil(L);
+                while (lua_next(L, uvIdx) != 0)
+                {
+                    lua_pop(L, 1);
+                    const bool isClass = (lua_type(L, -1) == LUA_TSTRING) && (strcmp(lua_tostring(L, -1), OCT_CLASS_TABLE_KEY) == 0);
+                    if (!isClass)
+                    {
+                        lua_pushvalue(L, -1);
+                        lua_pushnil(L);
+                        lua_rawset(L, uvIdx);
+                    }
+                }
+            }
+
+            // Pop the uservalue and the userdata. (It popped the one: each script that went left its node's userdata
+            // on the stack -- a root, so its node, everything its fields held and their assets outlived the scene)
+            lua_pop(L, 2);
         }
 
         mClassName = "";

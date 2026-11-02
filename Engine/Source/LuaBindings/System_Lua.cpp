@@ -123,6 +123,9 @@ int System_Lua::SetWindowTitle(lua_State* L)
 #if PLATFORM_GAMECUBE
 size_t BigBlockCacheBytes();    // BigBlockCache_Dolphin.cpp: freed blocks kept for reuse
 #endif
+#if API_GX && PLATFORM_DOLPHIN
+size_t GxGpuFreeBytes();        // GxGpuMem.cpp
+#endif
 
 int System_Lua::GetFreeMemory(lua_State* L)
 {
@@ -135,6 +138,9 @@ int System_Lua::GetFreeMemory(lua_State* L)
 #endif
 #if PLATFORM_GAMECUBE
     freeBytes += lua_Integer(BigBlockCacheBytes());     // held for reuse, but free all the same
+#endif
+#if API_GX && PLATFORM_DOLPHIN
+    freeBytes += lua_Integer(GxGpuFreeBytes());         // GPU memory's region: its free blocks (GxGpuMem.cpp)
 #endif
 
     lua_pushinteger(L, freeBytes);

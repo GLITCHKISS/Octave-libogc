@@ -215,7 +215,10 @@ namespace
     {
         for (uint32_t i = 0; i < sNumDeferred; ++i)
         {
-            free(sDeferred[i]);
+            if (!GxGpuFree(sDeferred[i]))           // (a texture's texels from their region, or the heap's)
+            {
+                free(sDeferred[i]);
+            }
         }
         sNumDeferred = 0;
     }
@@ -922,24 +925,36 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& data)
         return;
     }
 
-    resource->mTplData = SYS_AlignedMalloc((uint32_t)data.size(), 32);
-
-    // Running out of memory here used to be a write through a null pointer: the copy below went
-    // ahead regardless and the game died inside memcpy at address 0, which says nothing about what
-    // actually went wrong. Say which texture could not be allocated and how big it was, and leave
-    // it untextured -- a missing texture is a far better failure than a corrupted heap, and it
-    // names the thing to make smaller.
+    // The texels LoadStream read straight into an aligned block, taken as they are (Texture::TakeCookedData);
+    // else a block of our own, copied into.
+    uint32_t tplSize = 0;
+    resource->mTplData = texture->TakeCookedData(tplSize);
     if (resource->mTplData == nullptr)
     {
-        LogError("Texture '%s': could not allocate %u bytes; out of memory.",
-                 texture->GetName().c_str(), (uint32_t)data.size());
-        return;
+        tplSize = (uint32_t)data.size();
+        resource->mTplData = GxGpuAlloc(tplSize);                    // (GPU memory's own region: GxGpuMem.cpp)
+        if (resource->mTplData == nullptr)
+        {
+            resource->mTplData = SYS_AlignedMalloc(tplSize, 32);
+        }
+
+        // Running out of memory here used to be a write through a null pointer: the copy below went
+        // ahead regardless and the game died inside memcpy at address 0, which says nothing about what
+        // actually went wrong. Say which texture could not be allocated and how big it was, and leave
+        // it untextured -- a missing texture is a far better failure than a corrupted heap, and it
+        // names the thing to make smaller.
+        if (resource->mTplData == nullptr)
+        {
+            LogError("Texture '%s': could not allocate %u bytes; out of memory.",
+                     texture->GetName().c_str(), tplSize);
+            return;
+        }
+
+        memcpy(resource->mTplData, data.data(), tplSize);
     }
+    resource->mTplSize = tplSize;
 
-    memcpy(resource->mTplData, data.data(), data.size());
-    resource->mTplSize = (uint32_t)data.size();
-
-    TPL_OpenTPLFromMemory(&resource->mTplFile, resource->mTplData, (uint32_t)data.size());
+    TPL_OpenTPLFromMemory(&resource->mTplFile, resource->mTplData, tplSize);
     TPL_GetTexture(&resource->mTplFile, 0, &resource->mGxTexObj);
 
     //uint32_t fmt = 0;
@@ -1389,7 +1404,11 @@ static void* WriteSkinList(const GxStripSet& s, uint32_t perVertex, const uint8_
     if (bytes == 0)
         return nullptr;
     const uint32_t size = (bytes + 31) & ~31u;
-    uint8_t* list = (uint8_t*)memalign(32, size);
+    uint8_t* list = (uint8_t*)GxGpuAlloc(size);         // (GPU memory's own region: GxGpuMem.cpp)
+    if (list == nullptr)
+    {
+        list = (uint8_t*)memalign(32, size);
+    }
     if (list == nullptr)
     {
         LogError("Mesh %s: out of memory for a %u byte skinned display list", meshName, size);

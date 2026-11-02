@@ -1744,7 +1744,11 @@ void* CreateMeshDisplayList(StaticMesh* staticMesh, bool useColor, uint32_t& out
         }
         uint32_t allocSize = (bytes + 0x1f) & (~0x1f);  // 32 byte aligned
         allocSize += 64;                                // extra space to account for the pipe flush
-        void* displayList = memalign(32, allocSize);
+        void* displayList = GxGpuAlloc(allocSize);      // (GPU memory's own region: GxGpuMem.cpp)
+        if (displayList == nullptr)
+        {
+            displayList = memalign(32, allocSize);
+        }
 
         // Out of memory: no lists at all, and the mesh is not drawn (CallMeshDisplayList skips
         // it), rather than lists written through a null pointer.

@@ -24,6 +24,9 @@ static Profiler* sProfiler = nullptr;
 #include <stdio.h>
 #include <string.h>
 #include <malloc.h>
+#if API_GX
+#include "Graphics/GX/GxUtils.h"
+#endif
 void OctLog(const char* format, ...);
 
 bool OctPerfLogging()
@@ -246,7 +249,11 @@ static void LogFrameStats(const std::vector<CpuStat>& stats, float deltaTime)
         struct mallinfo info = mallinfo();
         // heap: the free gaps inside what malloc has taken (it swings as blocks come and go); free: those and the
         // arena malloc hasn't taken yet -- the memory really left
-        const int freeK = int((info.fordblks + size_t((char*)SYS_GetArena1Hi() - (char*)SYS_GetArena1Lo())) / 1024);
+        size_t freeBytes = info.fordblks + size_t((char*)SYS_GetArena1Hi() - (char*)SYS_GetArena1Lo());
+#if API_GX
+        freeBytes += GxGpuFreeBytes();              // (GPU memory's region: its free blocks, GxGpuMem.cpp)
+#endif
+        const int freeK = int(freeBytes / 1024);
         int at = snprintf(line, sizeof(line), "PERF %.1ffps free=%dK heap=%dK avg", sFrames / sTime, freeK,
                           int(info.fordblks / 1024));
 

@@ -601,6 +601,15 @@ TextureResource* Texture::GetResource()
     return &mResource;
 }
 
+void* Texture::TakeCookedData(uint32_t& outSize)
+{
+    void* data = mCookedData;
+    outSize = mCookedSize;
+    mCookedData = nullptr;
+    mCookedSize = 0;
+    return data;
+}
+
 // WHY. A GameCube game that changes between skies frees eight 512 KB star frames and loads eight
 // more of exactly the same size, each time. With malloc that cuts the heap up: a few changes in,
 // with megabytes free, no single 512 KB block is left and the frames fail to load. The textures
@@ -944,8 +953,29 @@ void Texture::LoadStream(Stream& stream, Platform platform)
         }
 
         uint32_t cookedDataSize = stream.ReadUint32();
+#if API_GX && !EDITOR
+        // straight into the block the GPU will draw from (TakeCookedData): no copy, half the memory at once
+        if (mCookedData != nullptr)
+        {
+            if (!GxGpuFree(mCookedData)) SYS_AlignedFree(mCookedData);
+            mCookedData = nullptr;
+            mCookedSize = 0;
+        }
+        mCookedData = GxGpuAlloc(cookedDataSize);                  // (GPU memory's own region: GxGpuMem.cpp)
+        if (mCookedData == nullptr)
+        {
+            mCookedData = SYS_AlignedMalloc(cookedDataSize, 32);
+        }
+        if (mCookedData == nullptr)
+        {
+            throw std::bad_alloc();     // (as mPixels' resize did: the load's caller makes it a failed load)
+        }
+        mCookedSize = cookedDataSize;
+        stream.ReadBytes((uint8_t*)mCookedData, cookedDataSize);
+#else
         mPixels.resize(cookedDataSize);
         stream.ReadBytes(mPixels.data(), cookedDataSize);
+#endif
     }
     else
     {
@@ -1049,6 +1079,15 @@ void Texture::Destroy()
     Asset::Destroy();
 
     GFX_DestroyTextureResource(this);
+
+#if API_GX && !EDITOR
+    if (mCookedData != nullptr)         // (read, but never handed over: a load that failed after)
+    {
+        if (!GxGpuFree(mCookedData)) SYS_AlignedFree(mCookedData);
+        mCookedData = nullptr;
+        mCookedSize = 0;
+    }
+#endif
 }
 
 bool Texture::Import(const std::string& path, ImportOptions* options)

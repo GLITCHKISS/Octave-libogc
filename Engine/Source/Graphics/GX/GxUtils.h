@@ -133,6 +133,15 @@ void GxMeshListsNoCull(void* displayList);
 // memory it reads. GxDeferFree: free a block it may still be reading once it is done with it.
 void GxWaitGpu();
 void GxDeferFree(void* block);
+
+// The GPU's big blocks (textures' texels, meshes' display lists: 32-byte aligned) from their own region at the top of
+// the arena, the heap below growing up to it: the small blocks a scene leaves behind (in the heap) never cut up the
+// space its textures and lists had, and the next scene's find it whole (GxGpuMem.cpp). Null when the region has no
+// room (or for a block under 4 KB): then from the heap as before. GxGpuFree takes either (and GxDeferFree's blocks go
+// there): false if it wasn't the region's.
+void* GxGpuAlloc(uint32_t size);
+bool GxGpuFree(void* block);
+size_t GxGpuFreeBytes();         // its free blocks (free memory all the same)
 void GxCountDraw(uint32_t verts, uint32_t tris);
 
 // BindMaterial skips loading GX_TEXMTX0/1 when they already hold its UV offset and scale: code that loads either

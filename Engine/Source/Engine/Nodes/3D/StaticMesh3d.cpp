@@ -97,6 +97,14 @@ void StaticMesh3D::Destroy()
 {
     GFX_DestroyStaticMeshCompResource(this);
 
+    // Its mesh and material let go of now, not when the last reference to the node goes: a script left holding the
+    // node (a global function of a scene that's gone) kept the whole scene's meshes and textures loaded, and the next
+    // scene ran out of memory loading in its place. BEFORE Mesh3D::Destroy: the node can be deleted by the time that
+    // returns (its last reference its parent's), and these let go of again then were a mesh's refs gone below zero.
+    // (Nothing frees an asset until the next RefSweep: its collision shape and the rest are still there below.)
+    mStaticMesh = nullptr;
+    mMaterialOverride = nullptr;
+
     Mesh3D::Destroy();
 }
 

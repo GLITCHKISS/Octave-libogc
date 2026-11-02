@@ -53,6 +53,8 @@ void Quad::Destroy()
 {
     GFX_DestroyQuadResource(this);
 
+    mTexture = nullptr;                 // (its texture let go of now, before the node can be deleted: as
+                                        //  StaticMesh3D::Destroy)
     Widget::Destroy();
 }
 

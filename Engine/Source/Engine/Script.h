@@ -142,6 +142,7 @@ protected:
     std::vector<ScriptNetDatum> mReplicatedData;
     std::vector<AutoProperty> mAutoProperties;
     bool mActive = false;
+    bool mClearOnDestroy = false;       // (its node going: the instance's fields cleared as it's destroyed)
     bool mTickEnabled = false;
     bool mHandleBeginOverlap = false;
     bool mHandleEndOverlap = false;

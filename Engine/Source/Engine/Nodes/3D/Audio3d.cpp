@@ -133,6 +133,8 @@ void Audio3D::Create()
 void Audio3D::Destroy()
 {
     AudioManager::StopComponent(this);
+    mSoundWave = nullptr;               // (its sound let go of now, before the node can be deleted: as
+                                        //  StaticMesh3D::Destroy)
     Node3D::Destroy();
 }
 

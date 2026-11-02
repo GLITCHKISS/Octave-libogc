@@ -18,6 +18,10 @@ public:
 
     TextureResource* GetResource();
 
+    // GX, not the editor: the cooked texels LoadStream read straight into GPU memory for this texture (32-byte
+    // aligned), handed over to GFX_CreateTextureResource -- null if there are none. The caller owns them after.
+    void* TakeCookedData(uint32_t& outSize);
+
     // Console only (GX): fill THIS texture's existing buffer with another texture asset's texels,
     // read straight off the disc in small pieces, when the two are the same size and format.
     // Nothing big is allocated or freed -- see the .cpp. False (and nothing changed) otherwise.
@@ -132,6 +136,12 @@ protected:
     // This pixel array is used as an intermediate storage between LoadStream() and Create()
     // It is cleared and shrunk within Create() except when compiled for EDITOR
     std::vector<uint8_t> mPixels;
+
+    // GX, not the editor: the cooked texels in place of mPixels, read straight into the block the GPU will use (see
+    // TakeCookedData). Read into mPixels and copied into an aligned block, a 2 MB texture needed 4 MB at once, two
+    // 2 MB holes -- one more than a 24 MB console back from a big scene had.
+    void* mCookedData = nullptr;
+    uint32_t mCookedSize = 0;
 
     // Graphics Resource
     TextureResource mResource;

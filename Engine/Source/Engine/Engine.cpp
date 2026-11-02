@@ -36,6 +36,10 @@
 #endif
 
 #if PLATFORM_DOLPHIN
+#include "Graphics/GX/GxUtils.h"
+#endif
+
+#if PLATFORM_DOLPHIN
 #include <malloc.h>     // mallinfo, for OctLuaAlloc
 #include <new>
 void OctLog(const char* format, ...);
@@ -451,7 +455,14 @@ static bool SpawnLoadingScene()
         return false;
     }
 
-    GetWorld(0)->LoadScene(sEngineConfig.mLoadingScene.c_str(), true);
+    // Made BEFORE the scene that was up goes, not after (World::LoadScene's order): made after, its nodes, script and
+    // the rest went into the holes that scene had just left, among the next scene's big textures and meshes as they
+    // loaded round them -- and on a 24 MB console, back from a big scene, a 2 MB texture found no hole big enough.
+    // (As World::QueueRootScene, which also makes the new scene before the old one goes.)
+    Scene* loadingScene = LoadAsset<Scene>(sEngineConfig.mLoadingScene);
+    NodePtr loadingRoot = loadingScene->Instantiate();
+    GetWorld(0)->DestroyRootNode();
+    GetWorld(0)->SetRootNode(loadingRoot.Get());
     GetWorld(0)->Update(0.0f);
     Renderer::Get()->SetLoadingWorldTick(true);
     return true;
@@ -563,7 +574,30 @@ static void LoadSceneBehindLoadingScreen(const std::string& sceneName)
     // and means to keep, it holds on to: whatever nothing holds goes)
     if (loadingSceneUp)
     {
+        // Lua collected until it stops shrinking, then the assets swept. A destroyed node's Lua side goes in a cycle of
+        // its own: a handle with a finaliser keeps what it refers to (its fields' nodes, theirs) through the cycle that
+        // finalises it, so one collection let go of only the first of a chain -- the scene's nodes, and the meshes and
+        // textures they held, stayed loaded while the next scene loaded in among them
+#if LUA_ENABLED
+        {
+            lua_State* L = GetLua();
+            int before = lua_gc(L, LUA_GCCOUNT, 0);
+            for (int pass = 0; pass < 16; ++pass)
+            {
+                ScriptUtils::GarbageCollect();
+                const int after = lua_gc(L, LUA_GCCOUNT, 0);
+                if (after >= before) break;
+                before = after;
+            }
+        }
+#endif
         GarbageCollect();           // (Lua's first: a script instance gone with that scene may still hold an asset)
+#if PLATFORM_DOLPHIN
+        // And the GPU's memory of it freed now (its textures, display lists and arrays wait in GxDeferFree for the
+        // frame the GPU was drawing): left to the loading screen's next frame, the next scene's first loads went into
+        // the gaps around it, and it was freed after between them -- a heap in holes, no one of them a big texture's
+        GxWaitGpu();
+#endif
     }
 
     AssetManager::Get()->EnableLoadProgressPump(true);

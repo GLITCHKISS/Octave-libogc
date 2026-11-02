@@ -141,6 +141,9 @@ void SkeletalMesh3D::Destroy()
 {
     GFX_DestroySkeletalMeshCompResource(this);
 
+    mSkeletalMesh = nullptr;            // (its assets let go of now, before the node can be deleted: as
+    mMaterialOverride = nullptr;        //  StaticMesh3D::Destroy)
+
     Mesh3D::Destroy();
 }
 
