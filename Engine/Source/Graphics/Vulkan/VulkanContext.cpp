@@ -83,10 +83,10 @@ VulkanContext::VulkanContext()
     mSurface = 0;
     mSwapchain = 0;
 
-    // This format breaks shadow mesh rendering. If we want to 
-    // bring back that feature, then change to RGBA16 possibly. 
-    // Need the extra precision to prevent banding artifacts from srbg -> linear.
-    mSceneColorImageFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    // Half floats: the precision a linear colour space needs in the darks (8-bit banded there), and a gamma-space
+    // project's colours stored as they are keep it in the brights too. 11/11/10-bit floats (as before) step only
+    // 1/128 red and green and 1/64 blue from 0.5 to 1 -- coarser than 8-bit: a bright sky's gradient banded.
+    mSceneColorImageFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
     mGlobalUniformData.mScreenDimensions = glm::vec2(800.0f, 600.0f);
     mGlobalUniformData.mVisualizationMode = 0;

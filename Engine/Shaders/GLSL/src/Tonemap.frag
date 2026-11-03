@@ -40,6 +40,7 @@ void main()
     {
         sceneColor = texture(samplerLitColor, inTexcoord);
     }
+    sceneColor.a = 1.0;     // (the scene's own alpha isn't the picture's: its old format had none, read as 1)
 
     if (global.mLinearColorSpace != 0)
     {
