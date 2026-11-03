@@ -1531,6 +1531,37 @@ void SkeletalMesh3D::ClearBoneScale(int32_t boneIndex)
     }
 }
 
+void SkeletalMesh3D::SetBoneRotationOffset(int32_t boneIndex, glm::quat offset)
+{
+    if (boneIndex < 0)
+    {
+        return;
+    }
+
+    for (auto& over : mBoneRotationOffsets)
+    {
+        if (over.first == boneIndex)
+        {
+            over.second = offset;
+            return;
+        }
+    }
+
+    mBoneRotationOffsets.push_back({ boneIndex, offset });
+}
+
+void SkeletalMesh3D::ClearBoneRotationOffset(int32_t boneIndex)
+{
+    for (uint32_t i = 0; i < mBoneRotationOffsets.size(); ++i)
+    {
+        if (mBoneRotationOffsets[i].first == boneIndex)
+        {
+            mBoneRotationOffsets.erase(mBoneRotationOffsets.begin() + i);
+            return;
+        }
+    }
+}
+
 uint32_t SkeletalMesh3D::GetNumBones() const
 {
     return uint32_t(mBoneMatrices.size());
@@ -1815,6 +1846,15 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
                     if (over.first < (int32_t)numBones && sDecompTransforms[over.first].mValid)
                     {
                         sDecompTransforms[over.first].mScale = over.second;
+                    }
+                }
+
+                // Turns laid over the animated rotations, in each bone's parent's space
+                for (const auto& over : mBoneRotationOffsets)
+                {
+                    if (over.first < (int32_t)numBones && sDecompTransforms[over.first].mValid)
+                    {
+                        sDecompTransforms[over.first].mRotation = over.second * sDecompTransforms[over.first].mRotation;
                     }
                 }
 

@@ -176,6 +176,19 @@ Sig: `SkeletalMesh3D:SetBoneScale(boneName, scale)`
  - Arg: `string boneName` Name of bone to adjust
  - Arg: `Vector scale` Bone scale
 ---
+### SetBoneRotationOffset
+Lay a turn over a bone's animated rotation, in its parent's space. The animations keep playing under it: a head turned toward something still nods with its idle. Held until cleared.
+
+Sig: `SkeletalMesh3D:SetBoneRotationOffset(boneName, rotEuler)`
+ - Arg: `string boneName` Name of bone to turn
+ - Arg: `Vector rotEuler` The turn in euler angles (degrees), in the bone's parent's space
+---
+### ClearBoneRotationOffset
+Take off a turn set with SetBoneRotationOffset.
+
+Sig: `SkeletalMesh3D:ClearBoneRotationOffset(boneName)`
+ - Arg: `string boneName` Name of bone
+---
 ### GetNumBones
 Get the number of bones this mesh node is using.
 

@@ -158,6 +158,10 @@ public:
     // scale -- one shown, another hidden -- blended between two animations otherwise came out half of each
     void SetBoneScale(int32_t boneIndex, glm::vec3 scale);
     void ClearBoneScale(int32_t boneIndex);
+    // A turn laid over a bone's animated rotation, in its parent's space (cleared by ClearBoneRotationOffset): the
+    // animations play on under it -- a head turned to look at something, still nodding with its idle
+    void SetBoneRotationOffset(int32_t boneIndex, glm::quat offset);
+    void ClearBoneRotationOffset(int32_t boneIndex);
 
     uint32_t GetNumBones() const;
     BoneInfluenceMode GetBoneInfluenceMode() const;
@@ -263,6 +267,7 @@ protected:
     float mBoneInertiaScale = 1.0f;
     std::vector<float> mMorphWeights;
     std::vector<std::pair<int32_t, glm::vec3>> mBoneScaleOverrides;
+    std::vector<std::pair<int32_t, glm::quat>> mBoneRotationOffsets;
     bool mAnimationPaused;
     bool mRevertToBindPose;
     bool mInheritPose;

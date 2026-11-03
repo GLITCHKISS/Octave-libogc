@@ -434,6 +434,29 @@ int SkeletalMesh3D_Lua::ClearBoneScale(lua_State* L)
     return 0;
 }
 
+// SetBoneRotationOffset(boneName, eulerDegrees): a turn laid over the bone's animated rotation, in its parent's space
+// (pitch, yaw, roll as the engine's other rotations); ClearBoneRotationOffset(boneName) takes it off
+int SkeletalMesh3D_Lua::SetBoneRotationOffset(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    const char* boneName = CHECK_STRING(L, 2);
+    glm::vec3 euler = CHECK_VECTOR(L, 3);
+
+    comp->SetBoneRotationOffset(comp->FindBoneIndex(boneName), glm::quat(glm::radians(euler)));
+
+    return 0;
+}
+
+int SkeletalMesh3D_Lua::ClearBoneRotationOffset(lua_State* L)
+{
+    SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
+    const char* boneName = CHECK_STRING(L, 2);
+
+    comp->ClearBoneRotationOffset(comp->FindBoneIndex(boneName));
+
+    return 0;
+}
+
 int SkeletalMesh3D_Lua::GetNumBones(lua_State* L)
 {
     SkeletalMesh3D* comp = CHECK_SKELETAL_MESH_3D(L, 1);
@@ -541,6 +564,10 @@ void SkeletalMesh3D_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, SetBoneScale);
 
     REGISTER_TABLE_FUNC(L, mtIndex, ClearBoneScale);
+
+    REGISTER_TABLE_FUNC(L, mtIndex, SetBoneRotationOffset);
+
+    REGISTER_TABLE_FUNC(L, mtIndex, ClearBoneRotationOffset);
 
     REGISTER_TABLE_FUNC(L, mtIndex, GetNumBones);
 

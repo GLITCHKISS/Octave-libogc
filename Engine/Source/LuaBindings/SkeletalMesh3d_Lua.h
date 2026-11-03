@@ -51,6 +51,8 @@ struct SkeletalMesh3D_Lua
     static int ClearBoneDynamics(lua_State* L);
     static int SetBoneScale(lua_State* L);
     static int ClearBoneScale(lua_State* L);
+    static int SetBoneRotationOffset(lua_State* L);
+    static int ClearBoneRotationOffset(lua_State* L);
     static int GetNumBones(lua_State* L);
     static int SetAnimEventHandler(lua_State* L);
     static int SetBoundsRadiusOverride(lua_State* L);
