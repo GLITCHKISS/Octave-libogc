@@ -597,6 +597,9 @@ static void LoadSceneBehindLoadingScreen(const std::string& sceneName)
         // frame the GPU was drawing): left to the loading screen's next frame, the next scene's first loads went into
         // the gaps around it, and it was freed after between them -- a heap in holes, no one of them a big texture's
         GxWaitGpu();
+        // And the heap's free top given back to the arena (newlib's malloc_trim, whole 4 KB pages): there the GPU's
+        // region can grow into it for the next scene's textures -- kept by the heap, only the heap could use it
+        malloc_trim(0);
 #endif
     }
 
@@ -785,6 +788,11 @@ bool Initialize()
 
 #if PLATFORM_DOLPHIN
         std::set_new_handler(OctNewFailed);
+        // The heap's free top given back to the arena once it's 32 KB (newlib's default: 128 KB, its free() trims
+        // past it): every peak -- Lua's garbage, a load -- had the heap take arena it then kept, and the GPU's region
+        // (GxGpuMem.cpp), growing down into the same arena, found none left for a texture brought back from ARAM.
+        // (Holes inside the heap can't be given back: only its top. Trimming is an sbrk: a few instructions.)
+        mallopt(M_TRIM_THRESHOLD, 32 * 1024);
         sEngineState.mLua = lua_newstate(OctLuaAlloc, nullptr);
         if (sEngineState.mLua != nullptr)
         {

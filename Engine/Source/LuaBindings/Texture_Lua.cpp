@@ -96,6 +96,28 @@ int Texture_Lua::FreeStash(lua_State* L)
     return 0;
 }
 
+// texture:Evict() / texture:Restore() / texture:IsEvicted(): kept in ARAM while it isn't wanted (GameCube; see Texture.h)
+int Texture_Lua::Evict(lua_State* L)
+{
+    Texture* texture = CHECK_TEXTURE(L, 1);
+    lua_pushboolean(L, texture->Evict());
+    return 1;
+}
+
+int Texture_Lua::Restore(lua_State* L)
+{
+    Texture* texture = CHECK_TEXTURE(L, 1);
+    lua_pushboolean(L, texture->Restore());
+    return 1;
+}
+
+int Texture_Lua::IsEvicted(lua_State* L)
+{
+    Texture* texture = CHECK_TEXTURE(L, 1);
+    lua_pushboolean(L, texture->IsEvicted());
+    return 1;
+}
+
 int Texture_Lua::ReloadFromStash(lua_State* L)
 {
     Texture* texture = CHECK_TEXTURE(L, 1);
@@ -208,6 +230,9 @@ void Texture_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, IsStashing);
     REGISTER_TABLE_FUNC(L, mtIndex, ReloadFromStash);
     REGISTER_TABLE_FUNC(L, mtIndex, FreeStash);
+    REGISTER_TABLE_FUNC(L, mtIndex, Evict);
+    REGISTER_TABLE_FUNC(L, mtIndex, Restore);
+    REGISTER_TABLE_FUNC(L, mtIndex, IsEvicted);
 
     REGISTER_TABLE_FUNC(L, mtIndex, GetWidth);
 

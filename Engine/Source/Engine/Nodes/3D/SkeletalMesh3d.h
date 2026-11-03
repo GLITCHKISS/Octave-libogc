@@ -246,6 +246,7 @@ protected:
     // (GX: the parent whose CPU-skinned vertices this one draws instead of its own, this frame -- an inherited pose
     //  of the same mesh, no morphs: the same vertices exactly. UpdateAnimation sets it, GetSkinnedVertices reads it)
     SkeletalMesh3D* mSkinShare = nullptr;
+    uint8_t mHiddenFrames = 0;          // (GX: frames in a row hidden -- TickCommon lets an inherited pose's arrays go)
     // (GX: each of the two arrays keeps its rigid vertices as the mesh has them -- CpuSkinBlended -- swapped with them)
     bool mSkinnedRigid = false;
     bool mSkinnedRigidBack = false;

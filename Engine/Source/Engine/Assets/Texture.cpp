@@ -653,6 +653,18 @@ bool Texture::LocateTexels(const char* head, uint32_t headSize, void* ctx, uint3
         stream.ReadBool();
         stream.ReadUint8();
     }
+    if (header.mVersion >= ASSET_VERSION_ALPHA_BAND_CUSTOM_MIPS)
+    {
+        // its mip bias and its own mips (as LoadStream reads them): left out here, every texture saved since that
+        // version was found at the wrong place and never stashed or reloaded
+        stream.ReadFloat();
+        const uint32_t customMipSize = stream.ReadUint32();
+        if (stream.GetPos() + customMipSize + 24 > headSize)
+        {
+            return false;               // (its own mips past the first bytes read: not found here)
+        }
+        stream.SetPos(stream.GetPos() + customMipSize);
+    }
     if (header.mVersion >= ASSET_VERSION_TEXTURE_COOKED_PROPERTIES)
     {
         width = stream.ReadUint32();
@@ -749,6 +761,57 @@ bool Texture::IsStashed(const std::string& assetName) const
     return mStashState == 2 && mStashSource == assetName;
 }
 
+// Kept in ARAM while it isn't wanted (see Texture.h). The stash is the texture file's own bytes, read off the disc
+// by StashFrom: the block in main memory can't be copied there instead, because opening it (TPL_OpenTPLFromMemory)
+// writes its own address into its header. Restore puts the file's bytes in a new block and opens that.
+bool Texture::Evict()
+{
+#if API_GX && !EDITOR && PLATFORM_GAMECUBE
+    if (mEvicted || IsDynamic() || !IsLoaded() || !IsStashed(GetName()))
+    {
+        return false;
+    }
+    FinishAsyncReload();
+    GFX_DestroyTextureResource(this);   // (its block freed once the GPU is done with the frame: GxDeferFree)
+    mEvicted = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool Texture::Restore()
+{
+#if API_GX && !EDITOR && PLATFORM_GAMECUBE
+    if (!mEvicted || mStashAram == 0)
+    {
+        return false;
+    }
+    const uint32_t size = mResource.mTplSize;
+    void* block = GxGpuAllocTransient(size);       // (the region's holes, the heap's, then the region grown: GxGpuMem.cpp)
+    if (block == nullptr)
+    {
+        LogError("Texture %s: no memory to bring %u bytes back from ARAM", GetName().c_str(), size);
+        return false;
+    }
+    AUD_AramDma(false, block, mStashAram, size);    // (it invalidates the cache)
+    mCookedData = block;                            // (taken as it is: GFX_CreateTextureResource, TakeCookedData)
+    mCookedSize = size;
+    std::vector<uint8_t> none;
+    GFX_CreateTextureResource(this, none);
+    mEvicted = false;
+    GX_InvalidateTexAll();
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool Texture::IsEvicted() const
+{
+    return mEvicted;
+}
+
 void Texture::FreeStash()
 {
 #if API_GX && !EDITOR && PLATFORM_GAMECUBE
@@ -771,9 +834,9 @@ bool Texture::IsStashing() const
 bool Texture::ReloadFromStash()
 {
 #if API_GX && !EDITOR && PLATFORM_GAMECUBE
-    if (mStashState != 2 || mStashAram == 0)
+    if (mStashState != 2 || mStashAram == 0 || mEvicted)
     {
-        return false;
+        return false;                   // (evicted: no block to copy into -- Restore)
     }
     FinishAsyncReload();
     TextureResource* resource = GetResource();

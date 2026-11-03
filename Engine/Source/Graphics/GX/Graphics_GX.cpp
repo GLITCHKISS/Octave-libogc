@@ -402,12 +402,19 @@ void GFX_BeginFrame()
 // Lua's garbage collector stepped in the frame's idle time -- while the CPU would only wait for the retrace that shows
 // the last frame -- so less of its work falls in the middle of a frame (on the GameCube, scripts' garbage caught
 // up with in 60-80 ms steps). Small steps, each only while the video beam is far enough from the end of its field
-// (the retrace) that one can't delay the copy; and, whatever the idle time, a heap grown past twice its size after
-// the last full cycle steps on a few anyway. The automatic collector's pause is raised at the state's creation
+// (the retrace) that one can't delay the copy; and, whatever the idle time, a heap grown past half again its size
+// after the last full cycle steps on a few anyway. The automatic collector's pause is raised at the state's creation
 // (Engine.cpp) so it rarely starts a cycle itself mid-frame.
+// Each step ADDS to the collector's debt (lua_gc's STEP with a size): Lua 5.3's "small step" (a size of 0) sets the
+// debt instead -- every frame it wiped what the frame had allocated, so the automatic collector never started a
+// cycle, the idle steps (few, a full frame) fell behind the garbage, and the heap grew till an allocation failed and
+// Lua collected in full in an emergency (a level's 0.5 KB a frame: ~770 KB to 1.43 MB and 10 KB of memory left, every
+// 24 s).
 static int sGcBaseKB = 0;                  // (the heap just after the last full cycle)
 static const float kGcIdleMarginUs = 2000.0f;
 static const uint32_t kGcIdleMaxSteps = 64;
+static const int kGcIdleStepKB = 1;        // (each idle step's debt: with the step multiplier, its work)
+static const int kGcCatchUpStepKB = 16;
 
 static void LuaGcIdle(bool idle)
 {
@@ -426,15 +433,15 @@ static void LuaGcIdle(bool idle)
             const float leftUs = (lines - float(VIDEO_GetCurrentLine())) * usPerLine;
             if (leftUs < kGcIdleMarginUs)
                 break;
-            if (lua_gc(L, LUA_GCSTEP, 0))
+            if (lua_gc(L, LUA_GCSTEP, kGcIdleStepKB))
                 sGcBaseKB = lua_gc(L, LUA_GCCOUNT, 0);       // (a cycle finished: the live heap)
         }
     }
-    if (sGcBaseKB > 0 && lua_gc(L, LUA_GCCOUNT, 0) > 2 * sGcBaseKB)
+    if (sGcBaseKB > 0 && lua_gc(L, LUA_GCCOUNT, 0) > sGcBaseKB + sGcBaseKB / 2)
     {
         for (uint32_t n = 0; n < 4; ++n)
         {
-            if (lua_gc(L, LUA_GCSTEP, 0))
+            if (lua_gc(L, LUA_GCSTEP, kGcCatchUpStepKB))
             {
                 sGcBaseKB = lua_gc(L, LUA_GCCOUNT, 0);
                 break;
@@ -1288,7 +1295,7 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
 #if OCT_SKELETAL
 // A CPU-skinned mesh's triangles as display lists: its index stream never changes (only the skinned vertices the
 // indices point into do, through GX_SetArray), yet every draw sent it again a 16-bit write at a time -- four indices
-// a corner, ~50,000 writes for a 2,500-vertex character, again for each copy of it (a Starman's afterimages), its
+// a corner, ~50,000 writes for a 2,500-vertex character, again for each copy of it (a character's afterimages), its
 // cape, its sail, and once more for the projected shadow's caster. As a list the GPU reads the same bytes from
 // memory. Written byte by byte, not recorded with GX_BeginDispList: libogc's GX_Begin flushes whatever GX state is
 // pending into what it's recording, and a list made after one material's BindMaterial would set that material's
@@ -1950,8 +1957,8 @@ void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp
 void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<Vertex>& skinnedVertices)
 {
     // The CPU-skinned vertices out of the data cache, once, as they're written (CpuSkinVertices, and the array's
-    // first fill): the draws that read them -- the mesh, its shadow caster, children drawing its skin (the Starman's
-    // ghosts) -- no longer each flush the whole array again (~108 KB for a character, up to 7 times a frame)
+    // first fill): the draws that read them -- the mesh, its shadow caster, children drawing its skin (a character's
+    // afterimages) -- no longer each flush the whole array again (~108 KB for a character, up to 7 times a frame)
     if (!skinnedVertices.empty())
         DCFlushRange((void*)skinnedVertices.data(), uint32_t(skinnedVertices.size() * sizeof(Vertex)));
 }
@@ -1969,6 +1976,10 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
         {
             Vertex* vertices = skeletalMeshComp->GetSkinnedVertices();
             uint32_t numVertices = skeletalMeshComp->GetNumSkinnedVertices();
+            if (vertices == nullptr || numVertices < mesh->GetNumVertices())
+            {
+                return;                         // (no array of its own this frame: SkeletalMesh3D lets a sharing
+            }                                   //  child's go -- drawn from it, the GPU would read past its end)
 
             GX_ClearVtxDesc();
             if (rigid != nullptr)
@@ -2315,6 +2326,10 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
     {
         Vertex* vertices = skeletalMeshComp->GetSkinnedVertices();
         uint32_t numVertices = skeletalMeshComp->GetNumSkinnedVertices();
+        if (vertices == nullptr || numVertices < mesh->GetNumVertices())
+        {
+            return;                             // (no array of its own this frame: as GFX_DrawSkeletalMeshComp)
+        }
 
         GX_ClearVtxDesc();
 #if OCT_SKELETAL
@@ -3167,6 +3182,10 @@ void GFX_DrawQuad(Quad* quad)
     // Setup render state / TEVs
     Renderer* renderer = Renderer::Get();
     Texture* texture = quad->GetTexture() ? quad->GetTexture() : renderer->mWhiteTexture.Get<Texture>();
+    if (texture->IsEvicted())
+    {
+        return;                         // (its texels in ARAM, not main memory: nothing to draw from -- Texture::Evict)
+    }
 
     glm::vec4 uniColor = glm::clamp(quad->GetColor(), 0.0f, 1.0f);
     GXColor uniColorGx = { uint8_t(uniColor.r * 255.0f),

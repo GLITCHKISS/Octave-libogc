@@ -49,6 +49,14 @@ public:
     static bool LocateTexels(const char* head, uint32_t headSize, void* ctx, uint32_t& offset, uint32_t& size);
     bool ReloadFromStash();
     void FreeStash();                   // its ARAM given back (waits for a read under way)
+    // GameCube only: a texture kept in ARAM while it isn't wanted, as Nintendo's games keep their menus' art (a 2D
+    // archive in ARAM, copied into main memory for the screen that uses it). Evict lets its main-memory block go once
+    // its own stash is in (StashFrom(its name), IsStashed): false until then. Restore brings it back from ARAM in a few
+    // milliseconds (false: not evicted, or no memory). Evicted, a quad drawn with it draws nothing -- for UI quads only
+    // (a mesh's material would sample nothing).
+    bool Evict();
+    bool Restore();
+    bool IsEvicted() const;
 
     // Asset Interface
     virtual void LoadStream(Stream& stream, Platform platform) override;
@@ -106,6 +114,7 @@ protected:
     uint32_t mStashAram = 0;            // StashFrom: its ARAM block (kept for the next), the asset in it,
     std::string mStashSource;           // and 0 none, 1 reading, 2 in, 3 failed
     volatile int32_t mStashState = 0;
+    bool mEvicted = false;              // Evict: its texels only in its stash, not in main memory
 
     uint32_t mWidth;
     uint32_t mHeight;

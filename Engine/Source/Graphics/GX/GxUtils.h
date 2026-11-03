@@ -141,7 +141,13 @@ void GxDeferFree(void* block);
 // there): false if it wasn't the region's.
 void* GxGpuAlloc(uint32_t size);
 bool GxGpuFree(void* block);
+// A block wanted for a while and then let go (a menu's art back from ARAM): a hole already in the region first, then
+// the heap's holes, and only then the region grown -- leaving the heap a little to grow into (GxGpuMem.cpp)
+void* GxGpuAllocTransient(uint32_t size);
 size_t GxGpuFreeBytes();         // its free blocks (free memory all the same)
+void GxGpuRegionEnable(bool enable);   // on unless a game turns it off: then all from the heap
+// The region's book checked: null if sound, else what's wrong (outAddr: where; outIndex: which block). OctHeapCheck.
+const char* GxGpuCheck(uint32_t* outAddr, uint32_t* outIndex);
 void GxCountDraw(uint32_t verts, uint32_t tris);
 
 // BindMaterial skips loading GX_TEXMTX0/1 when they already hold its UV offset and scale: code that loads either

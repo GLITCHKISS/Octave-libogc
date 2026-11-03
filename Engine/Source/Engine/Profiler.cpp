@@ -247,15 +247,17 @@ static void LogFrameStats(const std::vector<CpuStat>& stats, float deltaTime)
     {
         char line[500];
         struct mallinfo info = mallinfo();
-        // heap: the free gaps inside what malloc has taken (it swings as blocks come and go); free: those and the
-        // arena malloc hasn't taken yet -- the memory really left
         size_t freeBytes = info.fordblks + size_t((char*)SYS_GetArena1Hi() - (char*)SYS_GetArena1Lo());
+        int gpuK = 0;
 #if API_GX
-        freeBytes += GxGpuFreeBytes();              // (GPU memory's region: its free blocks, GxGpuMem.cpp)
+        gpuK = int(GxGpuFreeBytes() / 1024);        // (GPU memory's region: its free blocks, GxGpuMem.cpp)
 #endif
-        const int freeK = int(freeBytes / 1024);
-        int at = snprintf(line, sizeof(line), "PERF %.1ffps free=%dK heap=%dK avg", sFrames / sTime, freeK,
-                          int(info.fordblks / 1024));
+        const int freeK = int(freeBytes / 1024) + gpuK;
+        // free: all of it; heap: the gaps inside what malloc has taken; arena: what it can still take; gpu: the free
+        // blocks inside the GPU's region (textures' and display lists' only: malloc -- Lua's heap -- can't use them)
+        int at = snprintf(line, sizeof(line), "PERF %.1ffps free=%dK heap=%dK arena=%dK gpu=%dK avg", sFrames / sTime,
+                          freeK, int(info.fordblks / 1024),
+                          int(((char*)SYS_GetArena1Hi() - (char*)SYS_GetArena1Lo()) / 1024), gpuK);
 
         for (uint32_t i = 0; i < count && at < int(sizeof(line)) - 24; ++i)
         {

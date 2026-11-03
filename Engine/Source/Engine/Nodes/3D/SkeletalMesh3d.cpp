@@ -167,6 +167,34 @@ void SkeletalMesh3D::EditorTick(float deltaTime)
 void SkeletalMesh3D::TickCommon(float deltaTime)
 {
     mHasAnimatedThisFrame = false;
+#if API_GX && !EDITOR
+    // Hidden, an inherited pose of its parent's own mesh (a character's afterimages, while they're off): its two
+    // skinned arrays let go (~96 KB each for a character's), after three frames hidden -- the GPU may still be drawing
+    // the frame before, and the arrays go straight back to the heap (not GxDeferFree: they're a vector's). Shown again,
+    // it draws its parent's (UpdateAnimation: mSkinShare) or sizes them again (CpuSkinVertices) -- and keeps them till
+    // it's hidden again: let go while shown too (whenever it shared), a share that came and went sized and freed ~96 KB
+    // an afterimage over and over, cutting the heap up mid-play
+    if (!IsVisible() && mInheritPose && (mSkinnedVertices.capacity() > 0 || mSkinnedVerticesBack.capacity() > 0))
+    {
+        Node* parentNode = mParent.Get();
+        SkeletalMesh3D* parentSkel = (parentNode != nullptr) ? parentNode->As<SkeletalMesh3D>() : nullptr;
+        if (parentSkel != nullptr && parentSkel->mSkeletalMesh.Get() == mSkeletalMesh.Get())
+        {
+            mHiddenFrames = (mHiddenFrames < 3) ? uint8_t(mHiddenFrames + 1) : mHiddenFrames;
+            if (mHiddenFrames >= 3)
+            {
+                std::vector<Vertex>().swap(mSkinnedVertices);
+                std::vector<Vertex>().swap(mSkinnedVerticesBack);
+                mSkinnedRigid = false;                          // (refilled whole when sized again: CpuSkinBlended)
+                mSkinnedRigidBack = false;
+            }
+        }
+    }
+    else if (IsVisible())
+    {
+        mHiddenFrames = 0;
+    }
+#endif
 }
 
 bool SkeletalMesh3D::IsStaticMesh3D() const
@@ -193,7 +221,8 @@ void SkeletalMesh3D::SetSkeletalMesh(SkeletalMesh* skeletalMesh)
             {
                 // Initialize skinned vertex array
                 mSkinnedVertices.resize(skeletalMesh->GetNumVertices());
-                const std::vector<VertexSkinned> srcVerts = skeletalMesh->GetVertices();
+                const std::vector<VertexSkinned>& srcVerts = skeletalMesh->GetVertices();   // (not a copy: a whole
+                                                                                            //  mesh's, every time)
                 for (uint32_t i = 0; i < mSkinnedVertices.size(); ++i)
                 {
                     mSkinnedVertices[i].mPosition = srcVerts[i].mPosition;
@@ -769,7 +798,7 @@ static inline float OctRsqrt(float x)
 // whether the segment p-q can come within reach of a capsule's line, its box lo-hi: the segment's box grown by reach
 // not meeting the line's and it can't -- PushSegmentOut would find nothing, so it's skipped. Only comparisons: the
 // GameCube has no square root instruction (newlib's sqrtf is software), and every chain segment against every collider,
-// four passes a frame, was 2.6 ms of Mario's dynamic bones, almost all of them far apart
+// four passes a frame, was 2.6 ms of a character's dynamic bones, almost all of them far apart
 static inline bool NearCapsule(const glm::vec3& p, const glm::vec3& q, const glm::vec3& lo, const glm::vec3& hi, float reach)
 {
     return glm::min(p.x, q.x) - reach <= hi.x && glm::max(p.x, q.x) + reach >= lo.x &&
@@ -1157,7 +1186,7 @@ glm::vec3 SkeletalMesh3D::InterpolateScale(float time, const Channel& channel)
 
 // Normalized lerp of two rotations, the shorter way round: no trig, where glm::slerp takes an acos and three sines. Between
 // neighbouring keys (a few degrees apart at most) it's slerp to a fraction of a degree; blending animation layers, the
-// ends are exact and only the speed through the middle differs. On the GameCube, Mario's pose (65 bones, several layers,
+// ends are exact and only the speed through the middle differs. On the GameCube, a character's pose (65 bones, several layers,
 // two slerps a bone a layer) spent most of its 3.6 ms in sinf/acosf.
 static inline glm::quat NLerpQuat(const glm::quat& a, const glm::quat& b, float t)
 {
@@ -1275,7 +1304,7 @@ static uint32_t FindKeyIndexSearch(const std::vector<KeyT>& keys, float time)
 // The same key, found by guessing first: keys baked a frame apart are evenly spaced, so where `time` falls between the
 // first key and the last says which it is; a step or two either way confirms it (the binary search's own answer: the
 // last g with every key from 1 to g at or before `time`, and the key after it past it). Keys unevenly spaced: after a
-// few steps, the search. Mario's pose looked up ~1000 keys a frame (three a channel, every bone, every layer) at ~8
+// few steps, the search. A character's pose looked up ~1000 keys a frame (three a channel, every bone, every layer) at ~8
 // probes each, scattered through each channel's keys -- 0.55 ms on the GameCube.
 template<typename KeyT>
 static uint32_t FindKeyIndex(const std::vector<KeyT>& keys, float time)
@@ -1859,7 +1888,7 @@ void SkeletalMesh3D::UpdateAnimation(float deltaTime, bool updateBones)
 #if API_GX && !EDITOR
         // An inherited pose of the parent's own mesh, the same influences, no morphs on either: its skinned vertices
         // are the parent's exactly -- drawn from the parent's array (GetSkinnedVertices) instead of skinned again.
-        // (A Starman's five afterimages, each Mario's mesh in Mario's pose: 2468 vertices each, ~0.9 ms each on the
+        // (A character's afterimages, each its mesh in its pose: 2468 vertices each, ~0.9 ms each on the
         // GameCube.) The parent was updated first (above); its array is the one it skinned into this frame.
         SkeletalMesh3D* parentSkel = inheritPose ? mParent->As<SkeletalMesh3D>() : nullptr;
         bool share = parentSkel != nullptr &&

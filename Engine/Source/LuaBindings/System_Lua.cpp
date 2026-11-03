@@ -127,6 +127,23 @@ size_t BigBlockCacheBytes();    // BigBlockCache_Dolphin.cpp: freed blocks kept 
 size_t GxGpuFreeBytes();        // GxGpuMem.cpp
 #endif
 
+// System.HeapCheck(where): the heap and the GPU's region walked and checked (HeapCheck_Dolphin.cpp): true if sound;
+// the first failure logged (HEAPFAIL). A test build's, once a frame or round a suspect. True off the GameCube.
+#if PLATFORM_DOLPHIN
+bool OctHeapCheck(const char* where);
+#endif
+int System_Lua::HeapCheck(lua_State* L)
+{
+    const char* where = lua_isstring(L, 1) ? lua_tostring(L, 1) : "Lua";
+#if PLATFORM_DOLPHIN
+    lua_pushboolean(L, OctHeapCheck(where));
+#else
+    (void)where;
+    lua_pushboolean(L, true);
+#endif
+    return 1;
+}
+
 int System_Lua::GetFreeMemory(lua_State* L)
 {
     lua_Integer freeBytes = 0;
@@ -449,6 +466,7 @@ void System_Lua::Bind()
     REGISTER_TABLE_FUNC(L, tableIdx, UnmountMemoryCard);
 
     REGISTER_TABLE_FUNC(L, tableIdx, GetFreeMemory);
+    REGISTER_TABLE_FUNC(L, tableIdx, HeapCheck);
     REGISTER_TABLE_FUNC(L, tableIdx, GetAramStats);
     REGISTER_TABLE_FUNC(L, tableIdx, MemoryCensus);
     REGISTER_TABLE_FUNC(L, tableIdx, PinBlocks);

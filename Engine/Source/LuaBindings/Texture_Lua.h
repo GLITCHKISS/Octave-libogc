@@ -27,6 +27,9 @@ struct Texture_Lua
     static int IsStashing(lua_State* L);
     static int ReloadFromStash(lua_State* L);
     static int FreeStash(lua_State* L);
+    static int Evict(lua_State* L);
+    static int Restore(lua_State* L);
+    static int IsEvicted(lua_State* L);
     static int GetWidth(lua_State* L);
     static int GetHeight(lua_State* L);
     static int GetMipLevels(lua_State* L);
