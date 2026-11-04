@@ -161,7 +161,26 @@ void SetupLightingChannels()
     static LightingState prevState(false, false, 0, 0, 0, 0);
     LightingState& curState = gGxContext.mLighting;
 
-    if (curState != prevState)
+    if (curState != prevState && curState.mRaw)
+    {
+        // A GX program's channels, as it gives them: lit ones by the draw's lights (SetupLightMask's mask). A vertex
+        // colour source reads REG where there's none to read -- the draw's vertices without colours, or COLOR1 (the
+        // vertices carry one colour, CLR0)
+        static const uint8_t kChans[4] = { GX_COLOR0, GX_ALPHA0, GX_COLOR1, GX_ALPHA1 };
+        const GxProgramChannels& raw = curState.mRawChannels;
+        GX_SetNumChans(raw.mNumChans);
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            const GxProgramChan& chan = raw.mChans[i];
+            const bool vtxColor = curState.mColorChannel && i < 2;
+            GX_SetChanCtrl(kChans[i], chan.mEnable ? GX_ENABLE : GX_DISABLE,
+                           (chan.mAmbSrc == GX_SRC_VTX && vtxColor) ? GX_SRC_VTX : GX_SRC_REG,
+                           (chan.mMatSrc == GX_SRC_VTX && vtxColor) ? GX_SRC_VTX : GX_SRC_REG,
+                           chan.mEnable ? curState.mLightMask : 0, chan.mDiffuseFn, chan.mAttnFn);
+        }
+        prevState = curState;
+    }
+    else if (curState != prevState)
     {
         // If we are using vertex color modulation, then we use the first channel for that
         // since the vertex color can't go as input in the COLOR1A1 unless you have two vertex color attributes.
@@ -469,8 +488,32 @@ void GxLoadScreenTexMtx(const glm::mat4& world)
     GX_LoadTexMtxImm(t, GX_TEXMTX9, GX_MTX3x4);
 }
 
+// The TEV stages a GX program left on a swap table other than SWAP0 (bit n: stage n), and whether it changed SWAP0
+// itself: every other TEV setup takes SWAP0, as it stands, on stages it doesn't set the swap mode of
+static uint32_t sProgramSwapStages = 0;
+static bool sProgramSwapTable0 = false;
+
 void GxResetIndirect()
 {
+    // (and a GX program's channels and swap modes: what it sets that the other setups take as they find it)
+    gGxContext.mLighting.mRaw = false;
+    if (sProgramSwapStages != 0 || sProgramSwapTable0)
+    {
+        for (uint32_t stage = 0; stage < 16; ++stage)
+        {
+            if (sProgramSwapStages & (1u << stage))
+            {
+                GX_SetTevSwapMode(stage, GX_TEV_SWAP0, GX_TEV_SWAP0);
+            }
+        }
+        if (sProgramSwapTable0)
+        {
+            GX_SetTevSwapModeTable(GX_TEV_SWAP0, GX_CH_RED, GX_CH_GREEN, GX_CH_BLUE, GX_CH_ALPHA);
+        }
+        sProgramSwapStages = 0;
+        sProgramSwapTable0 = false;
+    }
+
     uint32_t mask = gGxContext.mIndirectTevMask;
     if (mask == 0)
     {
@@ -516,8 +559,205 @@ static void LoadUvMtx(uint32_t slot, const glm::vec2& offset, const glm::vec2& s
     sUvMtxValid[slot] = true;
 }
 
+static void ApplyMaterialFog(MaterialLite* material);
+static void ApplyMaterialCull(CullMode cullMode);
+
+// A material's raw GX program (GxProgram.h): its state as it stands, in place of all BindMaterial would make of the
+// material's own settings -- another game's material (J3D's MAT3) drawn as that game drew it. What the normal path
+// leaves to the draw is left the same way: the channels go through SetupLightingChannels (gGxContext.mLighting.mRaw,
+// lit ones by the draw's lights), and what only a program changes (the channels, the stages' swap modes, SWAP0) is
+// put back by GxResetIndirect, which every other TEV setup calls first.
+static void BindGxProgram(MaterialLite* material, const GxProgram& program, bool useVertexColor, bool hasNormals)
+{
+    GxResetIndirect();   // (the last material's indirect stages off, and a program's swap modes put back)
+
+    gGxContext.mEnvMapBound = false;
+    gGxContext.mSpecTexBound = false;
+    sEnvTexCoords = 0;
+
+    // The texture coordinates, each through its own matrix (GX_TEXMTX0 + i x 3: J3D's texture SRT, scrolled by the
+    // game's time) or none. The draw's vertices without normals (particles: position, colour, UV 0) read UV 0 for a
+    // normal or a UV 1 they don't carry, rather than what isn't there.
+    const float time = GetEngineState()->mGameElapsedTime;
+    const uint32_t numTexGens = std::min<uint32_t>(program.mNumTexGens, GX_PROGRAM_MAX_TEXGENS);
+    for (uint32_t i = 0; i < numTexGens; ++i)
+    {
+        const GxProgramTexGen& texGen = program.mTexGens[i];
+        uint32_t source = texGen.mSource;
+        if (!hasNormals && (source == GX_TG_NRM || source == GX_TG_TEX1))
+        {
+            source = GX_TG_TEX0;
+        }
+
+        uint32_t texMtx = GX_IDENTITY;
+        if (texGen.mMatrix == GX_PROGRAM_MTX_SCREEN)
+        {
+            // the pixel's place on the screen: the position through GX_TEXMTX9 (GxLoadScreenTexMtx, which the draw
+            // loads for a refraction material), projected -- as a refraction material's slot 0
+            GX_SetTexCoordGen(GX_TEXCOORD0 + i, GX_TG_MTX3x4, GX_TG_POS, GX_TEXMTX9);
+            continue;
+        }
+        if (texGen.mMatrix != GX_PROGRAM_MTX_NONE)
+        {
+            Mtx m;
+            GxProgramTexMtx(texGen, time, m);
+            texMtx = GX_TEXMTX0 + i * 3;
+            GX_LoadTexMtxImm(m, texMtx, texGen.mType == GX_TG_MTX2x4 ? GX_MTX2x4 : GX_MTX3x4);
+        }
+        GX_SetTexCoordGen(GX_TEXCOORD0 + i, texGen.mType, source, texMtx);
+    }
+    GX_SetNumTexGens(numTexGens);
+    GxInvalidateTexMtxCache();   // (TEXMTX0/1 no longer the UV matrices the next material may want)
+
+    // The TEV stages, as they are; and the texture maps they read: map n the material's texture slot n
+    Texture* white = Renderer::Get()->mWhiteTexture.Get<Texture>();
+    const uint32_t numStages = glm::clamp<uint32_t>(program.mNumTevStages, 1, GX_PROGRAM_MAX_TEV_STAGES);
+    uint32_t usedMaps = 0;
+    uint32_t indirectStages = 0;
+    static const GxProgramTevInd kDirect;
+    for (uint32_t s = 0; s < numStages; ++s)
+    {
+        const GxProgramStage& st = program.mStages[s];
+        GX_SetTevOrder(s, st.mTexCoord, st.mTexMap, st.mChannel);
+        GX_SetTevColorIn(s, st.mColorIn[0], st.mColorIn[1], st.mColorIn[2], st.mColorIn[3]);
+        GX_SetTevColorOp(s, st.mColorOp, st.mColorBias, st.mColorScale, st.mColorClamp, st.mColorOut);
+        GX_SetTevAlphaIn(s, st.mAlphaIn[0], st.mAlphaIn[1], st.mAlphaIn[2], st.mAlphaIn[3]);
+        GX_SetTevAlphaOp(s, st.mAlphaOp, st.mAlphaBias, st.mAlphaScale, st.mAlphaClamp, st.mAlphaOut);
+        GX_SetTevKColorSel(s, st.mKColorSel);
+        GX_SetTevKAlphaSel(s, st.mKAlphaSel);
+        GX_SetTevSwapMode(s, st.mRasSwap & 3, st.mTexSwap & 3);
+        if ((st.mRasSwap & 3) != 0 || (st.mTexSwap & 3) != 0)
+        {
+            sProgramSwapStages |= (1u << s);
+        }
+        if (st.mTexMap < 8)
+        {
+            usedMaps |= (1u << st.mTexMap);
+        }
+
+        const GxProgramTevInd& ind = st.mInd;
+        GX_SetTevIndirect(s, ind.mIndStage, ind.mFormat, ind.mBias, ind.mMatrix, ind.mWrapS, ind.mWrapT, ind.mAddPrev,
+                          ind.mUtcLod, ind.mAlphaSel);
+        if (memcmp(&ind, &kDirect, sizeof(GxProgramTevInd)) != 0)
+        {
+            indirectStages |= (1u << s);
+        }
+    }
+    GX_SetNumTevStages(numStages);
+
+    // Indirect texturing, as given: its stages (each a texcoord and a map of its own), the three matrices (from
+    // J3D as they are: GX_SetIndTexMatrix's form), each TEV stage's use of them above. GxResetIndirect turns it all
+    // off for the next material, as for a warp slot's (gGxContext.mIndirectTevMask: every stage here, so all of them
+    // are set direct again).
+    const uint32_t numIndStages = std::min<uint32_t>(program.mNumIndStages, GX_PROGRAM_MAX_IND_STAGES);
+    for (uint32_t i = 0; i < numIndStages; ++i)
+    {
+        const GxProgramIndStage& ind = program.mIndStages[i];
+        GX_SetIndTexOrder(GX_INDTEXSTAGE0 + i, ind.mTexCoord, ind.mTexMap);
+        GX_SetIndTexCoordScale(GX_INDTEXSTAGE0 + i, ind.mScaleS, ind.mScaleT);
+        if (ind.mTexMap < 8)
+        {
+            usedMaps |= (1u << ind.mTexMap);
+        }
+    }
+    if (indirectStages != 0 || numIndStages > 0)
+    {
+        for (uint32_t m = 0; m < GX_PROGRAM_IND_MATRICES; ++m)
+        {
+            f32 mtx[2][3];
+            memcpy(mtx, program.mIndMtx[m].mMtx, sizeof(mtx));
+            GX_SetIndTexMatrix(GX_ITM_0 + m, mtx, program.mIndMtx[m].mScaleExp);
+        }
+        GX_SetNumIndStages(numIndStages);
+        gGxContext.mIndirectTevMask = (1u << numStages) - 1;
+    }
+
+    for (uint32_t t = 0; t < 4; ++t)
+    {
+        const uint8_t* sw = program.mSwapTables[t];
+        GX_SetTevSwapModeTable(GX_TEV_SWAP0 + t, sw[0] & 3, sw[1] & 3, sw[2] & 3, sw[3] & 3);
+    }
+    const uint8_t* sw0 = program.mSwapTables[0];
+    if ((sw0[0] & 3) != GX_CH_RED || (sw0[1] & 3) != GX_CH_GREEN || (sw0[2] & 3) != GX_CH_BLUE || (sw0[3] & 3) != GX_CH_ALPHA)
+    {
+        sProgramSwapTable0 = true;
+    }
+
+    for (uint32_t m = 0; m < 8; ++m)
+    {
+        if (usedMaps & (1u << m))
+        {
+            // (a refraction material's map 0: the frame copied before the translucent draws)
+            if (m == 0 && material->IsRefract() && gGxContext.mSceneTexValid)
+            {
+                GX_LoadTexObj(&gGxContext.mSceneTexObj, GX_TEXMAP0);
+                continue;
+            }
+            Texture* texture = (m < MATERIAL_LITE_MAX_TEXTURES) ? material->GetTexture(m) : nullptr;
+            if (texture == nullptr)
+                texture = white;
+            GX_LoadTexObj(&texture->GetResource()->mGxTexObj, GX_TEXMAP0 + m);
+        }
+    }
+
+    // The registers: TEV colours (REG0-2, then PREV), konst colours, the channels' material and ambient colours
+    static const uint8_t kTevRegs[4] = { GX_TEVREG0, GX_TEVREG1, GX_TEVREG2, GX_TEVPREV };
+    for (uint32_t r = 0; r < 4; ++r)
+    {
+        const int16_t* c = program.mTevColors[r];
+        GX_SetTevColorS10(kTevRegs[r], { c[0], c[1], c[2], c[3] });
+    }
+    for (uint32_t k = 0; k < 4; ++k)
+    {
+        const uint8_t* c = program.mKonstColors[k];
+        GX_SetTevKColor(GX_KCOLOR0 + k, { c[0], c[1], c[2], c[3] });
+    }
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        const uint8_t* mat = program.mMatColors[i];
+        const uint8_t* amb = program.mAmbColors[i];
+        GX_SetChanMatColor(i == 0 ? GX_COLOR0A0 : GX_COLOR1A1, { mat[0], mat[1], mat[2], mat[3] });
+        GX_SetChanAmbColor(i == 0 ? GX_COLOR0A0 : GX_COLOR1A1, { amb[0], amb[1], amb[2], amb[3] });
+    }
+
+    // the channels' controls, set by the draw (SetupLightingChannels) once it knows its lights
+    LightingState& lighting = gGxContext.mLighting;
+    lighting.mRaw = true;
+    lighting.mRawChannels = program.mChannels;
+    lighting.mColorChannel = useVertexColor;
+    lighting.mEnabled = false;
+    lighting.mSpecularMask = 0;
+    lighting.mMaterialSrc = GX_SRC_REG;
+
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetAlphaUpdate(GX_FALSE);
+    GX_SetAlphaCompare(program.mAlphaComp0, program.mAlphaRef0, program.mAlphaOp, program.mAlphaComp1, program.mAlphaRef1);
+    GX_SetBlendMode(program.mBlendType, program.mBlendSrc, program.mBlendDst, program.mLogicOp);
+    GX_SetZMode(program.mZEnable ? GX_TRUE : GX_FALSE, program.mZFunc, program.mZUpdate ? GX_TRUE : GX_FALSE);
+    GX_SetZCompLoc(program.mZCompLoc ? GX_TRUE : GX_FALSE);
+
+    ApplyMaterialFog(material);
+    if (program.mCullMode == GX_PROGRAM_NONE)
+    {
+        ApplyMaterialCull(material->GetCullMode());
+    }
+    else
+    {
+        // (GX's own number, as given: Octave's meshes wind the other way round from GX, so a mesh's back faces are
+        //  culled by GX_CULL_FRONT -- ApplyMaterialCull -- unless the tool kept the source game's winding)
+        GX_SetCullMode(program.mCullMode);
+    }
+}
+
 void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLighting, bool hasNormals)
 {
+    // A raw GX program: the whole material
+    if (material->HasGxProgram())
+    {
+        BindGxProgram(material, *material->GetGxProgram(), useVertexColor, hasNormals);
+        return;
+    }
+
     // If we are using vertex color modulation, then we need to use the first channel
     // since there is only one color vertex attribute.
     uint8_t matColorChannel = useVertexColor ? GX_COLOR1A1 : GX_COLOR0A0;
@@ -850,15 +1090,36 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
         GX_SetBlendMode(GX_BM_SUBTRACT, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
     }
 
-    // the alpha band: kept only at most the one value or at least the other (GX_LEQUAL OR GX_GEQUAL)
+    // the alpha band: kept only at most the one value or at least the other (GX_LEQUAL OR GX_GEQUAL). The other way
+    // round (below over above): only what's between (GX_GREATER AND GX_LESS) -- what such a band drops -- and, additive,
+    // its colour added flat (ONE, ONE: the alpha only chooses where), so a copy of a banded material fills its gaps
     if (material->IsLite() && ((MaterialLite*)material)->HasAlphaBand())
     {
         MaterialLite* lite = (MaterialLite*)material;
-        GX_SetAlphaCompare(GX_LEQUAL, uint8_t(glm::clamp(lite->GetAlphaKeepBelow(), 0.0f, 1.0f) * 255.0f), GX_AOP_OR,
-                           GX_GEQUAL, uint8_t(glm::clamp(lite->GetAlphaKeepAbove(), 0.0f, 1.0f) * 255.0f));
+        const uint8_t below = uint8_t(glm::clamp(lite->GetAlphaKeepBelow(), 0.0f, 1.0f) * 255.0f);
+        const uint8_t above = uint8_t(glm::clamp(lite->GetAlphaKeepAbove(), 0.0f, 1.0f) * 255.0f);
+        if (below > above)
+        {
+            GX_SetAlphaCompare(GX_GREATER, above, GX_AOP_AND, GX_LESS, below);
+            if (blendMode == BlendMode::Additive)
+            {
+                GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
+            }
+        }
+        else
+        {
+            GX_SetAlphaCompare(GX_LEQUAL, below, GX_AOP_OR, GX_GEQUAL, above);
+        }
         GX_SetZCompLoc(GX_FALSE);
     }
 
+    ApplyMaterialFog(material);
+    ApplyMaterialCull(material->GetCullMode());
+}
+
+// The scene's fog on or off for the material's Apply Fog (only when that changes)
+static void ApplyMaterialFog(MaterialLite* material)
+{
     bool matApplyFog = material->ShouldApplyFog();
     if (gGxContext.mFogType != GX_FOG_NONE && 
         gGxContext.mApplyFog != matApplyFog)
@@ -887,8 +1148,10 @@ void BindMaterial(MaterialLite* material, bool useVertexColor, bool useBakedLigh
                 {0,0,0,0});
         }
     }
+}
 
-    CullMode cullMode = material->GetCullMode();
+static void ApplyMaterialCull(CullMode cullMode)
+{
     switch (cullMode)
     {
         // Note: Culling is reversed on GX for some reason.
@@ -1004,7 +1267,8 @@ bool GFX_MaterialAllowsCompact(Material* material)
 {
     MaterialLite* lite = Material::AsLite(material);
     if (lite == nullptr || lite->GetShadingModel() != ShadingModel::Unlit ||
-        lite->GetVertexColorMode() == VertexColorMode::TextureBlend)
+        lite->GetVertexColorMode() == VertexColorMode::TextureBlend ||
+        lite->HasGxProgram())   // (its texgens read the coordinates a compact mesh leaves out)
     {
         return false;
     }

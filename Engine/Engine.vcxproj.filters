@@ -1503,6 +1503,9 @@
     <ClInclude Include="Source\Engine\Assets\MaterialLite.h">
       <Filter>Source Files\Engine\Assets</Filter>
     </ClInclude>
+    <ClInclude Include="Source\Engine\Assets\GxProgram.h">
+      <Filter>Source Files\Engine\Assets</Filter>
+    </ClInclude>
     <ClInclude Include="Source\Graphics\Vulkan\Shader.h">
       <Filter>Source Files\Graphics\Vulkan</Filter>
     </ClInclude>

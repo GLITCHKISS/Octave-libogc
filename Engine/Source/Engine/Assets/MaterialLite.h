@@ -1,6 +1,9 @@
 #pragma once
 
 #include "Assets/Material.h"
+#include "Assets/GxProgram.h"
+
+#include <memory>
 
 extern const char* gShadingModelStrings[];
 extern const char* gVertexColorModeStrings[];
@@ -26,7 +29,8 @@ struct MaterialLiteParams
     float mMaskCutoff = 0.5f;
     // Kept only where alpha is at most mAlphaKeepBelow or at least mAlphaKeepAbove, the rest discarded (the GameCube's
     // alpha compare, GX_LEQUAL OR GX_GEQUAL): 1, 1 keeps all of it. The band between drops out, so what's kept has
-    // a crisp edge.
+    // a crisp edge. Below over above turns it round: only the band between is kept, and an additive material adds
+    // its colour flat there (the alpha only chooses where) -- a copy of a banded material that fills its gaps.
     float mAlphaKeepBelow = 1.0f;
     float mAlphaKeepAbove = 1.0f;
     // Its textures sampled log2(picture height / 548) mip levels smaller on top of their own bias: hand-drawn mip
@@ -46,7 +50,46 @@ struct MaterialLiteParams
     bool mFresnelEnabled = false;
     bool mApplyFog = true;
     CullMode mCullMode = CullMode::Back;
+    // A raw GX program (GxProgram.h), or none: on the GameCube its GX state is the whole material. Shared by the
+    // materials copied from this one (New(src), SetLiteParams): nothing edits a program once it's loaded.
+    std::shared_ptr<const GxProgram> mGxProgram;
 };
+
+// THE GX PROGRAM IN THE STREAM (ASSET_VERSION_GX_PROGRAM on), after mSharpSpecular, for a tool that writes MaterialLite
+// assets itself. Little-endian, as all of an asset (the GameCube's reader swaps); u8 = 1 byte, s16 = 2, f32 = 4 (IEEE);
+// no padding or alignment anywhere. Every enum is GX's own number (GxProgram.h).
+//
+//   u8   present                 0: no program, and nothing more follows. 1: the rest follows.
+//   u8   numTevStages            1-16
+//   u8   numTexGens              0-8
+//   u8   numChans                0-2 (GX_SetNumChans; 0 is drawn as 1)
+//   numTevStages x 25 bytes, a stage each (GxProgramStage), in this order:
+//        u8 texCoord, u8 texMap, u8 channel                                   (0xFF: none)
+//        u8 colorA, colorB, colorC, colorD, colorOp, colorBias, colorScale, colorClamp, colorOut
+//        u8 alphaA, alphaB, alphaC, alphaD, alphaOp, alphaBias, alphaScale, alphaClamp, alphaOut
+//        u8 kColorSel, u8 kAlphaSel, u8 rasSwap, u8 texSwap
+//   u8   numIndStages            0-4 (indirect texture stages)
+//   numIndStages x 4 bytes        u8 texCoord, u8 texMap, u8 scaleS, u8 scaleT (GX_ITS_*)
+//   3 x 25 bytes, the indirect matrices GX_ITM_0, 1, 2 (always all three):
+//        f32 m00, m01, m02, m10, m11, m12 (GX_SetIndTexMatrix's offset_mtx[2][3], row by row), s8 scaleExp
+//   numTevStages x 9 bytes, each TEV stage's indirect part (GX_SetTevIndirect; all 0: a direct stage):
+//        u8 indStage, format, bias, matrix, wrapS, wrapT, addPrev, utcLod, alphaSel
+//   numTexGens x 39 bytes, a texgen each (GxProgramTexGen; texgen i is GX_TEXCOORD0 + i, its matrix GX_TEXMTX0 + i x 3):
+//        u8 type, u8 source, u8 matrix (0 none / GX_IDENTITY, 1 J3D basic SRT, 2 J3D Maya SRT, 3 the screen)
+//        f32 scaleS, scaleT, rotation (degrees), translationS, translationT, centerS, centerT, scrollS, scrollT
+//   16 bytes  swap tables         4 tables (GX_TEV_SWAP0-3) x u8 r, g, b, a (GX_CH_*)
+//   32 bytes  TEV colours         4 x s16 r, g, b, a: GX_TEVREG0, GX_TEVREG1, GX_TEVREG2, GX_TEVPREV (J3D's order)
+//   16 bytes  konst colours       4 x u8 r, g, b, a: GX_KCOLOR0-3
+//   20 bytes  channel controls    4 x (u8 enable, matSrc, ambSrc, diffuseFn, attnFn): COLOR0, ALPHA0, COLOR1, ALPHA1
+//    8 bytes  material colours    2 x u8 r, g, b, a: COLOR0A0, COLOR1A1
+//    8 bytes  ambient colours     2 x u8 r, g, b, a: COLOR0A0, COLOR1A1
+//    5 bytes  alpha compare       u8 comp0, ref0, op, comp1, ref1
+//    4 bytes  blend               u8 type, srcFactor, dstFactor, logicOp
+//    4 bytes  Z                   u8 enable, func, update, compLoc (1: before texturing)
+//    1 byte   cull                u8 GX_CULL_*, or 0xFF for the material's own Cull Mode
+//
+// So a program is 194 + 34 x numTevStages + 4 x numIndStages + 39 x numTexGens bytes (4 + 25 n + 1 + 4 i + 75 + 9 n
+// + 39 t + 114); with none, the one byte 0.
 
 class MaterialLite : public Material
 {
@@ -124,6 +167,8 @@ public:
     bool MipBiasFollowsHeight() const { return mLiteParams.mMipBiasFollowsHeight; }
     bool IsFresnelAlpha() const { return mLiteParams.mFresnelAlpha; }
     bool IsSharpSpecular() const { return mLiteParams.mSharpSpecular; }
+    bool HasGxProgram() const { return mLiteParams.mGxProgram != nullptr; }
+    const GxProgram* GetGxProgram() const { return mLiteParams.mGxProgram.get(); }
 
     float GetShininess() const;
     void SetShininess(float shininess);

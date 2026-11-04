@@ -51,8 +51,10 @@ void GxEnvTexMtx(const Mtx normalMtx, Mtx env);
 // The texture coordinates the last BindMaterial generates by the sphere map (bit n: GX_TEXCOORD0 + n; 0: none)
 uint32_t GxBoundEnvTexCoords();
 // Turns off indirect texturing (a TevMode::Warp material's) if any is on: GX_SetTevDirect on the
-// stages that used it and GX_SetNumIndStages(0). BindMaterial, the UI pass and Octave's own TEV
-// setups call it; code that sets up its own TEV stages during the 3D pass must call it too.
+// stages that used it and GX_SetNumIndStages(0). Also puts back what only a material's GX program
+// changes (MaterialLite, GxProgram.h): its channel controls, its stages' swap modes and swap table 0.
+// BindMaterial, the UI pass and Octave's own TEV setups call it; code that sets up its own TEV stages
+// during the 3D pass must call it too.
 void GxResetIndirect();
 
 // A refraction material's screen-space texgen matrix (GX_TEXMTX9) for a draw's world transform: see BindMaterial.

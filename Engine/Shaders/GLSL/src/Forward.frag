@@ -133,8 +133,18 @@ void main()
         discard;
     }
 
-    // the alpha band: kept only at most mAlphaKeepBelow or at least mAlphaKeepAbove (the GameCube's alpha compare)
-    if (diffuse.a > material.mAlphaKeepBelow && diffuse.a < material.mAlphaKeepAbove)
+    // the alpha band: kept only at most mAlphaKeepBelow or at least mAlphaKeepAbove (the GameCube's alpha compare);
+    // the other way round (below over above), only what's between, its colour added flat (alpha 1): what such a
+    // band drops, filled (GxUtils.cpp's ONE, ONE)
+    if (material.mAlphaKeepBelow > material.mAlphaKeepAbove)
+    {
+        if (diffuse.a <= material.mAlphaKeepAbove || diffuse.a >= material.mAlphaKeepBelow)
+        {
+            discard;
+        }
+        diffuse.a = 1.0;
+    }
+    else if (diffuse.a > material.mAlphaKeepBelow && diffuse.a < material.mAlphaKeepAbove)
     {
         discard;
     }

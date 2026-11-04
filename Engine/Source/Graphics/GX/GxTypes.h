@@ -5,6 +5,7 @@
 #include <gccore.h>
 #include <stdint.h>
 #include "EngineTypes.h"
+#include "Assets/GxProgram.h"
 
 class World;
 
@@ -17,6 +18,10 @@ struct LightingState
     uint8_t mDiffuseFunc = GX_DF_CLAMP;
     uint8_t mAttenuationFunc = GX_AF_SPOT;
     uint8_t mSpecularMask = 0;   // (not 0: COLOR1 is the material's specular, lit by this light alone)
+    // A GX program's channels (BindMaterial): its own controls, in place of all the above but the light mask (and
+    // mColorChannel: whether the draw's vertices carry a colour). Off again with GxResetIndirect.
+    bool mRaw = false;
+    GxProgramChannels mRawChannels;
 
     LightingState()
     {
@@ -43,7 +48,9 @@ struct LightingState
             mLightMask == other.mLightMask &&
             mDiffuseFunc == other.mDiffuseFunc &&
             mAttenuationFunc == other.mAttenuationFunc &&
-            mSpecularMask == other.mSpecularMask;
+            mSpecularMask == other.mSpecularMask &&
+            mRaw == other.mRaw &&
+            (!mRaw || mRawChannels == other.mRawChannels);
     }
 
     bool operator!=(const LightingState& other) const

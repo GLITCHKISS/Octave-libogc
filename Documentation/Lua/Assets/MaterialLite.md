@@ -104,6 +104,12 @@ Check whether fresnel is enabled.
 Sig: `enabled = MaterialLite:IsFresnelEnabled()`
  - Ret: `bool enabled` If fresnel is enabled
 ---
+### HasGxProgram
+Check whether the material carries a raw GX program: a block of GX state that is the whole material on the GameCube (other platforms draw it by its own settings). See [GxProgram](../../Info/GxProgram.md).
+
+Sig: `hasProgram = MaterialLite:HasGxProgram()`
+ - Ret: `bool hasProgram` If it has a GX program
+---
 ### GetFresnelColor
 Get the fresnel color.
 

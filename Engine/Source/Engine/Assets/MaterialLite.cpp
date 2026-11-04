@@ -138,6 +138,273 @@ MaterialLite::~MaterialLite()
 
 }
 
+// The GX program's stream, field by field in the order MaterialLite.h lays out (a tool writes the same bytes). A count
+// past GX's own limit is read in full, the extra stages or texgens dropped, so the rest of the asset still lines up.
+static void ReadGxProgramStage(Stream& stream, GxProgramStage& stage)
+{
+    stage.mTexCoord = stream.ReadUint8();
+    stage.mTexMap = stream.ReadUint8();
+    stage.mChannel = stream.ReadUint8();
+    for (uint32_t i = 0; i < 4; ++i)
+        stage.mColorIn[i] = stream.ReadUint8();
+    stage.mColorOp = stream.ReadUint8();
+    stage.mColorBias = stream.ReadUint8();
+    stage.mColorScale = stream.ReadUint8();
+    stage.mColorClamp = stream.ReadUint8();
+    stage.mColorOut = stream.ReadUint8();
+    for (uint32_t i = 0; i < 4; ++i)
+        stage.mAlphaIn[i] = stream.ReadUint8();
+    stage.mAlphaOp = stream.ReadUint8();
+    stage.mAlphaBias = stream.ReadUint8();
+    stage.mAlphaScale = stream.ReadUint8();
+    stage.mAlphaClamp = stream.ReadUint8();
+    stage.mAlphaOut = stream.ReadUint8();
+    stage.mKColorSel = stream.ReadUint8();
+    stage.mKAlphaSel = stream.ReadUint8();
+    stage.mRasSwap = stream.ReadUint8();
+    stage.mTexSwap = stream.ReadUint8();
+}
+
+static void ReadGxProgramTexGen(Stream& stream, GxProgramTexGen& texGen)
+{
+    texGen.mType = stream.ReadUint8();
+    texGen.mSource = stream.ReadUint8();
+    texGen.mMatrix = stream.ReadUint8();
+    texGen.mScale[0] = stream.ReadFloat();
+    texGen.mScale[1] = stream.ReadFloat();
+    texGen.mRotation = stream.ReadFloat();
+    texGen.mTranslation[0] = stream.ReadFloat();
+    texGen.mTranslation[1] = stream.ReadFloat();
+    texGen.mCenter[0] = stream.ReadFloat();
+    texGen.mCenter[1] = stream.ReadFloat();
+    texGen.mScroll[0] = stream.ReadFloat();
+    texGen.mScroll[1] = stream.ReadFloat();
+}
+
+static std::shared_ptr<const GxProgram> ReadGxProgram(Stream& stream, const char* name)
+{
+    std::shared_ptr<GxProgram> program = std::make_shared<GxProgram>();
+    GxProgram& p = *program;
+
+    const uint32_t numTevStages = stream.ReadUint8();
+    const uint32_t numTexGens = stream.ReadUint8();
+    p.mChannels.mNumChans = stream.ReadUint8();
+
+    GxProgramStage spareStage;
+    for (uint32_t i = 0; i < numTevStages; ++i)
+        ReadGxProgramStage(stream, (i < GX_PROGRAM_MAX_TEV_STAGES) ? p.mStages[i] : spareStage);
+
+    // indirect: its stages, the three matrices, each TEV stage's indirect part
+    const uint32_t numIndStages = stream.ReadUint8();
+    GxProgramIndStage spareInd;
+    for (uint32_t i = 0; i < numIndStages; ++i)
+    {
+        GxProgramIndStage& ind = (i < GX_PROGRAM_MAX_IND_STAGES) ? p.mIndStages[i] : spareInd;
+        ind.mTexCoord = stream.ReadUint8();
+        ind.mTexMap = stream.ReadUint8();
+        ind.mScaleS = stream.ReadUint8();
+        ind.mScaleT = stream.ReadUint8();
+    }
+    p.mNumIndStages = uint8_t(glm::min<uint32_t>(numIndStages, GX_PROGRAM_MAX_IND_STAGES));
+    for (uint32_t m = 0; m < GX_PROGRAM_IND_MATRICES; ++m)
+    {
+        for (uint32_t r = 0; r < 2; ++r)
+            for (uint32_t c = 0; c < 3; ++c)
+                p.mIndMtx[m].mMtx[r][c] = stream.ReadFloat();
+        p.mIndMtx[m].mScaleExp = stream.ReadInt8();
+    }
+    for (uint32_t i = 0; i < numTevStages; ++i)
+    {
+        GxProgramTevInd& ind = ((i < GX_PROGRAM_MAX_TEV_STAGES) ? p.mStages[i] : spareStage).mInd;
+        ind.mIndStage = stream.ReadUint8();
+        ind.mFormat = stream.ReadUint8();
+        ind.mBias = stream.ReadUint8();
+        ind.mMatrix = stream.ReadUint8();
+        ind.mWrapS = stream.ReadUint8();
+        ind.mWrapT = stream.ReadUint8();
+        ind.mAddPrev = stream.ReadUint8();
+        ind.mUtcLod = stream.ReadUint8();
+        ind.mAlphaSel = stream.ReadUint8();
+    }
+
+    GxProgramTexGen spareTexGen;
+    for (uint32_t i = 0; i < numTexGens; ++i)
+        ReadGxProgramTexGen(stream, (i < GX_PROGRAM_MAX_TEXGENS) ? p.mTexGens[i] : spareTexGen);
+
+    if (numTevStages < 1 || numTevStages > GX_PROGRAM_MAX_TEV_STAGES || numTexGens > GX_PROGRAM_MAX_TEXGENS ||
+        p.mChannels.mNumChans > 2 || numIndStages > GX_PROGRAM_MAX_IND_STAGES)
+    {
+        LogWarning("MaterialLite %s: GX program with %u TEV stages, %u indirect, %u texgens, %u channels "
+                   "(GX has 1-16, 0-4, 0-8, 0-2)", name, unsigned(numTevStages), unsigned(numIndStages),
+                   unsigned(numTexGens), unsigned(p.mChannels.mNumChans));
+    }
+    p.mNumTevStages = uint8_t(glm::clamp<uint32_t>(numTevStages, 1, GX_PROGRAM_MAX_TEV_STAGES));
+    p.mNumTexGens = uint8_t(glm::min<uint32_t>(numTexGens, GX_PROGRAM_MAX_TEXGENS));
+    p.mChannels.mNumChans = uint8_t(glm::clamp<uint32_t>(p.mChannels.mNumChans, 1, 2));
+
+    for (uint32_t t = 0; t < 4; ++t)
+        for (uint32_t c = 0; c < 4; ++c)
+            p.mSwapTables[t][c] = stream.ReadUint8();
+    for (uint32_t r = 0; r < 4; ++r)
+        for (uint32_t c = 0; c < 4; ++c)
+            p.mTevColors[r][c] = stream.ReadInt16();
+    for (uint32_t k = 0; k < 4; ++k)
+        for (uint32_t c = 0; c < 4; ++c)
+            p.mKonstColors[k][c] = stream.ReadUint8();
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        GxProgramChan& chan = p.mChannels.mChans[i];
+        chan.mEnable = stream.ReadUint8();
+        chan.mMatSrc = stream.ReadUint8();
+        chan.mAmbSrc = stream.ReadUint8();
+        chan.mDiffuseFn = stream.ReadUint8();
+        chan.mAttnFn = stream.ReadUint8();
+    }
+    for (uint32_t i = 0; i < 2; ++i)
+        for (uint32_t c = 0; c < 4; ++c)
+            p.mMatColors[i][c] = stream.ReadUint8();
+    for (uint32_t i = 0; i < 2; ++i)
+        for (uint32_t c = 0; c < 4; ++c)
+            p.mAmbColors[i][c] = stream.ReadUint8();
+
+    p.mAlphaComp0 = stream.ReadUint8();
+    p.mAlphaRef0 = stream.ReadUint8();
+    p.mAlphaOp = stream.ReadUint8();
+    p.mAlphaComp1 = stream.ReadUint8();
+    p.mAlphaRef1 = stream.ReadUint8();
+    p.mBlendType = stream.ReadUint8();
+    p.mBlendSrc = stream.ReadUint8();
+    p.mBlendDst = stream.ReadUint8();
+    p.mLogicOp = stream.ReadUint8();
+    p.mZEnable = stream.ReadUint8();
+    p.mZFunc = stream.ReadUint8();
+    p.mZUpdate = stream.ReadUint8();
+    p.mZCompLoc = stream.ReadUint8();
+    p.mCullMode = stream.ReadUint8();
+
+    return program;
+}
+
+static void WriteGxProgram(Stream& stream, const GxProgram& p)
+{
+    stream.WriteUint8(p.mNumTevStages);
+    stream.WriteUint8(p.mNumTexGens);
+    stream.WriteUint8(p.mChannels.mNumChans);
+
+    for (uint32_t i = 0; i < p.mNumTevStages; ++i)
+    {
+        const GxProgramStage& stage = p.mStages[i];
+        stream.WriteUint8(stage.mTexCoord);
+        stream.WriteUint8(stage.mTexMap);
+        stream.WriteUint8(stage.mChannel);
+        for (uint32_t c = 0; c < 4; ++c)
+            stream.WriteUint8(stage.mColorIn[c]);
+        stream.WriteUint8(stage.mColorOp);
+        stream.WriteUint8(stage.mColorBias);
+        stream.WriteUint8(stage.mColorScale);
+        stream.WriteUint8(stage.mColorClamp);
+        stream.WriteUint8(stage.mColorOut);
+        for (uint32_t c = 0; c < 4; ++c)
+            stream.WriteUint8(stage.mAlphaIn[c]);
+        stream.WriteUint8(stage.mAlphaOp);
+        stream.WriteUint8(stage.mAlphaBias);
+        stream.WriteUint8(stage.mAlphaScale);
+        stream.WriteUint8(stage.mAlphaClamp);
+        stream.WriteUint8(stage.mAlphaOut);
+        stream.WriteUint8(stage.mKColorSel);
+        stream.WriteUint8(stage.mKAlphaSel);
+        stream.WriteUint8(stage.mRasSwap);
+        stream.WriteUint8(stage.mTexSwap);
+    }
+
+    stream.WriteUint8(p.mNumIndStages);
+    for (uint32_t i = 0; i < p.mNumIndStages; ++i)
+    {
+        const GxProgramIndStage& ind = p.mIndStages[i];
+        stream.WriteUint8(ind.mTexCoord);
+        stream.WriteUint8(ind.mTexMap);
+        stream.WriteUint8(ind.mScaleS);
+        stream.WriteUint8(ind.mScaleT);
+    }
+    for (uint32_t m = 0; m < GX_PROGRAM_IND_MATRICES; ++m)
+    {
+        for (uint32_t r = 0; r < 2; ++r)
+            for (uint32_t c = 0; c < 3; ++c)
+                stream.WriteFloat(p.mIndMtx[m].mMtx[r][c]);
+        stream.WriteInt8(p.mIndMtx[m].mScaleExp);
+    }
+    for (uint32_t i = 0; i < p.mNumTevStages; ++i)
+    {
+        const GxProgramTevInd& ind = p.mStages[i].mInd;
+        stream.WriteUint8(ind.mIndStage);
+        stream.WriteUint8(ind.mFormat);
+        stream.WriteUint8(ind.mBias);
+        stream.WriteUint8(ind.mMatrix);
+        stream.WriteUint8(ind.mWrapS);
+        stream.WriteUint8(ind.mWrapT);
+        stream.WriteUint8(ind.mAddPrev);
+        stream.WriteUint8(ind.mUtcLod);
+        stream.WriteUint8(ind.mAlphaSel);
+    }
+
+    for (uint32_t i = 0; i < p.mNumTexGens; ++i)
+    {
+        const GxProgramTexGen& texGen = p.mTexGens[i];
+        stream.WriteUint8(texGen.mType);
+        stream.WriteUint8(texGen.mSource);
+        stream.WriteUint8(texGen.mMatrix);
+        stream.WriteFloat(texGen.mScale[0]);
+        stream.WriteFloat(texGen.mScale[1]);
+        stream.WriteFloat(texGen.mRotation);
+        stream.WriteFloat(texGen.mTranslation[0]);
+        stream.WriteFloat(texGen.mTranslation[1]);
+        stream.WriteFloat(texGen.mCenter[0]);
+        stream.WriteFloat(texGen.mCenter[1]);
+        stream.WriteFloat(texGen.mScroll[0]);
+        stream.WriteFloat(texGen.mScroll[1]);
+    }
+
+    for (uint32_t t = 0; t < 4; ++t)
+        for (uint32_t c = 0; c < 4; ++c)
+            stream.WriteUint8(p.mSwapTables[t][c]);
+    for (uint32_t r = 0; r < 4; ++r)
+        for (uint32_t c = 0; c < 4; ++c)
+            stream.WriteInt16(p.mTevColors[r][c]);
+    for (uint32_t k = 0; k < 4; ++k)
+        for (uint32_t c = 0; c < 4; ++c)
+            stream.WriteUint8(p.mKonstColors[k][c]);
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        const GxProgramChan& chan = p.mChannels.mChans[i];
+        stream.WriteUint8(chan.mEnable);
+        stream.WriteUint8(chan.mMatSrc);
+        stream.WriteUint8(chan.mAmbSrc);
+        stream.WriteUint8(chan.mDiffuseFn);
+        stream.WriteUint8(chan.mAttnFn);
+    }
+    for (uint32_t i = 0; i < 2; ++i)
+        for (uint32_t c = 0; c < 4; ++c)
+            stream.WriteUint8(p.mMatColors[i][c]);
+    for (uint32_t i = 0; i < 2; ++i)
+        for (uint32_t c = 0; c < 4; ++c)
+            stream.WriteUint8(p.mAmbColors[i][c]);
+
+    stream.WriteUint8(p.mAlphaComp0);
+    stream.WriteUint8(p.mAlphaRef0);
+    stream.WriteUint8(p.mAlphaOp);
+    stream.WriteUint8(p.mAlphaComp1);
+    stream.WriteUint8(p.mAlphaRef1);
+    stream.WriteUint8(p.mBlendType);
+    stream.WriteUint8(p.mBlendSrc);
+    stream.WriteUint8(p.mBlendDst);
+    stream.WriteUint8(p.mLogicOp);
+    stream.WriteUint8(p.mZEnable);
+    stream.WriteUint8(p.mZFunc);
+    stream.WriteUint8(p.mZUpdate);
+    stream.WriteUint8(p.mZCompLoc);
+    stream.WriteUint8(p.mCullMode);
+}
+
 void MaterialLite::LoadStream(Stream& stream, Platform platform)
 {
     Material::LoadStream(stream, platform);
@@ -200,6 +467,12 @@ void MaterialLite::LoadStream(Stream& stream, Platform platform)
     {
         mLiteParams.mSharpSpecular = stream.ReadBool();
     }
+
+    mLiteParams.mGxProgram = nullptr;
+    if (mVersion >= ASSET_VERSION_GX_PROGRAM && stream.ReadUint8() != 0)
+    {
+        mLiteParams.mGxProgram = ReadGxProgram(stream, GetName().c_str());
+    }
 }
 
 void MaterialLite::SaveStream(Stream& stream, Platform platform)
@@ -245,6 +518,12 @@ void MaterialLite::SaveStream(Stream& stream, Platform platform)
     stream.WriteBool(mLiteParams.mMipBiasFollowsHeight);
     stream.WriteBool(mLiteParams.mFresnelAlpha);
     stream.WriteBool(mLiteParams.mSharpSpecular);
+
+    stream.WriteUint8(mLiteParams.mGxProgram != nullptr ? 1 : 0);
+    if (mLiteParams.mGxProgram != nullptr)
+    {
+        WriteGxProgram(stream, *mLiteParams.mGxProgram);
+    }
 }
 
 void MaterialLite::Create()

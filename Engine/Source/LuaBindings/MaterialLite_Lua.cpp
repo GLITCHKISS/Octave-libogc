@@ -158,6 +158,15 @@ int MaterialLite_Lua::IsFresnelEnabled(lua_State* L)
     return 1;
 }
 
+// material:HasGxProgram(): whether it carries a raw GX program (GameCube only: its whole material there; GxProgram.h)
+int MaterialLite_Lua::HasGxProgram(lua_State* L)
+{
+    MaterialLite* mat = CHECK_MATERIAL_LITE(L, 1);
+
+    lua_pushboolean(L, mat->HasGxProgram());
+    return 1;
+}
+
 int MaterialLite_Lua::GetFresnelColor(lua_State* L)
 {
     MaterialLite* mat = CHECK_MATERIAL_LITE(L, 1);
@@ -418,6 +427,8 @@ void MaterialLite_Lua::Bind()
     REGISTER_TABLE_FUNC(L, mtIndex, EnableFresnel);
 
     REGISTER_TABLE_FUNC(L, mtIndex, IsFresnelEnabled);
+
+    REGISTER_TABLE_FUNC(L, mtIndex, HasGxProgram);
 
     REGISTER_TABLE_FUNC(L, mtIndex, GetFresnelColor);
 

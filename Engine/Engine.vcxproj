@@ -943,6 +943,7 @@
     <ClInclude Include="Source\Engine\Assets\MaterialInstance.h" />
     <ClInclude Include="Source\Engine\Assets\Material.h" />
     <ClInclude Include="Source\Engine\Assets\MaterialLite.h" />
+    <ClInclude Include="Source\Engine\Assets\GxProgram.h" />
     <ClInclude Include="Source\Engine\Assets\ParticleSystem.h" />
     <ClInclude Include="Source\Engine\Assets\ParticleSystemInstance.h" />
     <ClInclude Include="Source\Engine\Assets\Scene.h" />
