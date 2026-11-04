@@ -85,7 +85,7 @@ GxStrips GxStripFaces(const IndexType* faceIdx, uint32_t faces);
 bool GxSkinRigidPlan(SkeletalMesh3D* component, const uint16_t*& blended, uint32_t& numBlended,
                      const uint16_t*& rigid, uint32_t& numRigid);
 // Out of the data cache, just these of a skinned array's vertices (`which` in order)
-void GxFlushSkinnedVertices(const Vertex* vertices, const uint16_t* which, uint32_t count);
+void GxFlushSkinnedVertices(const CpuSkinnedVertex* vertices, const uint16_t* which, uint32_t count);
 void GFX_SetCompactUnlitMeshes(bool compact);
 bool GFX_GetCompactUnlitMeshes();
 void GFX_SetQuantizedMeshes(bool quantized);

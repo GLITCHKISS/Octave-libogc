@@ -105,7 +105,7 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverri
 void GFX_CreateSkeletalMeshCompResource(SkeletalMesh3D* skeletalMeshComp);
 void GFX_DestroySkeletalMeshCompResource(SkeletalMesh3D* skeletalMeshComp);
 void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, uint32_t numVertices);
-void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<Vertex>& skinnedVertices);
+void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<CpuSkinnedVertex>& skinnedVertices);
 void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp);
 bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* skeletalMeshComp);
 

@@ -1787,7 +1787,7 @@ bool GxSkinRigidPlan(SkeletalMesh3D* component, const uint16_t*& blended, uint32
     return true;
 }
 
-void GxFlushSkinnedVertices(const Vertex* vertices, const uint16_t* which, uint32_t count)
+void GxFlushSkinnedVertices(const CpuSkinnedVertex* vertices, const uint16_t* which, uint32_t count)
 {
     // a run of neighbours at a time (a part's vertices come together), one sync at the end
     uint32_t i = 0;
@@ -1796,7 +1796,7 @@ void GxFlushSkinnedVertices(const Vertex* vertices, const uint16_t* which, uint3
         uint32_t j = i + 1;
         while (j < count && uint32_t(which[j]) == uint32_t(which[j - 1]) + 1)
             ++j;
-        DCFlushRangeNoSync((void*)(vertices + which[i]), (j - i) * uint32_t(sizeof(Vertex)));
+        DCFlushRangeNoSync((void*)(vertices + which[i]), (j - i) * uint32_t(sizeof(CpuSkinnedVertex)));
         i = j;
     }
     _sync();
@@ -1804,6 +1804,12 @@ void GxFlushSkinnedVertices(const Vertex* vertices, const uint16_t* which, uint3
 
 void GFX_CreateSkeletalMeshResource(SkeletalMesh* skeletalMesh, uint32_t numVertices, VertexSkinned* vertices, uint32_t numIndices, IndexType* indices)
 {
+    // The mesh's own vertices out of the data cache, once, now they're loaded: a CPU-skinned draw reads its texture
+    // coordinates straight from them (the skinned arrays keep only positions and normals: CpuSkinnedVertex), and
+    // nothing writes them again (BindSkeletalMesh, the GPU-skinned draw, flushes them each time as ever)
+    if (vertices != nullptr && numVertices > 0)
+        DCFlushRange(vertices, numVertices * uint32_t(sizeof(VertexSkinned)));
+
     // its skinned lists now, with the loading (not a hitch the first time it's drawn) -- for a mesh skinned on the CPU
     FreeSkinLists(skeletalMesh);
     if (skeletalMesh->GetNumBones() > MAX_GPU_BONES && skeletalMesh->GetNumFaces() > 0)
@@ -1954,13 +1960,13 @@ void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp
 
 }
 
-void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<Vertex>& skinnedVertices)
+void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<CpuSkinnedVertex>& skinnedVertices)
 {
     // The CPU-skinned vertices out of the data cache, once, as they're written (CpuSkinVertices, and the array's
     // first fill): the draws that read them -- the mesh, its shadow caster, children drawing its skin (a character's
-    // afterimages) -- no longer each flush the whole array again (~108 KB for a character, up to 7 times a frame)
+    // afterimages) -- no longer each flush the whole array again (~65 KB for a character, up to 7 times a frame)
     if (!skinnedVertices.empty())
-        DCFlushRange((void*)skinnedVertices.data(), uint32_t(skinnedVertices.size() * sizeof(Vertex)));
+        DCFlushRange((void*)skinnedVertices.data(), uint32_t(skinnedVertices.size() * sizeof(CpuSkinnedVertex)));
 }
 
 void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
@@ -1974,12 +1980,13 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
         const GxSkinLists* rigid = cpuSkinned ? GetRigidLists(skeletalMeshComp, mesh) : nullptr;
         if (cpuSkinned)
         {
-            Vertex* vertices = skeletalMeshComp->GetSkinnedVertices();
+            CpuSkinnedVertex* vertices = skeletalMeshComp->GetSkinnedVertices();
             uint32_t numVertices = skeletalMeshComp->GetNumSkinnedVertices();
             if (vertices == nullptr || numVertices < mesh->GetNumVertices())
             {
                 return;                         // (no array of its own this frame: SkeletalMesh3D lets a sharing
             }                                   //  child's go -- drawn from it, the GPU would read past its end)
+            const VertexSkinned* meshVerts = mesh->GetVertices().data();
 
             GX_ClearVtxDesc();
             if (rigid != nullptr)
@@ -1994,12 +2001,15 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
             GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
             GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
 
-            GX_SetArray(GX_VA_POS, &vertices[0].mPosition, sizeof(Vertex));
-            GX_SetArray(GX_VA_NRM, &vertices[0].mNormal, sizeof(Vertex));
-            GX_SetArray(GX_VA_TEX0, &vertices[0].mTexcoord0, sizeof(Vertex));
-            GX_SetArray(GX_VA_TEX1, &vertices[0].mTexcoord1, sizeof(Vertex));
-            // (flushed when skinned: GFX_UpdateSkeletalMeshCompVertexBuffer; the vertex cache cleared at the
-            //  frame's start, GFX_BeginFrame -- nothing rewrites a skinned array between)
+            // (positions and normals the skinned array's; the texture coordinates, which the bones never move, the
+            //  mesh's own vertices' -- the same index into both)
+            GX_SetArray(GX_VA_POS, &vertices[0].mPosition, sizeof(CpuSkinnedVertex));
+            GX_SetArray(GX_VA_NRM, &vertices[0].mNormal, sizeof(CpuSkinnedVertex));
+            GX_SetArray(GX_VA_TEX0, (void*)&meshVerts[0].mTexcoord0, sizeof(VertexSkinned));
+            GX_SetArray(GX_VA_TEX1, (void*)&meshVerts[0].mTexcoord1, sizeof(VertexSkinned));
+            // (flushed when skinned: GFX_UpdateSkeletalMeshCompVertexBuffer, and the mesh's once, when it's created:
+            //  GFX_CreateSkeletalMeshResource; the vertex cache cleared at the frame's start, GFX_BeginFrame --
+            //  nothing rewrites a skinned array between)
             (void)numVertices;
         }
         else
@@ -2324,7 +2334,7 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
 #endif
     if (cpuSkinned)
     {
-        Vertex* vertices = skeletalMeshComp->GetSkinnedVertices();
+        CpuSkinnedVertex* vertices = skeletalMeshComp->GetSkinnedVertices();
         uint32_t numVertices = skeletalMeshComp->GetNumSkinnedVertices();
         if (vertices == nullptr || numVertices < mesh->GetNumVertices())
         {
@@ -2344,14 +2354,16 @@ static void ProjShadowDrawCaster(SkeletalMesh3D* skeletalMeshComp, const Mtx vie
             GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
             GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
             GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
-            GX_SetArray(GX_VA_NRM, &vertices[0].mNormal, sizeof(Vertex));
-            GX_SetArray(GX_VA_TEX0, &vertices[0].mTexcoord0, sizeof(Vertex));
-            GX_SetArray(GX_VA_TEX1, &vertices[0].mTexcoord1, sizeof(Vertex));
+            // (the texture coordinates the mesh's own: as GFX_DrawSkeletalMeshComp)
+            const VertexSkinned* meshVerts = mesh->GetVertices().data();
+            GX_SetArray(GX_VA_NRM, &vertices[0].mNormal, sizeof(CpuSkinnedVertex));
+            GX_SetArray(GX_VA_TEX0, (void*)&meshVerts[0].mTexcoord0, sizeof(VertexSkinned));
+            GX_SetArray(GX_VA_TEX1, (void*)&meshVerts[0].mTexcoord1, sizeof(VertexSkinned));
         }
 #endif
         GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
         GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-        GX_SetArray(GX_VA_POS, &vertices[0].mPosition, sizeof(Vertex));
+        GX_SetArray(GX_VA_POS, &vertices[0].mPosition, sizeof(CpuSkinnedVertex));
         (void)numVertices;              // (flushed when skinned; the vertex cache cleared at the frame's start)
     }
     else

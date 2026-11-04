@@ -169,7 +169,8 @@ public:
     AnimationUpdateMode GetAnimationUpdateMode() const;
     void SetAnimationUpdateMode(AnimationUpdateMode mode);
 
-    Vertex* GetSkinnedVertices();
+    // (GX: positions and normals only -- CpuSkinnedVertex; the texture coordinates are the mesh's own, GetVertices)
+    CpuSkinnedVertex* GetSkinnedVertices();
     uint32_t GetNumSkinnedVertices();
     // (GX: the skinned vertices -- GetSkinnedVertices' -- keep the rigid ones as the mesh has them, for the GPU to put
     //  through their bones: CpuSkinBlended)
@@ -245,8 +246,8 @@ protected:
 
     SkeletalMeshRef mSkeletalMesh;
     std::vector<glm::mat4> mBoneMatrices;
-    std::vector<Vertex> mSkinnedVertices; // Used by CPU skinning only.
-    std::vector<Vertex> mSkinnedVerticesBack; // (GX: the other of the two, in turn -- CpuSkinVertices)
+    std::vector<CpuSkinnedVertex> mSkinnedVertices; // Used by CPU skinning only.
+    std::vector<CpuSkinnedVertex> mSkinnedVerticesBack; // (GX: the other of the two, in turn -- CpuSkinVertices)
     // (GX: the parent whose CPU-skinned vertices this one draws instead of its own, this frame -- an inherited pose
     //  of the same mesh, no morphs: the same vertices exactly. UpdateAnimation sets it, GetSkinnedVertices reads it)
     SkeletalMesh3D* mSkinShare = nullptr;

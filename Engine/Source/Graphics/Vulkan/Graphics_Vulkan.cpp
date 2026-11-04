@@ -385,7 +385,7 @@ void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp
     ReallocateSkeletalMeshCompVertexBuffer(skeletalMeshComp, numVertices);
 }
 
-void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<Vertex>& skinnedVertices)
+void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<CpuSkinnedVertex>& skinnedVertices)
 {
     if (IsHeadless()) return;
     UpdateSkeletalMeshCompVertexBuffer(skeletalMeshComp, skinnedVertices);

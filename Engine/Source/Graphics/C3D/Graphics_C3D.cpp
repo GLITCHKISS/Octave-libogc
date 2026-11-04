@@ -852,7 +852,7 @@ void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp
     }
 }
 
-void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<Vertex>& skinnedVertices)
+void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<CpuSkinnedVertex>& skinnedVertices)
 {
     SkeletalMeshCompResource* resource = skeletalMeshComp->GetResource();
 

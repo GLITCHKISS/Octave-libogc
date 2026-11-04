@@ -169,10 +169,10 @@ void SkeletalMesh3D::TickCommon(float deltaTime)
     mHasAnimatedThisFrame = false;
 #if API_GX && !EDITOR
     // Hidden, an inherited pose of its parent's own mesh (a character's afterimages, while they're off): its two
-    // skinned arrays let go (~96 KB each for a character's), after three frames hidden -- the GPU may still be drawing
+    // skinned arrays let go (~59 KB each for a character's), after three frames hidden -- the GPU may still be drawing
     // the frame before, and the arrays go straight back to the heap (not GxDeferFree: they're a vector's). Shown again,
     // it draws its parent's (UpdateAnimation: mSkinShare) or sizes them again (CpuSkinVertices) -- and keeps them till
-    // it's hidden again: let go while shown too (whenever it shared), a share that came and went sized and freed ~96 KB
+    // it's hidden again: let go while shown too (whenever it shared), a share that came and went sized and freed ~59 KB
     // an afterimage over and over, cutting the heap up mid-play
     if (!IsVisible() && mInheritPose && (mSkinnedVertices.capacity() > 0 || mSkinnedVerticesBack.capacity() > 0))
     {
@@ -183,8 +183,8 @@ void SkeletalMesh3D::TickCommon(float deltaTime)
             mHiddenFrames = (mHiddenFrames < 3) ? uint8_t(mHiddenFrames + 1) : mHiddenFrames;
             if (mHiddenFrames >= 3)
             {
-                std::vector<Vertex>().swap(mSkinnedVertices);
-                std::vector<Vertex>().swap(mSkinnedVerticesBack);
+                std::vector<CpuSkinnedVertex>().swap(mSkinnedVertices);
+                std::vector<CpuSkinnedVertex>().swap(mSkinnedVerticesBack);
                 mSkinnedRigid = false;                          // (refilled whole when sized again: CpuSkinBlended)
                 mSkinnedRigidBack = false;
             }
@@ -227,8 +227,10 @@ void SkeletalMesh3D::SetSkeletalMesh(SkeletalMesh* skeletalMesh)
                 {
                     mSkinnedVertices[i].mPosition = srcVerts[i].mPosition;
                     mSkinnedVertices[i].mNormal = srcVerts[i].mNormal;
-                    mSkinnedVertices[i].mTexcoord0 = srcVerts[i].mTexcoord0;
+#if !(API_GX && !EDITOR)                                                            // (GX: no texture coordinates in
+                    mSkinnedVertices[i].mTexcoord0 = srcVerts[i].mTexcoord0;        //  the array -- CpuSkinnedVertex)
                     mSkinnedVertices[i].mTexcoord1 = srcVerts[i].mTexcoord1;
+#endif
                 }
 
                 GFX_ReallocateSkeletalMeshCompVertexBuffer(this, skeletalMesh->GetNumVertices());
@@ -1582,7 +1584,7 @@ void SkeletalMesh3D::SetAnimationUpdateMode(AnimationUpdateMode mode)
     mAnimationUpdateMode = mode;
 }
 
-Vertex* SkeletalMesh3D::GetSkinnedVertices()
+CpuSkinnedVertex* SkeletalMesh3D::GetSkinnedVertices()
 {
     // (sharing its parent's this frame: the parent's array as it is now -- the one of its two it skinned into last)
     if (mSkinShare != nullptr && mSkinShare == mParent.Get())
@@ -2007,20 +2009,19 @@ uint32_t gOctSkinVerts = 0;
 #define OCT_GQR_S16_VALUE 0x00070007u
 // Each line of skinned vertices written out to memory as soon as it's finished (dcbst), while the loop goes on: the
 // flush after it (GFX_UpdateSkeletalMeshCompVertexBuffer) then finds the lines clean, instead of writing the whole
-// array back (~100 KB for a parachute) a line after another with nothing else to do. 0: as before
+// array back (~61 KB for a parachute) a line after another with nothing else to do. 0: as before
 #ifndef OCT_SKIN_STORE_LINES
 #define OCT_SKIN_STORE_LINES 1
 #endif
 
 // The vertex's own (VertexSkinned, 60 bytes: position 0, texture coordinates 12 and 20, normal 28) into f1 P (x y),
-// f2 PZ (z, ps0), f3 N, f4 NZ, f5 and f6 the texture coordinates
+// f2 PZ (z, ps0), f3 N, f4 NZ. (The texture coordinates not read: they aren't copied out -- CpuSkinnedVertex; the
+// draws read them from the mesh's own vertices.)
 #define OCT_SKIN_ASM_SRC \
     "psq_l     1,0(%[src]),0,0\n\t" \
     "psq_l     2,8(%[src]),1,0\n\t" \
     "psq_l     3,28(%[src]),0,0\n\t" \
-    "psq_l     4,36(%[src]),1,0\n\t" \
-    "psq_l     5,12(%[src]),0,0\n\t" \
-    "psq_l     6,20(%[src]),0,0\n\t"
+    "psq_l     4,36(%[src]),1,0\n\t"
 // The pairs of morph slots of a vertex (at least one: SkeletalMesh::MorphBlock), each pair 6 int16s -- x y of its
 // first slot, x y of its second, the two z's -- by its weight pair (each slot's weight times its scale): the x y of the
 // first by its weight (ps_madds0) summed in A from the vertex's own (XY), the second's (ps_madds1) in B -- two chains,
@@ -2060,9 +2061,9 @@ uint32_t gOctSkinVerts = 0;
     "fadds     2,13,2\n\t" \
     "fadds     4,19,4\n\t"
 // The bones' blended 3x4 -- a glm::mat4's columns 0..3 (cols), each two pairs, x y and z w (w unused), f14..f21 --
-// times the position and the normal, and the vertex out (Vertex, 40 bytes: position 0, texture coordinates 12 and
-// 20, normal 28). Four chains of three side by side: the FPU has one reservation station, and a chain alone waits out
-// each step's three cycles
+// times the position and the normal, and the vertex out (CpuSkinnedVertex, 24 bytes: position 0, normal 12). Four
+// chains of three side by side: the FPU has one reservation station, and a chain alone waits out each step's three
+// cycles
 #define OCT_SKIN_ASM_OUT \
     "psq_l     14,0(%[cols]),0,0\n\t" \
     "psq_l     15,8(%[cols]),0,0\n\t" \
@@ -2084,12 +2085,10 @@ uint32_t gOctSkinVerts = 0;
     "ps_madds0 23,19,2,23\n\t" \
     "ps_madds0 24,18,4,24\n\t" \
     "ps_madds0 25,19,4,25\n\t" \
-    "psq_st    5,12(%[dst]),0,0\n\t" \
-    "psq_st    6,20(%[dst]),0,0\n\t" \
     "psq_st    22,0(%[dst]),0,0\n\t" \
     "psq_st    23,8(%[dst]),1,0\n\t" \
-    "psq_st    24,28(%[dst]),0,0\n\t" \
-    "psq_st    25,36(%[dst]),1,0"
+    "psq_st    24,12(%[dst]),0,0\n\t" \
+    "psq_st    25,20(%[dst]),1,0"
 // As OCT_SKIN_ASM_OUT, with the normal made unit again: 1/sqrt(x*x + y*y + z*z) -- the estimate (frsqrte) and two
 // Newton steps (the SDK's PSVECNormalize takes one, trusting the Gekko's estimate to 1/4096; the second, a few
 // cycles, holds to a millionth even from the 1/32 the PowerPC promises); left as it is when nearly 0 (as the PC: a
@@ -2130,14 +2129,12 @@ uint32_t gOctSkinVerts = 0;
     "psq_st    22,0(%[dst]),0,0\n\t" \
     "psq_st    23,8(%[dst]),1,0\n\t" \
     "fnmsubs   12,12,8,%[three]\n\t" \
-    "psq_st    5,12(%[dst]),0,0\n\t" \
-    "psq_st    6,20(%[dst]),0,0\n\t" \
     "fmuls     11,12,13\n\t" \
     "fsel      11,10,11,%[one]\n\t" \
     "ps_muls0  24,24,11\n\t" \
     "ps_muls0  25,25,11\n\t" \
-    "psq_st    24,28(%[dst]),0,0\n\t" \
-    "psq_st    25,36(%[dst]),1,0"
+    "psq_st    24,12(%[dst]),0,0\n\t" \
+    "psq_st    25,20(%[dst]),1,0"
 #define OCT_SKIN_ASM_CLOBBERS \
     "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12", "fr13", \
     "fr14", "fr15", "fr16", "fr17", "fr18", "fr19", "fr20", "fr21", "fr22", "fr23", "fr24", "fr25", \
@@ -2215,7 +2212,7 @@ static inline __attribute__((always_inline)) void OctSkinBlend(float* out, const
 struct OctSkinJob
 {
     const VertexSkinned* mSrc;
-    Vertex* mDst;
+    CpuSkinnedVertex* mDst;
     uint32_t mNumVerts;
     const glm::mat4* mBones;
     bool mOneBone;
@@ -2235,7 +2232,7 @@ template<bool MORPH, bool RENORM>
 static void OctSkinPairs(const OctSkinJob& job)
 {
     const VertexSkinned* src = job.mSrc;
-    Vertex* dst = job.mDst;
+    CpuSkinnedVertex* dst = job.mDst;
     const uint32_t numVerts = job.mNumVerts;
     const glm::mat4* bones = job.mBones;
     const bool oneBone = job.mOneBone;
@@ -2246,16 +2243,17 @@ static void OctSkinPairs(const OctSkinJob& job)
     const float* nrmW = job.mNrmW;
     const uint32_t nrmOfs = job.mNrmOfs;
     const uint32_t numNrm = job.mNumNrm;
-    static_assert(sizeof(VertexSkinned) == 60 && sizeof(Vertex) == 40 && sizeof(glm::mat4) == 64,
+    static_assert(sizeof(VertexSkinned) == 60 && sizeof(CpuSkinnedVertex) == 24 && sizeof(glm::mat4) == 64 &&
+                  offsetof(CpuSkinnedVertex, mPosition) == 0 && offsetof(CpuSkinnedVertex, mNormal) == 12,
                   "OctSkinPairs' asm reads and writes them at these offsets");
 
-    // Each 32-byte cache line of the array zeroed just before it's written (dcbz) -- every byte of a Vertex is
+    // Each 32-byte cache line of the array zeroed just before it's written (dcbz) -- every byte of a vertex is
     // written below, so nothing the zeroing clears is kept -- not read in from memory first, as a store to a line
     // not in the cache otherwise is; the lines only partly in the array (its ends) left alone. And the source a few
     // vertices ahead asked for (dcbt), a cache line at a time, PF_AHEAD vertices ahead: each line once, not a dcbt
     // for every vertex whether its line was asked for already or not. (Past the arrays' ends too, for the last few:
     // a dcbt only reads, and one that can't is nothing.)
-    static_assert(sizeof(Vertex) == 2 * sizeof(glm::vec3) + 2 * sizeof(glm::vec2), "dcbz: a Vertex has no padding");
+    static_assert(sizeof(CpuSkinnedVertex) == 2 * sizeof(glm::vec3), "dcbz: a skinned vertex has no padding");
     uintptr_t nextLine = ((uintptr_t)dst + 31) & ~(uintptr_t)31;
     const uintptr_t dstEnd = (uintptr_t)(dst + numVerts);
 #if OCT_SKIN_STORE_LINES
@@ -2291,11 +2289,12 @@ static void OctSkinPairs(const OctSkinJob& job)
     }
 
     const VertexSkinned* sv = src;
-    Vertex* dv = dst;
+    CpuSkinnedVertex* dv = dst;
     const char* mv = morph;
     for (uint32_t i = 0; i < numVerts; ++i, ++sv, ++dv, mv += morphStride)
     {
-        // (a vertex, 40 bytes, starts at most two lines, and one 60 bytes on brings at most two more to ask for)
+        // (a vertex, 24 bytes, starts at most one line -- two kept, as when it was 40 -- and one 60 bytes on brings
+        //  at most two more to ask for)
         {
             const uintptr_t vertEnd = (uintptr_t)(dv + 1);
             if (nextLine < vertEnd && nextLine + 32 <= dstEnd)
@@ -2391,7 +2390,7 @@ static void OctSkinPairs(const OctSkinJob& job)
 
 #if OCT_SKIN_STORE_LINES
         {
-            const uintptr_t vertEnd = (uintptr_t)(dv + 1);         // (a vertex finishes at most two lines)
+            const uintptr_t vertEnd = (uintptr_t)(dv + 1);         // (a vertex finishes at most one line now)
             if (doneLine + 32 <= vertEnd)
             {
                 __asm__ volatile("dcbst 0,%0" : : "r"(doneLine) : "memory");
@@ -2441,7 +2440,7 @@ void SkeletalMesh3D::CpuSkinVertices()
         const std::vector<VertexSkinned>& verts = mesh->GetVertices();
         const uint32_t numVerts = mesh->GetNumVertices();
         const VertexSkinned* src = verts.data();
-        Vertex* dst = mSkinnedVertices.data();
+        CpuSkinnedVertex* dst = mSkinnedVertices.data();
         const glm::mat4* boneMats = mBoneMatrices.data();
 
         // The morph targets, each by its weight, added to the vertex's own as the vertices go by: a target's moves read
@@ -2526,7 +2525,7 @@ void SkeletalMesh3D::CpuSkinVertices()
         for (uint32_t i = 0; i < numVerts; ++i)
         {
             const VertexSkinned& srcVert = src[i];
-            Vertex& dstVert = dst[i];
+            CpuSkinnedVertex& dstVert = dst[i];                     // (here a whole Vertex: not the console's)
 
             glm::vec3 pos = srcVert.mPosition;
             glm::vec3 nrm = srcVert.mNormal;
@@ -2595,7 +2594,7 @@ bool SkeletalMesh3D::CpuSkinBlended()
 
     SkeletalMesh* mesh = mSkeletalMesh.Get<SkeletalMesh>();
     const VertexSkinned* src = mesh->GetVertices().data();
-    Vertex* dst = mSkinnedVertices.data();
+    CpuSkinnedVertex* dst = mSkinnedVertices.data();            // (positions and normals: CpuSkinnedVertex)
 #if PLATFORM_DOLPHIN && PROFILING_ENABLED
     gOctSkinVerts -= numRigid;                                  // (CpuSkinVertices counted them all)
 #endif
@@ -2606,10 +2605,8 @@ bool SkeletalMesh3D::CpuSkinBlended()
         for (uint32_t k = 0; k < numRigid; ++k)
         {
             const VertexSkinned& s = src[rigid[k]];
-            Vertex& d = dst[rigid[k]];
+            CpuSkinnedVertex& d = dst[rigid[k]];
             d.mPosition = s.mPosition;
-            d.mTexcoord0 = s.mTexcoord0;
-            d.mTexcoord1 = s.mTexcoord1;
             d.mNormal = s.mNormal;
         }
         mSkinnedRigid = true;
@@ -2620,7 +2617,7 @@ bool SkeletalMesh3D::CpuSkinBlended()
     for (uint32_t k = 0; k < numBlended; ++k)
     {
         const VertexSkinned& srcVert = src[blended[k]];
-        Vertex& dstVert = dst[blended[k]];
+        CpuSkinnedVertex& dstVert = dst[blended[k]];
         const glm::mat4& b0 = boneMats[srcVert.mBoneIndices[0]];
         const float w0 = oneBone ? 1.0f : srcVert.mBoneWeights[0];
         glm::vec3 c0 = glm::vec3(b0[0]) * w0, c1 = glm::vec3(b0[1]) * w0, c2 = glm::vec3(b0[2]) * w0, c3 = glm::vec3(b0[3]) * w0;
@@ -2634,8 +2631,6 @@ bool SkeletalMesh3D::CpuSkinBlended()
         const glm::vec3 pos = srcVert.mPosition;
         const glm::vec3 nrm = srcVert.mNormal;
         dstVert.mPosition = c0 * pos.x + c1 * pos.y + c2 * pos.z + c3;
-        dstVert.mTexcoord0 = srcVert.mTexcoord0;
-        dstVert.mTexcoord1 = srcVert.mTexcoord1;
         dstVert.mNormal = c0 * nrm.x + c1 * nrm.y + c2 * nrm.z;
     }
 

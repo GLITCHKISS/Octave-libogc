@@ -17,6 +17,14 @@
 
 // Most of this vorbis encoding / decoding code was taken from the official libvorbis samples.
 
+// Encoding is only for importing sounds (SoundWave::SaveStream), which a console never does: left
+// out there, the encoder's ~485 KB of code and tables (vorbisenc) stay out of the game's memory.
+#if PLATFORM_DOLPHIN && !EDITOR
+void AUD_EncodeVorbis(Stream& inStream, Stream& outStream, PcmFormat format)
+{
+    LogError("Vorbis: a console build doesn't encode; a sound not encoded");
+}
+#else
 #define READ 1024
 static signed char readbuffer[READ * 4 + 44]; /* out of the data segment, not the stack */
 
@@ -204,6 +212,7 @@ void AUD_EncodeVorbis(Stream& inStream, Stream& outStream, PcmFormat format)
 
     LogDebug("Encoded Vorbis: %d bytes -> %d bytes", inStream.GetSize(), outStream.GetSize());
 }
+#endif  // PLATFORM_DOLPHIN && !EDITOR
 
 static ogg_int16_t convbuffer[4096]; /* take 8k out of the data segment, not the stack */
 static uint8_t convbuffer8[4096];
